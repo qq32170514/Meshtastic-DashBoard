@@ -48,7 +48,26 @@ db.serialize(() => {
             air_util_tx REAL
         )
     `);
+    // 建立索引以加速前端查詢歷史數據的效能
+    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
 });
+
+// ==========================================
+// 1.2 資料清理任務 (保留 3 天)
+// ==========================================
+function cleanupOldData() {
+    const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-3 days')`;
+    db.run(sql, function(err) {
+        if (err) console.error('❌ 清理舊資料失敗:', err.message);
+        else if (this.changes > 0) {
+            console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 3 天的舊資料`);
+        }
+    });
+});
+
+// 每小時執行一次清理
+setInterval(cleanupOldData, 60 * 60 * 1000);
+cleanupOldData(); // 啟動時先執行一次
 
 // ==========================================
 // 1.5 API 路由設定 (提供給前端)
@@ -148,35 +167,34 @@ function startMqtt() {
                 const env = cleanJSON.environment_metrics || cleanJSON.environmentMetrics || {};
                 
                 if (Object.keys(device).length > 0 || Object.keys(env).length > 0) {
-                    const stmt = db.prepare(`
+                    const sql = `
                         INSERT INTO telemetry_data 
                         (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx) 
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                    `);
-                    
-                    stmt.run(
+                    `;
+                    const params = [
                         fromId, 
                         device.battery_level ?? device.batteryLevel ?? null, 
                         device.voltage ?? null, 
                         env.temperature ?? null, 
                         env.relative_humidity ?? env.relativeHumidity ?? null, 
                         device.channel_utilization ?? device.channelUtilization ?? null, 
-                        device.air_util_tx ?? device.airUtilTx ?? null,
-                        function(err) {
-                            if (!err) {
-                                console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
-                                // 透過 WebSocket 即時推播新資料到前端
-                                io.emit('telemetry_update', {
-                                    node_id: fromId,
-                                    battery_level: device.battery_level ?? device.batteryLevel ?? null,
-                                    temperature: env.temperature ?? null,
-                                    humidity: env.relative_humidity ?? env.relativeHumidity ?? null,
-                                    timestamp: new Date().toISOString()
-                                });
-                            }
-                        }
-                    );
-                    stmt.finalize();
+                        device.air_util_tx ?? device.airUtilTx ?? null
+                    ];
+
+                    db.run(sql, params, function(err) {
+                        if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
+                        
+                        console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
+                        // 透過 WebSocket 即時推播新資料到前端
+                        io.emit('telemetry_update', {
+                            node_id: fromId,
+                            battery_level: params[1],
+                            temperature: params[3],
+                            humidity: params[4],
+                            timestamp: new Date().toISOString()
+                        });
+                    });
                 }
             } 
         } catch (err) {

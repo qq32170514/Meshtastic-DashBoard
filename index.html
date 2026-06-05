@@ -10,13 +10,21 @@
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f0f2f5; }
         .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 900px; margin: auto; }
         h1 { color: #1a73e8; text-align: center; }
-        #status { text-align: center; font-size: 0.9em; color: #666; margin-bottom: 20px; }
+        .controls { text-align: center; margin-bottom: 20px; display: flex; justify-content: center; align-items: center; gap: 10px; }
+        select { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 1em; }
+        #status { font-size: 0.9em; color: #666; }
     </style>
 </head>
 <body>
     <div class="card">
         <h1>📡 Meshtastic 數據監控</h1>
-        <div id="status">正在連線至伺服器...</div>
+        <div class="controls">
+            <label for="nodeSelector">監控節點：</label>
+            <select id="nodeSelector">
+                <option value="">-- 請選擇節點 --</option>
+            </select>
+            <span id="status">正在連線...</span>
+        </div>
         <canvas id="telemetryChart"></canvas>
     </div>
 
@@ -40,13 +48,43 @@
             }
         });
 
-        // 1. 載入初始歷史資料 (最近 20 筆)
-        fetch('/api/telemetry?limit=20')
-            .then(res => res.json())
-            .then(data => {
-                data.reverse().forEach(item => updateChart(item));
-                document.getElementById('status').innerText = '✅ 即時連線中';
+        let currentNodeId = '';
+
+        // 1. 載入節點清單
+        async function refreshNodeList() {
+            const res = await fetch('/api/nodes');
+            const nodes = await res.json();
+            const selector = document.getElementById('nodeSelector');
+            const currentValue = selector.value;
+            
+            selector.innerHTML = '<option value="">-- 請選擇節點 --</option>';
+            nodes.forEach(node => {
+                const opt = document.createElement('option');
+                opt.value = node;
+                opt.textContent = node;
+                selector.appendChild(opt);
             });
+            if (nodes.includes(currentValue)) selector.value = currentValue;
+        }
+
+        // 2. 切換節點歷史資料
+        async function loadNodeHistory(nodeId) {
+            if (!nodeId) return;
+            const res = await fetch(`/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=30`);
+            const data = await res.json();
+            
+            // 清空舊圖表數據
+            chart.data.labels = [];
+            chart.data.datasets.forEach(d => d.data = []);
+            
+            data.reverse().forEach(item => updateChart(item, true));
+            chart.update();
+        }
+
+        document.getElementById('nodeSelector').addEventListener('change', (e) => {
+            currentNodeId = e.target.value;
+            loadNodeHistory(currentNodeId);
+        });
 
         // 2. 監聽 Socket.io 即時更新
         const socket = io();
@@ -55,7 +93,10 @@
             updateChart(data);
         });
 
-        function updateChart(data) {
+        function updateChart(data, isBatch = false) {
+            // 如果前端有選定節點，且收到的資料不是該節點，則忽略
+            if (currentNodeId && data.node_id !== currentNodeId) return;
+
             const label = new Date(data.timestamp).toLocaleTimeString();
             
             // 避免重複加入相同時間點的資料
@@ -70,8 +111,13 @@
                 chart.data.labels.shift();
                 chart.data.datasets.forEach(d => d.data.shift());
             }
-            chart.update('none'); // 使用 'none' 模式更新效能較好
+            if (!isBatch) chart.update('none');
         }
+
+        // 初始化
+        refreshNodeList();
+        setInterval(refreshNodeList, 30000); // 每 30 秒更新一次節點選單
+        document.getElementById('status').innerText = '✅ 即時連線中';
     </script>
 </body>
 </html>
