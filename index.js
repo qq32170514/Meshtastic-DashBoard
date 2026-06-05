@@ -54,13 +54,17 @@ db.serialize(() => {
             temperature REAL,
             humidity REAL,
             channel_utilization REAL,
-            air_util_tx REAL
+            air_util_tx REAL,
+            snr REAL,
+            rssi REAL
         )
     `);
     // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
     db.run(`
         CREATE TABLE IF NOT EXISTS nodes (
             node_id TEXT PRIMARY KEY,
+            long_name TEXT,
+            short_name TEXT,
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
@@ -139,12 +143,13 @@ server.listen(PORT, () => {
 const root = new protobuf.Root();
 root.resolvePath = (origin, target) => __dirname + '/protobufs/' + target;
 
-let ServiceEnvelope, Telemetry;
+let ServiceEnvelope, Telemetry, User;
 
 root.load([
     "meshtastic/mqtt.proto", 
     "meshtastic/telemetry.proto",
-    "meshtastic/portnums.proto"
+    "meshtastic/portnums.proto",
+    "meshtastic/mesh.proto"
 ], { keepCase: true }, (err) => {
     if (err) {
         console.error('❌ Protobuf 字典載入失敗:', err);
@@ -152,6 +157,7 @@ root.load([
     }
     ServiceEnvelope = root.lookupType("meshtastic.ServiceEnvelope");
     Telemetry = root.lookupType("meshtastic.Telemetry");
+    User = root.lookupType("meshtastic.User");
     console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
     startMqtt();
 });
@@ -203,9 +209,14 @@ function startMqtt() {
             console.log(`📦 [收到封包] 來自: ${fromId} | Port: ${decodedData.portnum} | Topic: ${topic}`);
             
             // 更新節點最後在線時間 (不論是否為遙測封包)
-            db.run(`REPLACE INTO nodes (node_id, last_seen) VALUES (?, CURRENT_TIMESTAMP)`, [fromId], (err) => {
+            // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
+            const nodeUpdateSql = `
+                INSERT INTO nodes (node_id, last_seen) VALUES (?, CURRENT_TIMESTAMP)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen
+            `;
+            db.run(nodeUpdateSql, [fromId], (err) => {
                 if (!err) {
-                    // 透過 WebSocket 通知前端更新節點列表
+                    // node_seen 會在下方解析名稱後一併推播，或在此單獨推播基礎資訊
                     io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString() });
                 }
             });
@@ -218,6 +229,26 @@ function startMqtt() {
                 time: new Date().toLocaleTimeString()
             });
 
+            // 解析節點資訊 (名稱)
+            if (decodedData.portnum === 4 || decodedData.portnum === 'NODEINFO_APP') {
+                try {
+                    const user = User.decode(decodedData.payload);
+                    db.run(`
+                        UPDATE nodes SET long_name = ?, short_name = ? WHERE node_id = ?
+                    `, [user.longName, user.shortName, fromId], (err) => {
+                        if (!err) {
+                            console.log(`👤 [節點資訊] 更新名稱: ${user.shortName} (${user.longName})`);
+                            io.emit('node_seen', { 
+                                node_id: fromId, 
+                                long_name: user.longName, 
+                                short_name: user.shortName,
+                                last_seen: new Date().toISOString() 
+                            });
+                        }
+                    });
+                } catch (e) { console.error('❌ 解析 NodeInfo 失敗', e); }
+            }
+
             if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
                 const telemetry = Telemetry.decode(decodedData.payload);
                 const cleanJSON = Telemetry.toObject(telemetry, { enums: String, defaults: true });
@@ -228,8 +259,8 @@ function startMqtt() {
                 if (Object.keys(device).length > 0 || Object.keys(env).length > 0) {
                     const sql = `
                         INSERT INTO telemetry_data 
-                        (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     `;
                     const params = [
                         fromId, 
@@ -238,7 +269,9 @@ function startMqtt() {
                         env.temperature ?? null, 
                         env.relative_humidity ?? env.relativeHumidity ?? null, 
                         device.channel_utilization ?? device.channelUtilization ?? null, 
-                        device.air_util_tx ?? device.airUtilTx ?? null
+                        device.air_util_tx ?? device.airUtilTx ?? null,
+                        packet.rx_snr ?? null,
+                        packet.rx_rssi ?? null
                     ];
 
                     db.run(sql, params, function(err) {
@@ -251,7 +284,9 @@ function startMqtt() {
                             battery_level: params[1],
                             temperature: params[3],
                             humidity: params[4],
-                            timestamp: new Date().toISOString()
+                            timestamp: new Date().toISOString(),
+                            snr: params[7],
+                            rssi: params[8]
                         });
                     });
                 }

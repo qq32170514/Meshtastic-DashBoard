@@ -5,52 +5,133 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Meshtastic Real-time Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <!-- 如果是本地開啟，自動切換至 CDN 確保能載入 Socket.io -->
+    <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f0f2f5; }
-        .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 900px; margin: auto; }
+        .container { max-width: 1000px; margin: auto; }
+        .card { background: white; border-radius: 0 0 12px 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         h1 { color: #1a73e8; text-align: center; }
+        
+        /* 分頁標籤樣式 */
+        .tabs { display: flex; background: #e2e8f0; border-radius: 12px 12px 0 0; overflow: hidden; }
+        .tab-btn { flex: 1; padding: 12px; border: none; cursor: pointer; background: none; font-weight: bold; color: #4a5568; transition: 0.3s; }
+        .tab-btn:hover { background: #cbd5e0; }
+        .tab-btn.active { background: white; color: #1a73e8; }
+
+        /* 隱藏未選取的分頁 */
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* 節點詳情樣式 */
+        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px solid #e2e8f0; text-align: center; }
+        .stat-value { font-size: 1.2em; font-weight: bold; color: #2d3748; display: block; margin-top: 5px; }
+        .stat-label { font-size: 0.85em; color: #718096; }
+
         .controls { text-align: center; margin-bottom: 20px; display: flex; justify-content: center; align-items: center; gap: 10px; }
         select { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 1em; }
         #status { font-size: 0.9em; color: #666; }
         .status-tag { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; margin-left: 5px; }
         .online { background: #e6fffa; color: #2d3748; border: 1px solid #38b2ac; }
-        .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 15px; }
-        .node-item { background: #fff; padding: 10px; border-radius: 8px; border: 1px solid #ddd; font-size: 0.85em; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .node-id { font-weight: bold; color: #1a73e8; cursor: pointer; text-decoration: underline; }
+        /* 條列式佈局 */
+        .node-grid { display: flex; flex-direction: column; gap: 5px; }
+        .node-item { 
+            background: #fff; padding: 12px 20px; border-radius: 8px; border: 1px solid #ddd; 
+            font-size: 0.95em; display: grid; grid-template-columns: 100px 100px 1fr 150px; 
+            align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); 
+        }
+        .node-id { font-family: monospace; color: #718096; cursor: pointer; text-decoration: underline; font-size: 0.9em; }
+        .node-name { font-weight: bold; color: #1a73e8; }
+        .node-short { color: #4a5568; font-weight: bold; }
         .node-time { color: #888; font-size: 0.8em; }
-        .log-container { margin-top: 20px; background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; }
+        .node-header { 
+            font-weight: bold; padding: 10px 20px; color: #4a5568; font-size: 0.85em;
+            display: grid; grid-template-columns: 100px 100px 1fr 150px;
+        }
+
+        .log-container { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; }
         .log-title { margin-bottom: 10px; font-weight: bold; border-bottom: 1px solid #7f8c8d; padding-bottom: 5px; display: flex; justify-content: space-between; }
-        #packetLog { height: 150px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
+        #packetLog { height: 400px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
         #packetLog li { margin-bottom: 4px; border-left: 3px solid #3498db; padding-left: 8px; }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h1>📡 Meshtastic 數據監控</h1>
-        <div class="controls">
-            <label for="nodeSelector">監控節點：</label>
-            <select id="nodeSelector">
-                <option value="">-- 請選擇節點 --</option>
-            </select>
-            <span id="status">Dashboard: 正在連線...</span>
-            <span id="mqttStatus" class="status-tag">MQTT: 檢測中</span>
-        </div>
-        <canvas id="telemetryChart"></canvas>
-
-        <div style="margin-top: 30px;">
-            <h3>📡 台灣頻道節點活動清單</h3>
-            <div id="nodeStatusGrid" class="node-grid"></div>
+    <div class="container">
+        <h1>📡 Meshtastic 儀表板</h1>
+        
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('dashboard')">📊 數據圖表</button>
+            <button class="tab-btn" onclick="switchTab('node-info', this)" id="btn-node-info">ℹ️ 節點詳情</button>
+            <button class="tab-btn" onclick="switchTab('nodes')">📡 節點狀態</button>
+            <button class="tab-btn" onclick="switchTab('logs')">📜 原始日誌</button>
         </div>
 
-        <!-- 新增的日誌小視窗 -->
-        <div class="log-container">
-            <div class="log-title"><span>📡 即時通訊日誌</span><span id="packetCount">已收到: 0</span></div>
-            <ul id="packetLog"><li>等待封包中...</li></ul>
+        <div class="card">
+            <!-- 分頁 1: 儀表板 -->
+            <div id="tab-dashboard" class="tab-content active">
+                <div class="controls">
+                    <label for="nodeSelector">監控節點：</label>
+                    <select id="nodeSelector">
+                        <option value="">-- 請選擇節點 --</option>
+                    </select>
+                    <span id="status">正在連線...</span>
+                    <span id="mqttStatus" class="status-tag">MQTT: 檢測中</span>
+                </div>
+                <canvas id="telemetryChart"></canvas>
+            </div>
+
+            <!-- 分頁 1.5: 節點詳情 -->
+            <div id="tab-node-info" class="tab-content">
+                <h2 id="info-node-id" style="text-align:center; margin-bottom: 20px; color: #1a73e8;">請從節點清單選擇節點</h2>
+                <div class="detail-grid">
+                    <div class="stat-card"><span class="stat-label">最後在線</span><span class="stat-value" id="info-last-seen">-</span></div>
+                    <div class="stat-card"><span class="stat-label">電池電量</span><span class="stat-value" id="info-battery">-</span></div>
+                    <div class="stat-card"><span class="stat-label">環境溫度</span><span class="stat-value" id="info-temp">-</span></div>
+                    <div class="stat-card"><span class="stat-label">環境濕度</span><span class="stat-value" id="info-humidity">-</span></div>
+                    <div class="stat-card"><span class="stat-label">SNR (訊噪比)</span><span class="stat-value" id="info-snr">-</span></div>
+                    <div class="stat-card"><span class="stat-label">RSSI (強度)</span><span class="stat-value" id="info-rssi">-</span></div>
+                </div>
+                <div style="text-align: center; margin-top: 10px;">
+                    <button class="tab-btn" style="border: 1px solid #ddd; border-radius: 8px; padding: 10px 20px;" onclick="switchTab('dashboard')">查看趨勢圖表 📉</button>
+                </div>
+            </div>
+
+            <!-- 分頁 2: 節點清單 -->
+            <div id="tab-nodes" class="tab-content">
+                <h3>📡 台灣頻道活動節點</h3>
+                <div class="node-header">
+                    <span>ID</span>
+                    <span>Short Name</span>
+                    <span>Long Name</span>
+                    <span style="text-align: right;">Last Seen</span>
+                </div>
+                <div id="nodeStatusGrid" class="node-grid"></div>
+            </div>
+
+            <!-- 分頁 3: 日誌 -->
+            <div id="tab-logs" class="tab-content">
+                <div class="log-container">
+                    <div class="log-title"><span>📡 即時通訊日誌</span><span id="packetCount">已收到: 0</span></div>
+                    <ul id="packetLog"><li>等待封包中...</li></ul>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
+        // 分頁切換邏輯
+        function switchTab(tabName, btnEl) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            
+            document.getElementById(`tab-${tabName}`).classList.add('active');
+            
+            // 如果有傳入按鈕物件就使用，否則根據 tabName 尋找按鈕
+            const targetBtn = btnEl || document.querySelector(`.tab-btn[onclick*="'${tabName}'"]`);
+            if (targetBtn) targetBtn.classList.add('active');
+        }
+
         const ctx = document.getElementById('telemetryChart').getContext('2d');
         const chart = new Chart(ctx, {
             type: 'line',
@@ -72,9 +153,13 @@
 
         let currentNodeId = '';
 
+        // 自動偵測 API 基礎路徑
+        // 如果是直接開啟檔案，就強制指向 localhost:3000
+        const API_BASE = window.location.protocol === 'file:' ? 'http://localhost:3000' : '';
+
         // 1. 載入節點清單
         async function refreshNodeList() {
-            const res = await fetch('/api/nodes');
+            const res = await fetch(`${API_BASE}/api/nodes`);
             const nodes = await res.json();
             const selector = document.getElementById('nodeSelector');
             const currentValue = selector.value;
@@ -92,7 +177,7 @@
         // 2. 切換節點歷史資料
         async function loadNodeHistory(nodeId) {
             if (!nodeId) return;
-            const res = await fetch(`/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=30`);
+            const res = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=30`);
             const data = await res.json();
             
             // 清空舊圖表數據
@@ -109,10 +194,17 @@
         });
 
         // 2. 監聽 Socket.io 即時更新
-        const socket = io();
+        // 如果是本地檔案開啟，必須手動指定連線位址
+        const socket = io(API_BASE);
         
         socket.on('connect', () => {
             document.getElementById('status').innerText = '✅ Dashboard: 已連線';
+            console.log('Socket.io 連線成功, ID:', socket.id);
+        });
+
+        socket.on('connect_error', (err) => {
+            document.getElementById('status').innerText = '❌ Dashboard 連線失敗';
+            console.error('Socket.io 連線錯誤:', err);
         });
 
         socket.on('telemetry_update', (data) => {
@@ -129,42 +221,69 @@
 
         // 監聽節點活動事件 (即時更新列表)
         socket.on('node_seen', (data) => {
-            updateNodeStatusUI(data.node_id, data.last_seen);
+            updateNodeStatusUI(data);
         });
 
         // 載入所有節點在線狀態
         async function fetchNodeStatus() {
-            const res = await fetch('/api/node-status');
+            const res = await fetch(`${API_BASE}/api/node-status`);
             const nodes = await res.json();
             const grid = document.getElementById('nodeStatusGrid');
             grid.innerHTML = '';
             nodes.forEach(node => {
-                updateNodeStatusUI(node.node_id, node.last_seen);
+                updateNodeStatusUI(node);
             });
         }
 
-        function updateNodeStatusUI(nodeId, lastSeen) {
+        function updateNodeStatusUI(nodeData) {
+            const { node_id, long_name, short_name, last_seen } = nodeData;
             const grid = document.getElementById('nodeStatusGrid');
-            let item = document.getElementById(`status-${nodeId}`);
-            const timeStr = new Date(lastSeen).toLocaleTimeString();
+            let item = document.getElementById(`status-${node_id}`);
+            const timeStr = new Date(last_seen).toLocaleTimeString();
 
             if (!item) {
                 item = document.createElement('div');
-                item.id = `status-${nodeId}`;
+                item.id = `status-${node_id}`;
                 item.className = 'node-item';
                 grid.prepend(item); // 新出現的排前面
             }
 
             item.innerHTML = `
-                <span class="node-id" onclick="selectNode('${nodeId}')">${nodeId}</span>
+                <span class="node-id" onclick="selectNode('${node_id}')">${node_id}</span>
+                <span class="node-short">${short_name || '---'}</span>
+                <span class="node-name">${long_name || 'Unknown Node'}</span>
                 <span class="node-time">${timeStr}</span>
             `;
         }
 
-        function selectNode(nodeId) {
+        async function selectNode(nodeId) {
             const selector = document.getElementById('nodeSelector');
             selector.value = nodeId;
             selector.dispatchEvent(new Event('change'));
+            
+            // 更新詳情分頁的資訊
+            await fetchNodeDetail(nodeId);
+            
+            // 點擊節點後自動切換至詳情分頁
+            switchTab('node-info');
+        }
+
+        async function fetchNodeDetail(nodeId) {
+            const res = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=1`);
+            const data = await res.json();
+            
+            document.getElementById('info-node-id').innerText = `節點詳情: ${nodeId}`;
+            if (data.length > 0) {
+                const latest = data[0];
+                document.getElementById('info-last-seen').innerText = new Date(latest.timestamp).toLocaleString();
+                document.getElementById('info-battery').innerText = latest.battery_level ? `${latest.battery_level}%` : 'N/A';
+                document.getElementById('info-temp').innerText = latest.temperature ? `${latest.temperature}°C` : 'N/A';
+                document.getElementById('info-humidity').innerText = latest.humidity ? `${latest.humidity}%` : 'N/A';
+                document.getElementById('info-snr').innerText = latest.snr !== null ? `${latest.snr} dB` : 'N/A';
+                document.getElementById('info-rssi').innerText = latest.rssi !== null ? `${latest.rssi} dBm` : 'N/A';
+            } else {
+                ['info-last-seen', 'info-battery', 'info-temp', 'info-humidity', 'info-snr', 'info-rssi'].forEach(id => document.getElementById(id).innerText = '無遙測數據');
+            }
         }
 
         // 監聽所有原始封包
