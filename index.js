@@ -14,6 +14,14 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// ==========================================
+// Socket.io 連線監聽 (新增)
+// ==========================================
+io.on('connection', (socket) => {
+    console.log('🔌 有新用戶連線到 Dashboard:', socket.id);
+    socket.on('disconnect', () => console.log('❌ 用戶已中斷連線'));
+});
+
 // 你的專屬節點 ID
 const myNodeId = '!7931b961'; 
 app.use(express.static(__dirname)); // 允許存取同目錄下的靜態檔案
