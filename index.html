@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meshtastic Real-time Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f0f2f5; }
+        .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 900px; margin: auto; }
+        h1 { color: #1a73e8; text-align: center; }
+        #status { text-align: center; font-size: 0.9em; color: #666; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>📡 Meshtastic 數據監控</h1>
+        <div id="status">正在連線至伺服器...</div>
+        <canvas id="telemetryChart"></canvas>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('telemetryChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: '電池電量 (%)', borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.1)', data: [], yAxisID: 'y', tension: 0.4, fill: true },
+                    { label: '溫度 (°C)', borderColor: '#e74c3c', data: [], yAxisID: 'y1', tension: 0.4 }
+                ]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: { type: 'linear', position: 'left', title: { display: true, text: '電量 %' }, min: 0, max: 100 },
+                    y1: { type: 'linear', position: 'right', title: { display: true, text: '溫度 °C' }, grid: { drawOnChartArea: false } }
+                }
+            }
+        });
+
+        // 1. 載入初始歷史資料 (最近 20 筆)
+        fetch('/api/telemetry?limit=20')
+            .then(res => res.json())
+            .then(data => {
+                data.reverse().forEach(item => updateChart(item));
+                document.getElementById('status').innerText = '✅ 即時連線中';
+            });
+
+        // 2. 監聽 Socket.io 即時更新
+        const socket = io();
+        socket.on('telemetry_update', (data) => {
+            console.log('收到新數據:', data);
+            updateChart(data);
+        });
+
+        function updateChart(data) {
+            const label = new Date(data.timestamp).toLocaleTimeString();
+            
+            // 避免重複加入相同時間點的資料
+            if (chart.data.labels.includes(label)) return;
+
+            chart.data.labels.push(label);
+            chart.data.datasets[0].data.push(data.battery_level);
+            chart.data.datasets[1].data.push(data.temperature);
+
+            // 保持顯示最近 20 筆
+            if (chart.data.labels.length > 20) {
+                chart.data.labels.shift();
+                chart.data.datasets.forEach(d => d.data.shift());
+            }
+            chart.update('none'); // 使用 'none' 模式更新效能較好
+        }
+    </script>
+</body>
+</html>

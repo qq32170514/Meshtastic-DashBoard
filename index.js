@@ -1,9 +1,22 @@
 const mqtt = require('mqtt');
 const protobuf = require('protobufjs');
 const sqlite3 = require('sqlite3').verbose();
+const express = require('express');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
 
 // 你的專屬節點 ID
 const myNodeId = '!7931b961'; 
+app.use(express.static(__dirname)); // 允許存取同目錄下的靜態檔案
 
 // ==========================================
 // 1. 初始化 SQLite 資料庫
@@ -27,6 +40,46 @@ db.serialize(() => {
             air_util_tx REAL
         )
     `);
+});
+
+// ==========================================
+// 1.5 API 路由設定 (提供給前端)
+// ==========================================
+
+// 取得所有或特定節點的最新遙測資料
+app.get('/api/telemetry', (req, res) => {
+    const nodeId = req.query.node_id;
+    const limit = parseInt(req.query.limit) || 50;
+
+    let sql = `SELECT * FROM telemetry_data`;
+    let params = [];
+
+    if (nodeId) {
+        sql += ` WHERE node_id = ?`;
+        params.push(nodeId);
+    }
+    
+    sql += ` ORDER BY timestamp DESC LIMIT ?`;
+    params.push(limit);
+
+    db.all(sql, params, (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 取得目前所有已知的節點清單
+app.get('/api/nodes', (req, res) => {
+    db.all(`SELECT DISTINCT node_id FROM telemetry_data`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows.map(row => row.node_id));
+    });
+});
+
+// 啟動 Express 伺服器
+server.listen(PORT, () => {
+    console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
+    console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
 });
 
 // ==========================================
@@ -102,7 +155,17 @@ function startMqtt() {
                         device.channel_utilization ?? device.channelUtilization ?? null, 
                         device.air_util_tx ?? device.airUtilTx ?? null,
                         function(err) {
-                            if (!err) console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
+                            if (!err) {
+                                console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
+                                // 透過 WebSocket 即時推播新資料到前端
+                                io.emit('telemetry_update', {
+                                    node_id: fromId,
+                                    battery_level: device.battery_level ?? device.batteryLevel ?? null,
+                                    temperature: env.temperature ?? null,
+                                    humidity: env.relative_humidity ?? env.relativeHumidity ?? null,
+                                    timestamp: new Date().toISOString()
+                                });
+                            }
                         }
                     );
                     stmt.finalize();
