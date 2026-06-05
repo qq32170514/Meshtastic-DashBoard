@@ -1,0 +1,26 @@
+{
+  "name": "meshtastic-dashboard",
+  "version": "1.0.0",
+  "description": "Meshtastic DashBoard",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qq32170514/Meshtastic-DashBoard.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/qq32170514/Meshtastic-DashBoard/issues"
+  },
+  "homepage": "https://github.com/qq32170514/Meshtastic-DashBoard#readme",
+  "dependencies": {
+    "mqtt": "^5.15.1",
+    "protobufjs": "^8.6.0",
+    "sqlite3": "^6.0.1"
+  }
+}
