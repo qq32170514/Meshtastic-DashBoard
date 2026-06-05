@@ -56,7 +56,9 @@ db.serialize(() => {
             channel_utilization REAL,
             air_util_tx REAL,
             snr REAL,
-            rssi REAL
+            rssi REAL,
+            hop_limit INTEGER,
+            hop_start INTEGER
         )
     `);
     // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
@@ -69,7 +71,9 @@ db.serialize(() => {
             latitude REAL,
             longitude REAL,
             is_favorite INTEGER DEFAULT 0,
-            last_topic TEXT
+            last_topic TEXT,
+            hop_limit INTEGER,
+            hop_start INTEGER
         )
     `);
     // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
@@ -80,13 +84,23 @@ db.serialize(() => {
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             portnum TEXT,
             topic TEXT,
+            gateway_id TEXT,
             snr REAL,
-            rssi REAL
+            rssi REAL,
+            hop_limit INTEGER,
+            hop_start INTEGER,
+            payload_json TEXT
         )
     `);
     // 確保舊資料庫也能加上欄位 (如果已存在則會忽略錯誤)
     db.run(`ALTER TABLE nodes ADD COLUMN is_favorite INTEGER DEFAULT 0`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN last_topic TEXT`, (err) => {});
+    db.run(`ALTER TABLE packet_logs ADD COLUMN gateway_id TEXT`, (err) => {});
+    db.run(`ALTER TABLE packet_logs ADD COLUMN hop_limit INTEGER`, (err) => {});
+    db.run(`ALTER TABLE packet_logs ADD COLUMN hop_start INTEGER`, (err) => {});
+    db.run(`ALTER TABLE packet_logs ADD COLUMN payload_json TEXT`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN hop_limit INTEGER`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN hop_start INTEGER`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
@@ -171,6 +185,34 @@ app.get('/api/node/:nodeId/packets', (req, res) => {
     });
 });
 
+// 取得單一節點的閘道收信統計 (Received Gateways)
+app.get('/api/node/:nodeId/gateways', (req, res) => {
+    const sql = `
+        SELECT gateway_id, COUNT(*) as count, MAX(timestamp) as last_seen 
+        FROM packet_logs 
+        WHERE node_id = ? AND gateway_id IS NOT NULL AND gateway_id != ''
+        GROUP BY gateway_id 
+        ORDER BY count DESC`;
+    db.all(sql, [req.params.nodeId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 取得單一節點的封包種類統計 (Packet Distribution)
+app.get('/api/node/:nodeId/packet-stats', (req, res) => {
+    const sql = `
+        SELECT portnum, COUNT(*) as count, MAX(timestamp) as last_seen 
+        FROM packet_logs 
+        WHERE node_id = ?
+        GROUP BY portnum 
+        ORDER BY count DESC`;
+    db.all(sql, [req.params.nodeId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // 切換節點最愛狀態
 app.post('/api/node/:nodeId/favorite', (req, res) => {
     const { is_favorite } = req.body;
@@ -247,6 +289,8 @@ function startMqtt() {
         // Debug: 在控制台印出所有收到的 Topic，確認過濾器是否有抓到東西
         // console.log(`📩 收到 Topic: ${topic}`);
 
+        const rawHex = message.toString('hex').toUpperCase();
+
         try {
             const envelope = ServiceEnvelope.decode(message);
             if (!envelope.packet || !envelope.packet.decoded) return;
@@ -254,6 +298,20 @@ function startMqtt() {
             const packet = envelope.packet;
             const decodedData = packet.decoded;
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
+            const gatewayId = envelope.gateway_id || 'Unknown';
+
+            // --- 嘗試預先解碼 Payload 以供檢視 ---
+            let payloadObj = null;
+            try {
+                if (decodedData.portnum === 4 || decodedData.portnum === 'NODEINFO_APP') {
+                    payloadObj = User.toObject(User.decode(decodedData.payload), { enums: String, defaults: true });
+                } else if (decodedData.portnum === 1 || decodedData.portnum === 'POSITION_APP') {
+                    payloadObj = Position.toObject(Position.decode(decodedData.payload), { enums: String, defaults: true });
+                } else if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
+                    payloadObj = Telemetry.toObject(Telemetry.decode(decodedData.payload), { enums: String, defaults: true });
+                }
+            } catch (e) { /* 解析失敗則維持 null */ }
+            const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
 
             // 在 Terminal 顯示收到的封包摘要
             console.log(`📦 [收到封包] 來自: ${fromId} | Port: ${decodedData.portnum} | Topic: ${topic}`);
@@ -261,10 +319,10 @@ function startMqtt() {
             // 更新節點最後在線時間 (不論是否為遙測封包)
             // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
             const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen, last_topic) VALUES (?, CURRENT_TIMESTAMP, ?)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic
+                INSERT INTO nodes (node_id, last_seen, last_topic, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
             `;
-            db.run(nodeUpdateSql, [fromId, topic], (err) => {
+            db.run(nodeUpdateSql, [fromId, topic, packet.hop_limit || 0, packet.hop_start || 0], (err) => {
                 if (!err) {
                     // node_seen 會在下方解析名稱後一併推播，或在此單獨推播基礎資訊
                     io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString() });
@@ -272,17 +330,22 @@ function startMqtt() {
             });
 
             // 將封包寫入歷史紀錄表
-            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, snr, rssi) VALUES (?, ?, ?, ?, ?)`, 
-                [fromId, decodedData.portnum, topic, packet.rx_snr || null, packet.rx_rssi || null]);
+            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                [fromId, decodedData.portnum, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson]);
 
             // 推播原始封包資訊到前端日誌視窗
             io.emit('raw_packet', {
                 from: fromId,
                 portnum: decodedData.portnum,
                 topic: topic,
+                gateway_id: gatewayId,
                 time: new Date().toLocaleTimeString(),
                 snr: packet.rx_snr || null,
-                rssi: packet.rx_rssi || null
+                rssi: packet.rx_rssi || null,
+                hop_limit: packet.hop_limit || 0,
+                hop_start: packet.hop_start || 0,
+                payload_json: payloadObj,
+                rawData: rawHex
             });
 
             // 解析節點資訊 (名稱)
@@ -332,8 +395,8 @@ function startMqtt() {
                 if (Object.keys(device).length > 0 || Object.keys(env).length > 0) {
                     const sql = `
                         INSERT INTO telemetry_data 
-                        (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, hop_limit, hop_start) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     `;
                     const params = [
                         fromId, 
@@ -344,7 +407,9 @@ function startMqtt() {
                         device.channel_utilization ?? device.channelUtilization ?? null, 
                         device.air_util_tx ?? device.airUtilTx ?? null,
                         packet.rx_snr ?? null,
-                        packet.rx_rssi ?? null
+                        packet.rx_rssi ?? null,
+                        packet.hop_limit || 0,
+                        packet.hop_start || 0
                     ];
 
                     db.run(sql, params, function(err) {
@@ -361,7 +426,9 @@ function startMqtt() {
                             air_util_tx: params[6],
                             timestamp: new Date().toISOString(),
                             snr: params[7],
-                            rssi: params[8]
+                            rssi: params[8],
+                            hop_limit: params[9],
+                            hop_start: params[10]
                         });
                     });
                 }

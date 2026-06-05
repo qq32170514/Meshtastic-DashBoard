@@ -120,6 +120,25 @@
                     <canvas id="signalChart" style="max-height: 250px;"></canvas>
                 </div>
 
+                <div id="nodeMap"></div>
+
+                <!-- 接收閘道統計 -->
+                <div style="margin-top: 30px; margin-bottom: 20px;">
+                    <h3 style="color: #805ad5; border-bottom: 2px solid #e9d8fd; padding-bottom: 10px;">📡 接收閘道統計 (Gateways)</h3>
+                    <table class="packet-table">
+                        <thead>
+                            <tr>
+                                <th>Gateway ID</th>
+                                <th style="width: 100px;">封包數量</th>
+                                <th style="width: 200px;">最近一次收到</th>
+                            </tr>
+                        </thead>
+                        <tbody id="gatewayStatsBody">
+                            <tr><td colspan="3" style="text-align:center;">尚無資料</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
                 <!-- 歷史封包紀錄表格 -->
                 <div style="margin-top: 30px; margin-bottom: 30px;">
                     <h3 style="color: #1a73e8; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">📜 最近封包紀錄 (Packet Logs)</h3>
@@ -128,9 +147,12 @@
                             <tr>
                                 <th style="width: 150px;">時間</th>
                                 <th style="width: 120px;">類型 (Port)</th>
+                                <th style="width: 120px;">Gateway</th>
+                                <th style="width: 100px;">跳數 / 方式</th>
                                 <th style="width: 80px;">SNR</th>
                                 <th style="width: 80px;">RSSI</th>
-                                <th>MQTT Topic / Path</th>
+                                <th style="width: 200px;">MQTT Topic</th>
+                                <th style="width: 60px;">細節</th>
                             </tr>
                         </thead>
                         <tbody id="packetHistoryBody">
@@ -139,7 +161,23 @@
                     </table>
                 </div>
 
-                <div id="nodeMap"></div>
+                <!-- 封包種類統計 -->
+                <div style="margin-top: 30px; margin-bottom: 30px;">
+                    <h3 style="color: #38a169; border-bottom: 2px solid #c6f6d5; padding-bottom: 10px;">📊 封包種類統計分析 (Packet Distribution)</h3>
+                    <table class="packet-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 150px;">封包類型 (Port)</th>
+                                <th style="width: 100px;">數量</th>
+                                <th style="width: 100px;">占比 (%)</th>
+                                <th>最後收到時間</th>
+                            </tr>
+                        </thead>
+                        <tbody id="packetStatsBody">
+                            <tr><td colspan="4" style="text-align:center;">尚無資料</td></tr>
+                        </tbody>
+                    </table>
+                </div>
 
                 <div style="text-align: center; margin-top: 10px;">
                     <button class="tab-btn" style="border: 1px solid #ddd; border-radius: 8px; padding: 10px 20px;" onclick="switchTab('nodes')">返回節點清單 🔙</button>
@@ -188,6 +226,17 @@
                     <ul id="packetLog"><li>等待封包中...</li></ul>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- 封包檢視 Modal -->
+    <div id="packetModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 style="margin:0; color:#1a73e8;">📦 封包詳細數據</h3>
+                <span class="close-btn" onclick="closeModal()">&times;</span>
+            </div>
+            <pre id="packetJsonDisplay"></pre>
         </div>
     </div>
 
@@ -300,7 +349,9 @@
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '© OpenStreetMap'
         }).addTo(map);
-        let mapMarker = L.marker([0, 0]).addTo(map);
+        let nodeMarker = L.marker([0, 0]).addTo(map);
+        let gwMarker = null; // 用於儲存 Gateway 標記
+        let linkLine = null; // 用於儲存節點與 Gateway 的連線
 
         // 初始化最愛節點地圖
         const favoritesMap = L.map('favoritesMap').setView([23.6, 121], 7);
@@ -494,18 +545,25 @@
         document.getElementById('nodeSearch').addEventListener('input', () => renderNodeList('nodeStatusGrid', false));
 
         async function selectNode(nodeId) {
+            if (!nodeId) return;
+            
             currentNodeId = nodeId;
             const selector = document.getElementById('nodeSelector');
-            selector.value = nodeId;
-            // 移除 dispatchEvent 以避免無限遞迴迴圈
+            if (selector) selector.value = nodeId;
 
-            // 更新趨勢圖表
-            await loadNodeHistory(nodeId);
-            // 更新詳情分頁的資訊
-            await fetchNodeDetail(nodeId);
-            
-            // 點擊節點後自動切換至詳情分頁
+            // 先跳轉分頁，提升互動反應速度
             switchTab('node-info');
+
+            try {
+                // 並行執行數據載入，縮短等待時間
+                await Promise.all([
+                    loadNodeHistory(nodeId),
+                    fetchNodeDetail(nodeId)
+                ]);
+            } catch (err) {
+                console.error('載入節點資料失敗:', err);
+                document.getElementById('info-long-name').innerText = '載入資料失敗';
+            }
         }
 
         async function fetchNodeDetail(nodeId) {
@@ -516,14 +574,15 @@
             updateDetailStar(!!nodeInfo.is_favorite);
 
             // 取得最新遙測數據
-            const res = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=1`);
-            const data = await res.json();
+            const teleRes = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=1`);
+            const data = await teleRes.json();
             
             // 清除之前的定時器 (如有)
             if (window.lastSeenTimer) clearInterval(window.lastSeenTimer);
 
             // 更新頂部三行資訊
-            document.getElementById('info-long-name').innerText = nodeInfo.long_name || 'Unknown Node';
+            const longName = nodeInfo.long_name || 'Unknown Node';
+            document.getElementById('info-long-name').innerText = longName;
             document.getElementById('info-short-name').innerText = nodeInfo.short_name || '';
             document.getElementById('info-node-id').innerText = nodeId;
             document.getElementById('info-last-topic').innerText = nodeInfo.last_topic || 'Unknown';
@@ -549,6 +608,12 @@
             // 載入封包歷史
             fetchNodePackets(nodeId);
 
+            // 載入閘道統計
+            fetchNodeGateways(nodeId);
+
+            // 載入封包統計
+            fetchPacketStats(nodeId);
+
             let latestBattery = 'N/A';
             if (data.length > 0) {
                 const latest = data[0];
@@ -558,24 +623,79 @@
                 document.getElementById('info-last-seen').innerText = '無遙測數據';
             }
 
+            // 清除舊的地圖元素
+            if (gwMarker) { map.removeLayer(gwMarker); gwMarker = null; }
+            if (linkLine) { map.removeLayer(linkLine); linkLine = null; }
+
             // 更新地圖
             if (nodeInfo.latitude && nodeInfo.longitude) {
                 const pos = [nodeInfo.latitude, nodeInfo.longitude];
-                mapMarker.setLatLng(pos);
+                nodeMarker.setLatLng(pos);
                 
-                // 綁定彈出視窗內容 (點擊標記時顯示)
-                mapMarker.bindPopup(`
+                nodeMarker.bindPopup(`
                     <div style="text-align: center;">
                         <strong style="font-size: 1.1em;">${nodeInfo.short_name || 'Unknown'}</strong><br>
                         <span style="color: #666;">🔋 電量: ${latestBattery}</span>
                     </div>
                 `);
 
-                map.setView(pos, 13);
+                // 處理 Gateway 與 跳數路徑
+                if (data.length > 0 && data[0].gateway_id && data[0].gateway_id !== 'Unknown') {
+                    const latest = data[0];
+                    const gwRes = await fetch(`${API_BASE}/api/node/${encodeURIComponent(latest.gateway_id)}`);
+                    const gwInfo = await gwRes.json();
+                    const hops = Math.max(0, latest.hop_start - latest.hop_limit);
+
+                    // 定義顏色深度: 越深(少跳) 越淺(多跳)
+                    // 使用 HSL: 飽和度固定，亮度隨跳數增加 (0跳: 30%, 1跳: 45%, 2跳: 60%...)
+                    const lightness = Math.min(30 + (hops * 15), 85); 
+                    const hopColor = `hsl(0, 100%, ${lightness}%)`; // 紅色系
+
+                    if (gwInfo.latitude && gwInfo.longitude) {
+                        const gwPos = [gwInfo.latitude, gwInfo.longitude];
+                        
+                        // 1. 標示 Gateway 位置 (使用圓形標記以區分)
+                        gwMarker = L.circleMarker(gwPos, {
+                            radius: 10,
+                            fillColor: hopColor,
+                            color: "#fff",
+                            weight: 2,
+                            fillOpacity: 0.9
+                        }).addTo(map).bindPopup(`<b>Gateway: ${gwInfo.short_name || latest.gateway_id}</b><br>跳數: ${hops}`);
+
+                        // 2. 畫出路徑連線
+                        linkLine = L.polyline([pos, gwPos], {
+                            color: hopColor,
+                            weight: 3,
+                            opacity: 0.7,
+                            dashArray: '5, 10' // 虛線代表無線電路徑
+                        }).addTo(map);
+
+                        // 調整視角以包含兩點
+                        const bounds = L.latLngBounds([pos, gwPos]);
+                        map.fitBounds(bounds, { padding: [50, 50] });
+                    } else {
+                        map.setView(pos, 13);
+                    }
+                } else {
+                    map.setView(pos, 13);
+                }
             } else {
                 map.setView([23.6, 121], 7);
             }
         }
+
+        // 顯示封包詳情 Modal
+        function showPacketDetails(payload) {
+            const display = document.getElementById('packetJsonDisplay');
+            let content = payload;
+            if (typeof content === 'string') {
+                try { content = JSON.parse(content); } catch(e) {}
+            }
+            display.textContent = content ? JSON.stringify(content, null, 2) : "此類型的封包目前不支援解析詳細內容。";
+            document.getElementById('packetModal').style.display = 'block';
+        }
+        function closeModal() { document.getElementById('packetModal').style.display = 'none'; }
 
         async function fetchNodePackets(nodeId) {
             const res = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}/packets?limit=20`);
@@ -585,16 +705,63 @@
             packets.forEach(p => addPacketToTable(p, false));
         }
 
+        async function fetchNodeGateways(nodeId) {
+            const res = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}/gateways`);
+            const gateways = await res.json();
+            const tbody = document.getElementById('gatewayStatsBody');
+            tbody.innerHTML = gateways.length ? '' : '<tr><td colspan="3" style="text-align:center;">尚無資料</td></tr>';
+            gateways.forEach(g => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td class="gateway-tag" onclick="selectNode('${g.gateway_id}')">${g.gateway_id}</td>
+                    <td><b>${g.count}</b></td>
+                    <td style="color: #666;">${new Date(g.last_seen).toLocaleString()}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        async function fetchPacketStats(nodeId) {
+            const res = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}/packet-stats`);
+            const stats = await res.json();
+            const tbody = document.getElementById('packetStatsBody');
+            const total = stats.reduce((acc, curr) => acc + curr.count, 0);
+            
+            tbody.innerHTML = stats.length ? '' : '<tr><td colspan="4" style="text-align:center;">尚無統計資料</td></tr>';
+            stats.forEach(s => {
+                const percent = total > 0 ? ((s.count / total) * 100).toFixed(1) : 0;
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td><span class="port-tag">${s.portnum}</span></td>
+                    <td><b>${s.count}</b></td>
+                    <td>${percent}%</td>
+                    <td style="color: #666;">${new Date(s.last_seen).toLocaleString()}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
         function addPacketToTable(p, isNew = true) {
             const tbody = document.getElementById('packetHistoryBody');
             const row = document.createElement('tr');
             const time = new Date(p.timestamp || Date.now()).toLocaleTimeString();
+            
+            const hopsTaken = (p.hop_start !== undefined && p.hop_limit !== undefined) ? (p.hop_start - p.hop_limit) : null;
+            const isDirect = hopsTaken === 0;
+            const hopDisplay = hopsTaken !== null ? 
+                `<span class="hop-tag ${isDirect ? 'hop-direct' : 'hop-relay'}">${isDirect ? 'Direct' : hopsTaken + ' Hops'}</span>` : 
+                '-';
+
+            row.dataset.payload = typeof p.payload_json === 'string' ? p.payload_json : JSON.stringify(p.payload_json);
             row.innerHTML = `
                 <td>${time}</td>
                 <td><span class="port-tag">${p.portnum}</span></td>
+                <td class="${p.gateway_id && p.gateway_id !== 'Unknown' ? 'gateway-tag' : ''}" ${p.gateway_id && p.gateway_id !== 'Unknown' ? `onclick="selectNode('${p.gateway_id}')"` : ''}>${p.gateway_id || '-'}</td>
+                <td style="text-align: center;">${hopDisplay}</td>
                 <td>${p.snr !== null ? p.snr : '-'}</td>
                 <td>${p.rssi !== null ? p.rssi : '-'}</td>
-                <td style="font-family: monospace; font-size: 0.9em; color: #718096;">${p.topic}</td>
+                <td style="font-family: monospace; font-size: 0.8em; color: #718096; word-break: break-all;">${p.topic}</td>
+                <td><button onclick="showPacketDetails(this.closest('tr').dataset.payload)" style="cursor:pointer; padding: 2px 5px;">👁️</button></td>
             `;
             if (isNew) tbody.insertBefore(row, tbody.firstChild);
             else tbody.appendChild(row);
@@ -650,7 +817,8 @@
             document.getElementById('packetCount').innerText = `已收到: ${pCount}`;
 
             const li = document.createElement('li');
-            li.innerHTML = `[${data.time}] 來自 <strong>${data.from}</strong> 的封包 (Port: ${data.portnum})`;
+            li.innerHTML = `[${data.time}] 來自 <strong>${data.from}</strong> (Port: ${data.portnum})
+                           <div style="color: #4ade80; font-size: 0.8em; word-break: break-all; opacity: 0.7; font-family: monospace; margin-top: 2px;">HEX: ${data.rawData}</div>`;
             logList.insertBefore(li, logList.firstChild);
 
             // 限制日誌數量，避免瀏覽器變慢
@@ -658,7 +826,9 @@
 
             // 同步更新詳情頁面的封包表格
             if (currentNodeId && data.from === currentNodeId) {
-                addPacketToTable({ timestamp: new Date(), portnum: data.portnum, snr: data.snr, rssi: data.rssi, topic: data.topic }, true);
+                addPacketToTable({ timestamp: new Date(), portnum: data.portnum, gateway_id: data.gateway_id, snr: data.snr, rssi: data.rssi, topic: data.topic, hop_limit: data.hop_limit, hop_start: data.hop_start, payload_json: data.payload_json }, true);
+                fetchNodeGateways(currentNodeId); // 即時更新統計數字
+                fetchPacketStats(currentNodeId); // 即時更新封包比例
             }
         });
 
