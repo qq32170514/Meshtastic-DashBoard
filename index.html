@@ -7,6 +7,8 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- 如果是本地開啟，自動切換至 CDN 確保能載入 Socket.io -->
     <script src="https://cdn.socket.io/4.8.3/socket.io.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f0f2f5; }
         .container { max-width: 1000px; margin: auto; }
@@ -29,6 +31,12 @@
         .stat-value { font-size: 1.2em; font-weight: bold; color: #2d3748; display: block; margin-top: 5px; }
         .stat-label { font-size: 0.85em; color: #718096; }
 
+        /* 星星按鈕樣式 */
+        .star-btn { cursor: pointer; color: #cbd5e0; font-size: 1.2em; border: none; background: none; transition: 0.2s; padding: 0 5px; }
+        .star-btn.active { color: #f1c40f; }
+
+        #nodeMap { height: 350px; width: 100%; border-radius: 12px; border: 1px solid #e2e8f0; margin-top: 20px; z-index: 1; }
+        .search-box { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px; font-size: 1em; box-sizing: border-box; }
         .controls { text-align: center; margin-bottom: 20px; display: flex; justify-content: center; align-items: center; gap: 10px; }
         select { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 1em; }
         #status { font-size: 0.9em; color: #666; }
@@ -38,7 +46,7 @@
         .node-grid { display: flex; flex-direction: column; gap: 5px; }
         .node-item { 
             background: #fff; padding: 12px 20px; border-radius: 8px; border: 1px solid #ddd; 
-            font-size: 0.95em; display: grid; grid-template-columns: 100px 100px 1fr 150px; 
+            font-size: 0.95em; display: grid; grid-template-columns: 40px 100px 100px 1fr 150px; 
             align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05); 
         }
         .node-id { font-family: monospace; color: #718096; cursor: pointer; text-decoration: underline; font-size: 0.9em; }
@@ -47,7 +55,7 @@
         .node-time { color: #888; font-size: 0.8em; }
         .node-header { 
             font-weight: bold; padding: 10px 20px; color: #4a5568; font-size: 0.85em;
-            display: grid; grid-template-columns: 100px 100px 1fr 150px;
+            display: grid; grid-template-columns: 40px 100px 100px 1fr 150px;
         }
 
         .log-container { background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; }
@@ -63,6 +71,7 @@
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('dashboard')">📊 數據圖表</button>
             <button class="tab-btn" onclick="switchTab('node-info', this)" id="btn-node-info">ℹ️ 節點詳情</button>
+            <button class="tab-btn" onclick="switchTab('favorites')">⭐ 最愛節點</button>
             <button class="tab-btn" onclick="switchTab('nodes')">📡 節點狀態</button>
             <button class="tab-btn" onclick="switchTab('logs')">📜 原始日誌</button>
         </div>
@@ -78,12 +87,15 @@
                     <span id="status">正在連線...</span>
                     <span id="mqttStatus" class="status-tag">MQTT: 檢測中</span>
                 </div>
-                <canvas id="telemetryChart"></canvas>
+                <p style="text-align: center; color: #666; margin-top: 50px;">請從上方選單或「節點狀態」清單中選擇一個節點來查看詳情。</p>
             </div>
 
             <!-- 分頁 1.5: 節點詳情 -->
             <div id="tab-node-info" class="tab-content">
-                <h2 id="info-node-id" style="text-align:center; margin-bottom: 20px; color: #1a73e8;">請從節點清單選擇節點</h2>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 10px; margin-bottom: 20px;">
+                    <h2 id="info-node-id" style="margin: 0; color: #1a73e8;">請從節點清單選擇節點</h2>
+                    <button id="detail-star" class="star-btn" style="font-size: 1.8em;">☆</button>
+                </div>
                 <div class="detail-grid">
                     <div class="stat-card"><span class="stat-label">最後在線</span><span class="stat-value" id="info-last-seen">-</span></div>
                     <div class="stat-card"><span class="stat-label">電池電量</span><span class="stat-value" id="info-battery">-</span></div>
@@ -92,15 +104,35 @@
                     <div class="stat-card"><span class="stat-label">SNR (訊噪比)</span><span class="stat-value" id="info-snr">-</span></div>
                     <div class="stat-card"><span class="stat-label">RSSI (強度)</span><span class="stat-value" id="info-rssi">-</span></div>
                 </div>
+                
+                <canvas id="telemetryChart" style="max-height: 300px; margin-bottom: 20px;"></canvas>
+
+                <div id="nodeMap"></div>
+
                 <div style="text-align: center; margin-top: 10px;">
-                    <button class="tab-btn" style="border: 1px solid #ddd; border-radius: 8px; padding: 10px 20px;" onclick="switchTab('dashboard')">查看趨勢圖表 📉</button>
+                    <button class="tab-btn" style="border: 1px solid #ddd; border-radius: 8px; padding: 10px 20px;" onclick="switchTab('nodes')">返回節點清單 🔙</button>
                 </div>
+            </div>
+
+            <!-- 分頁 1.8: 最愛節點 -->
+            <div id="tab-favorites" class="tab-content">
+                <h3>⭐ 我的最愛節點</h3>
+                <div class="node-header">
+                    <span></span>
+                    <span>ID</span>
+                    <span>Short Name</span>
+                    <span>Long Name</span>
+                    <span style="text-align: right;">Last Seen</span>
+                </div>
+                <div id="favoriteNodesGrid" class="node-grid"></div>
             </div>
 
             <!-- 分頁 2: 節點清單 -->
             <div id="tab-nodes" class="tab-content">
                 <h3>📡 台灣頻道活動節點</h3>
+                <input type="text" id="nodeSearch" class="search-box" placeholder="搜尋 Node ID 或 Long Name...">
                 <div class="node-header">
+                    <span></span>
                     <span>ID</span>
                     <span>Short Name</span>
                     <span>Long Name</span>
@@ -130,6 +162,11 @@
             // 如果有傳入按鈕物件就使用，否則根據 tabName 尋找按鈕
             const targetBtn = btnEl || document.querySelector(`.tab-btn[onclick*="'${tabName}'"]`);
             if (targetBtn) targetBtn.classList.add('active');
+
+            // 解決 Leaflet 在隱藏容器中初始化導致的渲染問題
+            if (tabName === 'node-info' && map) {
+                setTimeout(() => map.invalidateSize(), 100);
+            }
         }
 
         const ctx = document.getElementById('telemetryChart').getContext('2d');
@@ -139,19 +176,31 @@
                 labels: [],
                 datasets: [
                     { label: '電池電量 (%)', borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.1)', data: [], yAxisID: 'y', tension: 0.4, fill: true },
-                    { label: '溫度 (°C)', borderColor: '#e74c3c', data: [], yAxisID: 'y1', tension: 0.4 }
+                    { label: '溫度 (°C)', borderColor: '#e74c3c', data: [], yAxisID: 'y1', tension: 0.4 },
+                    { label: 'SNR (dB)', borderColor: '#3498db', data: [], yAxisID: 'y2', tension: 0.4 },
+                    { label: 'RSSI (dBm)', borderColor: '#f39c12', data: [], yAxisID: 'y2', tension: 0.4 }
                 ]
             },
             options: {
                 responsive: true,
                 scales: {
                     y: { type: 'linear', position: 'left', title: { display: true, text: '電量 %' }, min: 0, max: 100 },
-                    y1: { type: 'linear', position: 'right', title: { display: true, text: '溫度 °C' }, grid: { drawOnChartArea: false } }
+                    y1: { type: 'linear', position: 'right', title: { display: true, text: '溫度 °C' }, grid: { drawOnChartArea: false } },
+                    y2: { type: 'linear', position: 'right', title: { display: true, text: '信號 (dB/dBm)' }, grid: { drawOnChartArea: false }, min: -140, max: 20 }
                 }
             }
         });
 
         let currentNodeId = '';
+
+        let allNodes = []; // 用於存儲所有節點狀態以供過濾
+
+        // 初始化地圖
+        const map = L.map('nodeMap').setView([23.6, 121], 7);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+        let mapMarker = L.marker([0, 0]).addTo(map);
 
         // 自動偵測 API 基礎路徑
         // 如果是直接開啟檔案，就強制指向 localhost:3000
@@ -189,8 +238,9 @@
         }
 
         document.getElementById('nodeSelector').addEventListener('change', (e) => {
-            currentNodeId = e.target.value;
-            loadNodeHistory(currentNodeId);
+            if (e.target.value) {
+                selectNode(e.target.value);
+            }
         });
 
         // 2. 監聽 Socket.io 即時更新
@@ -227,40 +277,94 @@
         // 載入所有節點在線狀態
         async function fetchNodeStatus() {
             const res = await fetch(`${API_BASE}/api/node-status`);
-            const nodes = await res.json();
-            const grid = document.getElementById('nodeStatusGrid');
+            allNodes = await res.json();
+            renderAllLists();
+        }
+
+        function renderAllLists() {
+            renderNodeList('nodeStatusGrid', false);
+            renderNodeList('favoriteNodesGrid', true);
+        }
+
+        // 統一渲染節點清單
+        function renderNodeList(containerId, onlyFavorites) {
+            const query = document.getElementById('nodeSearch').value.toLowerCase();
+            const grid = document.getElementById(containerId);
+            if (!grid) return;
             grid.innerHTML = '';
-            nodes.forEach(node => {
-                updateNodeStatusUI(node);
+
+            let filtered = allNodes.filter(node => 
+                node.node_id.toLowerCase().includes(query) || 
+                (node.long_name && node.long_name.toLowerCase().includes(query))
+            );
+
+            if (onlyFavorites) {
+                filtered = filtered.filter(node => node.is_favorite);
+            }
+
+            filtered.forEach(node => {
+                const item = document.createElement('div');
+                item.id = `${containerId}-${node.node_id}`;
+                item.className = 'node-item';
+                const timeStr = new Date(node.last_seen).toLocaleTimeString();
+                const isFav = !!node.is_favorite;
+
+                item.innerHTML = `
+                    <button class="star-btn ${isFav ? 'active' : ''}" onclick="toggleFavorite(event, '${node.node_id}', ${isFav})">
+                        ${isFav ? '★' : '☆'}
+                    </button>
+                    <span class="node-id" onclick="selectNode('${node.node_id}')">${node.node_id}</span>
+                    <span class="node-short">${node.short_name || '---'}</span>
+                    <span class="node-name">${node.long_name || 'Unknown Node'}</span>
+                    <span class="node-time" style="text-align: right;">${timeStr}</span>
+                `;
+                grid.appendChild(item);
             });
         }
 
-        function updateNodeStatusUI(nodeData) {
-            const { node_id, long_name, short_name, last_seen } = nodeData;
-            const grid = document.getElementById('nodeStatusGrid');
-            let item = document.getElementById(`status-${node_id}`);
-            const timeStr = new Date(last_seen).toLocaleTimeString();
-
-            if (!item) {
-                item = document.createElement('div');
-                item.id = `status-${node_id}`;
-                item.className = 'node-item';
-                grid.prepend(item); // 新出現的排前面
-            }
-
-            item.innerHTML = `
-                <span class="node-id" onclick="selectNode('${node_id}')">${node_id}</span>
-                <span class="node-short">${short_name || '---'}</span>
-                <span class="node-name">${long_name || 'Unknown Node'}</span>
-                <span class="node-time">${timeStr}</span>
-            `;
+        async function toggleFavorite(event, nodeId, currentStatus) {
+            if (event) event.stopPropagation();
+            const newStatus = !currentStatus;
+            
+            try {
+                const res = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}/favorite`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ is_favorite: newStatus })
+                });
+                if (res.ok) {
+                    const node = allNodes.find(n => n.node_id === nodeId);
+                    if (node) node.is_favorite = newStatus ? 1 : 0;
+                    renderAllLists();
+                    // 如果正在詳情頁，同步更新星星
+                    if (currentNodeId === nodeId) updateDetailStar(newStatus);
+                }
+            } catch (err) { console.error('切換最愛失敗:', err); }
         }
 
+        function updateNodeStatusUI(nodeData) {
+            const index = allNodes.findIndex(n => n.node_id === nodeData.node_id);
+            if (index !== -1) {
+                allNodes[index] = { ...allNodes[index], ...nodeData };
+            } else {
+                allNodes.push(nodeData);
+            }
+            // 重新按時間排序
+            allNodes.sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen));
+            renderAllLists();
+        }
+
+        // 監聽搜尋框輸入事件
+        document.getElementById('nodeSearch').addEventListener('input', () => renderNodeList('nodeStatusGrid', false));
+
         async function selectNode(nodeId) {
+            currentNodeId = nodeId;
             const selector = document.getElementById('nodeSelector');
             selector.value = nodeId;
-            selector.dispatchEvent(new Event('change'));
-            
+            // 移除 dispatchEvent 以避免無限遞迴迴圈
+
+            // 更新趨勢圖表
+            await loadNodeHistory(nodeId);
             // 更新詳情分頁的資訊
             await fetchNodeDetail(nodeId);
             
@@ -269,12 +373,21 @@
         }
 
         async function fetchNodeDetail(nodeId) {
+            // 取得節點基礎資訊 (包含經緯度)
+            const nodeRes = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}`);
+            const nodeInfo = await nodeRes.json();
+
+            updateDetailStar(!!nodeInfo.is_favorite);
+
+            // 取得最新遙測數據
             const res = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=1`);
             const data = await res.json();
             
             document.getElementById('info-node-id').innerText = `節點詳情: ${nodeId}`;
+            let latestBattery = 'N/A';
             if (data.length > 0) {
                 const latest = data[0];
+                latestBattery = latest.battery_level !== null ? `${latest.battery_level}%` : 'N/A';
                 document.getElementById('info-last-seen').innerText = new Date(latest.timestamp).toLocaleString();
                 document.getElementById('info-battery').innerText = latest.battery_level ? `${latest.battery_level}%` : 'N/A';
                 document.getElementById('info-temp').innerText = latest.temperature ? `${latest.temperature}°C` : 'N/A';
@@ -284,6 +397,31 @@
             } else {
                 ['info-last-seen', 'info-battery', 'info-temp', 'info-humidity', 'info-snr', 'info-rssi'].forEach(id => document.getElementById(id).innerText = '無遙測數據');
             }
+
+            // 更新地圖
+            if (nodeInfo.latitude && nodeInfo.longitude) {
+                const pos = [nodeInfo.latitude, nodeInfo.longitude];
+                mapMarker.setLatLng(pos);
+                
+                // 綁定彈出視窗內容 (點擊標記時顯示)
+                mapMarker.bindPopup(`
+                    <div style="text-align: center;">
+                        <strong style="font-size: 1.1em;">${nodeInfo.short_name || 'Unknown'}</strong><br>
+                        <span style="color: #666;">🔋 電量: ${latestBattery}</span>
+                    </div>
+                `);
+
+                map.setView(pos, 13);
+            } else {
+                map.setView([23.6, 121], 7);
+            }
+        }
+
+        function updateDetailStar(isFav) {
+            const btn = document.getElementById('detail-star');
+            btn.innerText = isFav ? '★' : '☆';
+            btn.className = `star-btn ${isFav ? 'active' : ''}`;
+            btn.onclick = (e) => toggleFavorite(e, currentNodeId, isFav);
         }
 
         // 監聽所有原始封包
@@ -315,6 +453,8 @@
             chart.data.labels.push(label);
             chart.data.datasets[0].data.push(data.battery_level);
             chart.data.datasets[1].data.push(data.temperature);
+            chart.data.datasets[2].data.push(data.snr);
+            chart.data.datasets[3].data.push(data.rssi);
 
             // 保持顯示最近 20 筆
             if (chart.data.labels.length > 20) {

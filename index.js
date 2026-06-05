@@ -65,9 +65,15 @@ db.serialize(() => {
             node_id TEXT PRIMARY KEY,
             long_name TEXT,
             short_name TEXT,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            latitude REAL,
+            longitude REAL,
+            is_favorite INTEGER DEFAULT 0
         )
     `);
+    // 確保舊資料庫也能加上欄位 (如果已存在則會忽略錯誤)
+    db.run(`ALTER TABLE nodes ADD COLUMN is_favorite INTEGER DEFAULT 0`, (err) => {});
+
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
 });
@@ -131,6 +137,23 @@ app.get('/api/node-status', (req, res) => {
     });
 });
 
+// 取得單一節點的詳細資訊
+app.get('/api/node/:nodeId', (req, res) => {
+    db.get(`SELECT * FROM nodes WHERE node_id = ?`, [req.params.nodeId], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(row || {});
+    });
+});
+
+// 切換節點最愛狀態
+app.post('/api/node/:nodeId/favorite', (req, res) => {
+    const { is_favorite } = req.body;
+    db.run(`UPDATE nodes SET is_favorite = ? WHERE node_id = ?`, [is_favorite ? 1 : 0, req.params.nodeId], function(err) {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ success: true, is_favorite: is_favorite });
+    });
+});
+
 // 啟動 Express 伺服器
 server.listen(PORT, () => {
     console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
@@ -143,7 +166,7 @@ server.listen(PORT, () => {
 const root = new protobuf.Root();
 root.resolvePath = (origin, target) => __dirname + '/protobufs/' + target;
 
-let ServiceEnvelope, Telemetry, User;
+let ServiceEnvelope, Telemetry, User, Position;
 
 root.load([
     "meshtastic/mqtt.proto", 
@@ -158,6 +181,7 @@ root.load([
     ServiceEnvelope = root.lookupType("meshtastic.ServiceEnvelope");
     Telemetry = root.lookupType("meshtastic.Telemetry");
     User = root.lookupType("meshtastic.User");
+    Position = root.lookupType("meshtastic.Position");
     console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
     startMqtt();
 });
@@ -247,6 +271,23 @@ function startMqtt() {
                         }
                     });
                 } catch (e) { console.error('❌ 解析 NodeInfo 失敗', e); }
+            }
+
+            // 解析位置資訊 (經緯度)
+            if (decodedData.portnum === 1 || decodedData.portnum === 'POSITION_APP') {
+                try {
+                    const pos = Position.decode(decodedData.payload);
+                    if (pos.latitude_i && pos.longitude_i) {
+                        const lat = pos.latitude_i / 1e7;
+                        const lng = pos.longitude_i / 1e7;
+                        db.run(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [lat, lng, fromId], (err) => {
+                            if (!err) {
+                                console.log(`📍 [位置更新] 節點: ${fromId} -> ${lat}, ${lng}`);
+                                io.emit('node_seen', { node_id: fromId, latitude: lat, longitude: lng, last_seen: new Date().toISOString() });
+                            }
+                        });
+                    }
+                } catch (e) { console.error('❌ 解析 Position 失敗', e); }
             }
 
             if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
