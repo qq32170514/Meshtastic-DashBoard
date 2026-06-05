@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -33,14 +34,18 @@ process.on('uncaughtException', (err) => {
 
 // 你的專屬節點 ID
 const myNodeId = '!7931b961'; 
-app.use(express.static(__dirname)); // 允許存取同目錄下的靜態檔案
+
+// 靜態檔案路徑：優先服務前端編譯出的 dist 夾，若無則服務目前目錄（相容舊 index.html）
+app.use(express.static(path.join(__dirname, 'frontend/dist')));
+app.use(express.static(__dirname));
 
 // ==========================================
 // 1. 初始化 SQLite 資料庫
 // ==========================================
-const db = new sqlite3.Database('./meshtastic.db', (err) => {
+const dbPath = path.join(__dirname, 'meshtastic.db');
+const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error('❌ 資料庫連線失敗:', err.message);
-    else console.log('🗄️ SQLite 資料庫連線成功！');
+    else console.log(`🗄️ SQLite 資料庫已連線至: ${dbPath}`);
 });
 
 db.serialize(() => {
@@ -146,7 +151,10 @@ app.get('/api/telemetry', (req, res) => {
     params.push(limit);
 
     db.all(sql, params, (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) {
+            console.error('❌ API /api/telemetry Error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
         res.json(rows);
     });
 });
@@ -154,7 +162,10 @@ app.get('/api/telemetry', (req, res) => {
 // 取得目前所有已知的節點清單
 app.get('/api/nodes', (req, res) => {
     db.all(`SELECT node_id FROM nodes ORDER BY node_id ASC`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) {
+            console.error('❌ API /api/nodes Error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
         res.json(rows.map(row => row.node_id));
     });
 });
@@ -162,7 +173,10 @@ app.get('/api/nodes', (req, res) => {
 // 取得所有節點的詳細在線狀態
 app.get('/api/node-status', (req, res) => {
     db.all(`SELECT * FROM nodes ORDER BY last_seen DESC`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) {
+            console.error('❌ API /api/node-status Error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
         res.json(rows);
     });
 });
@@ -188,7 +202,7 @@ app.get('/api/node/:nodeId/packets', (req, res) => {
 // 取得單一節點的閘道收信統計 (Received Gateways)
 app.get('/api/node/:nodeId/gateways', (req, res) => {
     const sql = `
-        SELECT gateway_id, COUNT(*) as count, MAX(timestamp) as last_seen 
+        SELECT gateway_id, COUNT(*) as count, MAX(timestamp) as last_seen, MAX(hop_start) as hop_start, MIN(hop_limit) as hop_limit
         FROM packet_logs 
         WHERE node_id = ? AND gateway_id IS NOT NULL AND gateway_id != ''
         GROUP BY gateway_id 
@@ -234,13 +248,15 @@ server.listen(PORT, () => {
 const root = new protobuf.Root();
 root.resolvePath = (origin, target) => __dirname + '/protobufs/' + target;
 
-let ServiceEnvelope, Telemetry, User, Position;
+let ServiceEnvelope, Telemetry, User, Position, MapReport;
 
 root.load([
     "meshtastic/mqtt.proto", 
     "meshtastic/telemetry.proto",
     "meshtastic/portnums.proto",
-    "meshtastic/mesh.proto"
+    "meshtastic/mesh.proto",
+    "meshtastic/channel.proto",
+    "meshtastic/config.proto"
 ], { keepCase: true }, (err) => {
     if (err) {
         console.error('❌ Protobuf 字典載入失敗:', err);
@@ -250,14 +266,15 @@ root.load([
     Telemetry = root.lookupType("meshtastic.Telemetry");
     User = root.lookupType("meshtastic.User");
     Position = root.lookupType("meshtastic.Position");
+    MapReport = root.lookupType("meshtastic.MapReport");
     console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
-    startMqtt();
+    startMqttClient(); // 修正為 startMqttClient
 });
 
 // ==========================================
 // 3. 啟動 MQTT 監聽與資料寫入
 // ==========================================
-function startMqtt() {
+function startMqttClient() { // 修正函數名稱為 startMqttClient
     const client = mqtt.connect('mqtt://mqtt.meshtastic.org', {
         username: 'meshdev',
         password: 'large4cats',
@@ -293,12 +310,52 @@ function startMqtt() {
 
         try {
             const envelope = ServiceEnvelope.decode(message);
-            if (!envelope.packet || !envelope.packet.decoded) return;
+            if (!envelope.packet) return;
             
             const packet = envelope.packet;
-            const decodedData = packet.decoded;
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             const gatewayId = envelope.gateway_id || 'Unknown';
+
+            // 1. 無論封包是否解碼，都先更新節點的「最後在線」狀態
+            // 這能確保即使內容加密，我們也能在儀表板看到該 Node ID 出現
+            // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
+            const nodeUpdateSql = `
+                INSERT INTO nodes (node_id, last_seen, last_topic, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
+            `;
+            db.run(nodeUpdateSql, [fromId, topic, packet.hop_limit || 0, packet.hop_start || 0], (err) => {
+                if (!err) {
+                    io.emit('node_seen', { 
+                        node_id: fromId, 
+                        last_seen: new Date().toISOString(),
+                        last_topic: topic
+                    });
+                }
+            });
+
+            // 2. 如果封包未解碼 (加密封包)，我們仍然記錄它到日誌，但不執行後續的 Payload 解析
+            if (!packet.decoded) {
+                console.log(`📦 [收到加密封包] 來自: ${fromId} | Topic: ${topic}`);
+                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null]);
+                
+                io.emit('raw_packet', {
+                    from: fromId,
+                    portnum: 'ENCRYPTED',
+                    topic: topic,
+                    gateway_id: gatewayId,
+                    time: new Date().toLocaleTimeString(),
+                    snr: packet.rx_snr || null,
+                    rssi: packet.rx_rssi || null,
+                    hop_limit: packet.hop_limit || 0,
+                    hop_start: packet.hop_start || 0,
+                    payload_json: null,
+                    rawData: rawHex
+                });
+                return; // 加封包處理結束
+            }
+
+            const decodedData = packet.decoded;
 
             // --- 嘗試預先解碼 Payload 以供檢視 ---
             let payloadObj = null;
@@ -309,6 +366,8 @@ function startMqtt() {
                     payloadObj = Position.toObject(Position.decode(decodedData.payload), { enums: String, defaults: true });
                 } else if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
                     payloadObj = Telemetry.toObject(Telemetry.decode(decodedData.payload), { enums: String, defaults: true });
+                } else if (decodedData.portnum === 73 || decodedData.portnum === 'MAP_REPORT_APP') {
+                    payloadObj = MapReport.toObject(MapReport.decode(decodedData.payload), { enums: String, defaults: true });
                 }
             } catch (e) { /* 解析失敗則維持 null */ }
             const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
@@ -316,19 +375,6 @@ function startMqtt() {
             // 在 Terminal 顯示收到的封包摘要
             console.log(`📦 [收到封包] 來自: ${fromId} | Port: ${decodedData.portnum} | Topic: ${topic}`);
             
-            // 更新節點最後在線時間 (不論是否為遙測封包)
-            // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
-            const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen, last_topic, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
-            `;
-            db.run(nodeUpdateSql, [fromId, topic, packet.hop_limit || 0, packet.hop_start || 0], (err) => {
-                if (!err) {
-                    // node_seen 會在下方解析名稱後一併推播，或在此單獨推播基礎資訊
-                    io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString() });
-                }
-            });
-
             // 將封包寫入歷史紀錄表
             db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
                 [fromId, decodedData.portnum, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson]);
@@ -353,15 +399,17 @@ function startMqtt() {
                 try {
                     const user = User.decode(decodedData.payload);
                     db.run(`
-                        UPDATE nodes SET long_name = ?, short_name = ? WHERE node_id = ?
-                    `, [user.long_name, user.short_name, fromId], (err) => {
+                        UPDATE nodes SET long_name = ?, short_name = ?, role = ? WHERE node_id = ?
+                    `, [user.long_name, user.short_name, user.role, fromId], (err) => {
                         if (!err) {
                             console.log(`👤 [節點資訊] 更新名稱: ${user.short_name} (${user.long_name})`);
                             io.emit('node_seen', { 
                                 node_id: fromId, 
                                 long_name: user.long_name, 
                                 short_name: user.short_name,
-                                last_seen: new Date().toISOString() 
+                                role: user.role,
+                                last_seen: new Date().toISOString(),
+                                last_topic: topic
                             });
                         }
                     });
@@ -378,11 +426,42 @@ function startMqtt() {
                         db.run(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [lat, lng, fromId], (err) => {
                             if (!err) {
                                 console.log(`📍 [位置更新] 節點: ${fromId} -> ${lat}, ${lng}`);
-                                io.emit('node_seen', { node_id: fromId, latitude: lat, longitude: lng, last_seen: new Date().toISOString() });
+                                io.emit('node_seen', { 
+                                    node_id: fromId, 
+                                    latitude: lat, 
+                                    longitude: lng, 
+                                    last_seen: new Date().toISOString(),
+                                    last_topic: topic
+                                });
                             }
                         });
                     }
                 } catch (e) { console.error('❌ 解析 Position 失敗', e); }
+            }
+
+            // 解析 MapReport (包含名稱與位置)
+            if (decodedData.portnum === 73 || decodedData.portnum === 'MAP_REPORT_APP') {
+                try {
+                    const report = MapReport.decode(decodedData.payload);
+                    const lat = report.latitude_i / 1e7;
+                    const lng = report.longitude_i / 1e7;
+                    db.run(`
+                        UPDATE nodes SET long_name = ?, short_name = ?, latitude = ?, longitude = ? WHERE node_id = ?
+                    `, [report.long_name, report.short_name, lat, lng, fromId], (err) => {
+                        if (!err) {
+                            console.log(`🗺️ [地圖報告] 節點: ${report.short_name} -> ${lat}, ${lng}`);
+                            io.emit('node_seen', { 
+                                node_id: fromId, 
+                                long_name: report.long_name, 
+                                short_name: report.short_name,
+                                latitude: lat,
+                                longitude: lng,
+                                last_seen: new Date().toISOString(),
+                                last_topic: topic
+                            });
+                        }
+                    });
+                } catch (e) { console.error('❌ 解析 MapReport 失敗', e); }
             }
 
             if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
@@ -420,11 +499,14 @@ function startMqtt() {
                         io.emit('telemetry_update', {
                             node_id: fromId,
                             battery_level: params[1],
+                            voltage: params[2],
                             temperature: params[3],
                             humidity: params[4],
                             channel_utilization: params[5],
                             air_util_tx: params[6],
                             timestamp: new Date().toISOString(),
+                            temperature: params[3],
+                            humidity: params[4],
                             snr: params[7],
                             rssi: params[8],
                             hop_limit: params[9],
