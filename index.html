@@ -36,6 +36,7 @@
         .star-btn.active { color: #f1c40f; }
 
         #nodeMap { height: 350px; width: 100%; border-radius: 12px; border: 1px solid #e2e8f0; margin-top: 20px; z-index: 1; }
+        #favoritesMap { height: 400px; width: 100%; border-radius: 12px; border: 1px solid #e2e8f0; margin-top: 20px; z-index: 1; }
         .search-box { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 8px; font-size: 1em; box-sizing: border-box; }
         .controls { text-align: center; margin-bottom: 20px; display: flex; justify-content: center; align-items: center; gap: 10px; }
         select { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 1em; }
@@ -93,19 +94,50 @@
             <!-- 分頁 1.5: 節點詳情 -->
             <div id="tab-node-info" class="tab-content">
                 <div style="display: flex; justify-content: center; align-items: center; gap: 10px; margin-bottom: 20px;">
-                    <h2 id="info-node-id" style="margin: 0; color: #1a73e8;">請從節點清單選擇節點</h2>
+                    <div style="text-align: center;">
+                        <h2 id="info-long-name" style="margin: 0; color: #1a73e8;">請從節點清單選擇節點</h2>
+                        <h3 id="info-short-name" style="margin: 5px 0; color: #4a5568;"></h3>
+                        <div id="info-node-id" style="font-family: monospace; color: #718096; font-size: 0.9em;"></div>
+                    </div>
                     <button id="detail-star" class="star-btn" style="font-size: 1.8em;">☆</button>
                 </div>
                 <div class="detail-grid">
-                    <div class="stat-card"><span class="stat-label">最後在線</span><span class="stat-value" id="info-last-seen">-</span></div>
-                    <div class="stat-card"><span class="stat-label">電池電量</span><span class="stat-value" id="info-battery">-</span></div>
-                    <div class="stat-card"><span class="stat-label">環境溫度</span><span class="stat-value" id="info-temp">-</span></div>
-                    <div class="stat-card"><span class="stat-label">環境濕度</span><span class="stat-value" id="info-humidity">-</span></div>
-                    <div class="stat-card"><span class="stat-label">SNR (訊噪比)</span><span class="stat-value" id="info-snr">-</span></div>
-                    <div class="stat-card"><span class="stat-label">RSSI (強度)</span><span class="stat-value" id="info-rssi">-</span></div>
+                    <div class="stat-card"><span class="stat-label">最後在線 (最後封包)</span><span class="stat-value" id="info-last-seen">-</span><small id="info-last-seen-relative" style="color: #718096;"></small></div>
+                    <div class="stat-card"><span class="stat-label">最後通訊 Topic</span><span class="stat-value" id="info-last-topic" style="font-size: 0.8em; word-break: break-all;">-</span></div>
                 </div>
                 
-                <canvas id="telemetryChart" style="max-height: 300px; margin-bottom: 20px;"></canvas>
+                <!-- 三個獨立的趨勢圖 -->
+                <div style="margin-bottom: 30px;">
+                    <h4 style="color: #4a5568; margin-bottom: 10px;">⚡ 電源與頻道負載 (Battery / CU / AU)</h4>
+                    <canvas id="powerChart" style="max-height: 250px;"></canvas>
+                </div>
+                <div style="margin-bottom: 30px;">
+                    <h4 style="color: #4a5568; margin-bottom: 10px;">🌡️ 環境監測 (Temp / Humidity)</h4>
+                    <canvas id="envChart" style="max-height: 250px;"></canvas>
+                </div>
+                <div style="margin-bottom: 30px;">
+                    <h4 style="color: #4a5568; margin-bottom: 10px;">📡 訊號品質 (SNR / RSSI)</h4>
+                    <canvas id="signalChart" style="max-height: 250px;"></canvas>
+                </div>
+
+                <!-- 歷史封包紀錄表格 -->
+                <div style="margin-top: 30px; margin-bottom: 30px;">
+                    <h3 style="color: #1a73e8; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px;">📜 最近封包紀錄 (Packet Logs)</h3>
+                    <table class="packet-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 150px;">時間</th>
+                                <th style="width: 120px;">類型 (Port)</th>
+                                <th style="width: 80px;">SNR</th>
+                                <th style="width: 80px;">RSSI</th>
+                                <th>MQTT Topic / Path</th>
+                            </tr>
+                        </thead>
+                        <tbody id="packetHistoryBody">
+                            <tr><td colspan="5" style="text-align:center;">載入中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
 
                 <div id="nodeMap"></div>
 
@@ -117,6 +149,11 @@
             <!-- 分頁 1.8: 最愛節點 -->
             <div id="tab-favorites" class="tab-content">
                 <h3>⭐ 我的最愛節點</h3>
+                
+                <!-- 新增：最愛節點綜合趨勢圖 -->
+                <canvas id="favoritesChart" style="max-height: 300px; margin-bottom: 20px;"></canvas>
+
+                <!-- 節點清單標頭 -->
                 <div class="node-header">
                     <span></span>
                     <span>ID</span>
@@ -125,6 +162,9 @@
                     <span style="text-align: right;">Last Seen</span>
                 </div>
                 <div id="favoriteNodesGrid" class="node-grid"></div>
+
+                <!-- 新增：最愛節點分佈地圖 -->
+                <div id="favoritesMap"></div>
             </div>
 
             <!-- 分頁 2: 節點清單 -->
@@ -167,26 +207,86 @@
             if (tabName === 'node-info' && map) {
                 setTimeout(() => map.invalidateSize(), 100);
             }
+            // 解決最愛分頁地圖渲染問題
+            if (tabName === 'favorites' && favoritesMap) {
+                setTimeout(() => favoritesMap.invalidateSize(), 100);
+                loadFavoritesTelemetry();
+            }
         }
 
-        const ctx = document.getElementById('telemetryChart').getContext('2d');
-        const chart = new Chart(ctx, {
+        // 1. 電源與負載圖表 (Battery / CU / AU)
+        const powerChart = new Chart(document.getElementById('powerChart').getContext('2d'), {
             type: 'line',
             data: {
                 labels: [],
                 datasets: [
                     { label: '電池電量 (%)', borderColor: '#2ecc71', backgroundColor: 'rgba(46, 204, 113, 0.1)', data: [], yAxisID: 'y', tension: 0.4, fill: true },
-                    { label: '溫度 (°C)', borderColor: '#e74c3c', data: [], yAxisID: 'y1', tension: 0.4 },
-                    { label: 'SNR (dB)', borderColor: '#3498db', data: [], yAxisID: 'y2', tension: 0.4 },
-                    { label: 'RSSI (dBm)', borderColor: '#f39c12', data: [], yAxisID: 'y2', tension: 0.4 }
+                    { label: '頻道佔用 (CU %)', borderColor: '#9b59b6', data: [], yAxisID: 'y', tension: 0.4 },
+                    { label: '發送負載 (AU %)', borderColor: '#34495e', data: [], yAxisID: 'y', tension: 0.4 }
                 ]
             },
             options: {
                 responsive: true,
+                maintainAspectRatio: false,
                 scales: {
-                    y: { type: 'linear', position: 'left', title: { display: true, text: '電量 %' }, min: 0, max: 100 },
-                    y1: { type: 'linear', position: 'right', title: { display: true, text: '溫度 °C' }, grid: { drawOnChartArea: false } },
-                    y2: { type: 'linear', position: 'right', title: { display: true, text: '信號 (dB/dBm)' }, grid: { drawOnChartArea: false }, min: -140, max: 20 }
+                    y: { min: 0, max: 100, title: { display: true, text: '百分比 (%)' } }
+                }
+            }
+        });
+
+        // 2. 環境監測圖表 (Temp / Humidity)
+        const envChart = new Chart(document.getElementById('envChart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: '溫度 (°C)', borderColor: '#e74c3c', data: [], yAxisID: 'y', tension: 0.4 },
+                    { label: '濕度 (%)', borderColor: '#3498db', data: [], yAxisID: 'y1', tension: 0.4 }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { type: 'linear', position: 'left', title: { display: true, text: '溫度 °C' } },
+                    y1: { type: 'linear', position: 'right', title: { display: true, text: '濕度 %' }, grid: { drawOnChartArea: false }, min: 0, max: 100 }
+                }
+            }
+        });
+
+        // 3. 訊號品質圖表 (SNR / RSSI)
+        const signalChart = new Chart(document.getElementById('signalChart').getContext('2d'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'SNR (dB)', borderColor: '#2980b9', data: [], yAxisID: 'y', tension: 0.4 },
+                    { label: 'RSSI (dBm)', borderColor: '#f39c12', data: [], yAxisID: 'y1', tension: 0.4 }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { type: 'linear', position: 'left', title: { display: true, text: 'SNR (dB)' }, min: -20, max: 20 },
+                    y1: { type: 'linear', position: 'right', title: { display: true, text: 'RSSI (dBm)' }, grid: { drawOnChartArea: false }, min: -140, max: 0 }
+                }
+            }
+        });
+
+        const allDetailCharts = [powerChart, envChart, signalChart];
+
+        // 初始化最愛節點綜合圖表 (顯示所有最愛節點的電量)
+        const fCanvas = document.getElementById('favoritesChart');
+        let favoritesChart = new Chart(fCanvas.getContext('2d'), {
+            type: 'line',
+            data: { labels: [], datasets: [] },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { title: { display: true, text: '最愛節點電量趨勢 (%)' } },
+                scales: {
+                    y: { min: 0, max: 100, title: { display: true, text: '電量 %' } }
                 }
             }
         });
@@ -201,6 +301,13 @@
             attribution: '© OpenStreetMap'
         }).addTo(map);
         let mapMarker = L.marker([0, 0]).addTo(map);
+
+        // 初始化最愛節點地圖
+        const favoritesMap = L.map('favoritesMap').setView([23.6, 121], 7);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(favoritesMap);
+        let favoriteMarkers = {}; // 儲存 node_id -> marker
 
         // 自動偵測 API 基礎路徑
         // 如果是直接開啟檔案，就強制指向 localhost:3000
@@ -230,11 +337,10 @@
             const data = await res.json();
             
             // 清空舊圖表數據
-            chart.data.labels = [];
-            chart.data.datasets.forEach(d => d.data = []);
-            
+            allDetailCharts.forEach(c => { c.data.labels = []; c.data.datasets.forEach(d => d.data = []); });
+
             data.reverse().forEach(item => updateChart(item, true));
-            chart.update();
+            allDetailCharts.forEach(c => c.update());
         }
 
         document.getElementById('nodeSelector').addEventListener('change', (e) => {
@@ -284,6 +390,7 @@
         function renderAllLists() {
             renderNodeList('nodeStatusGrid', false);
             renderNodeList('favoriteNodesGrid', true);
+            updateFavoritesMap();
         }
 
         // 統一渲染節點清單
@@ -322,6 +429,27 @@
             });
         }
 
+        // 更新最愛地圖上的所有標記
+        function updateFavoritesMap() {
+            // 清除現有標記
+            Object.values(favoriteMarkers).forEach(m => favoritesMap.removeLayer(m));
+            favoriteMarkers = {};
+
+            allNodes.filter(n => n.is_favorite && n.latitude && n.longitude).forEach(node => {
+                const marker = L.marker([node.latitude, node.longitude])
+                    .addTo(favoritesMap)
+                    .bindPopup(`<b>${node.short_name || node.node_id}</b><br>ID: ${node.node_id}`);
+                favoriteMarkers[node.node_id] = marker;
+            });
+            
+            // 如果有標記，自動調整地圖縮放以包含所有點
+            const markers = Object.values(favoriteMarkers);
+            if (markers.length > 0) {
+                const group = new L.featureGroup(markers);
+                favoritesMap.fitBounds(group.getBounds().pad(0.1));
+            }
+        }
+
         async function toggleFavorite(event, nodeId, currentStatus) {
             if (event) event.stopPropagation();
             const newStatus = !currentStatus;
@@ -338,6 +466,14 @@
                     renderAllLists();
                     // 如果正在詳情頁，同步更新星星
                     if (currentNodeId === nodeId) updateDetailStar(newStatus);
+                    
+                    // 更新最愛圖表結構
+                    if (!newStatus) {
+                        favoritesChart.data.datasets = favoritesChart.data.datasets.filter(d => d.label !== nodeId);
+                        favoritesChart.update();
+                    } else {
+                        loadFavoritesTelemetry();
+                    }
                 }
             } catch (err) { console.error('切換最愛失敗:', err); }
         }
@@ -383,19 +519,43 @@
             const res = await fetch(`${API_BASE}/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=1`);
             const data = await res.json();
             
-            document.getElementById('info-node-id').innerText = `節點詳情: ${nodeId}`;
+            // 清除之前的定時器 (如有)
+            if (window.lastSeenTimer) clearInterval(window.lastSeenTimer);
+
+            // 更新頂部三行資訊
+            document.getElementById('info-long-name').innerText = nodeInfo.long_name || 'Unknown Node';
+            document.getElementById('info-short-name').innerText = nodeInfo.short_name || '';
+            document.getElementById('info-node-id').innerText = nodeId;
+            document.getElementById('info-last-topic').innerText = nodeInfo.last_topic || 'Unknown';
+
+            // 顯示最後在線時間並啟動相對時間計數
+            const updateRelativeTime = () => {
+                const lastSeenDate = new Date(nodeInfo.last_seen);
+                const now = new Date();
+                const diffInSecs = Math.floor((now - lastSeenDate) / 1000);
+                
+                let text = '';
+                if (diffInSecs < 60) text = `${diffInSecs} 秒前`;
+                else if (diffInSecs < 3600) text = `${Math.floor(diffInSecs / 60)} 分鐘前`;
+                else text = `${Math.floor(diffInSecs / 3600)} 小時前`;
+                
+                document.getElementById('info-last-seen').innerText = lastSeenDate.toLocaleTimeString();
+                document.getElementById('info-last-seen-relative').innerText = `(${text})`;
+            };
+
+            updateRelativeTime();
+            window.lastSeenTimer = setInterval(updateRelativeTime, 5000); // 每 5 秒更新一次文字
+
+            // 載入封包歷史
+            fetchNodePackets(nodeId);
+
             let latestBattery = 'N/A';
             if (data.length > 0) {
                 const latest = data[0];
                 latestBattery = latest.battery_level !== null ? `${latest.battery_level}%` : 'N/A';
                 document.getElementById('info-last-seen').innerText = new Date(latest.timestamp).toLocaleString();
-                document.getElementById('info-battery').innerText = latest.battery_level ? `${latest.battery_level}%` : 'N/A';
-                document.getElementById('info-temp').innerText = latest.temperature ? `${latest.temperature}°C` : 'N/A';
-                document.getElementById('info-humidity').innerText = latest.humidity ? `${latest.humidity}%` : 'N/A';
-                document.getElementById('info-snr').innerText = latest.snr !== null ? `${latest.snr} dB` : 'N/A';
-                document.getElementById('info-rssi').innerText = latest.rssi !== null ? `${latest.rssi} dBm` : 'N/A';
             } else {
-                ['info-last-seen', 'info-battery', 'info-temp', 'info-humidity', 'info-snr', 'info-rssi'].forEach(id => document.getElementById(id).innerText = '無遙測數據');
+                document.getElementById('info-last-seen').innerText = '無遙測數據';
             }
 
             // 更新地圖
@@ -417,11 +577,67 @@
             }
         }
 
+        async function fetchNodePackets(nodeId) {
+            const res = await fetch(`${API_BASE}/api/node/${encodeURIComponent(nodeId)}/packets?limit=20`);
+            const packets = await res.json();
+            const tbody = document.getElementById('packetHistoryBody');
+            tbody.innerHTML = '';
+            packets.forEach(p => addPacketToTable(p, false));
+        }
+
+        function addPacketToTable(p, isNew = true) {
+            const tbody = document.getElementById('packetHistoryBody');
+            const row = document.createElement('tr');
+            const time = new Date(p.timestamp || Date.now()).toLocaleTimeString();
+            row.innerHTML = `
+                <td>${time}</td>
+                <td><span class="port-tag">${p.portnum}</span></td>
+                <td>${p.snr !== null ? p.snr : '-'}</td>
+                <td>${p.rssi !== null ? p.rssi : '-'}</td>
+                <td style="font-family: monospace; font-size: 0.9em; color: #718096;">${p.topic}</td>
+            `;
+            if (isNew) tbody.insertBefore(row, tbody.firstChild);
+            else tbody.appendChild(row);
+            if (tbody.rows.length > 50) tbody.deleteRow(-1);
+        }
+
         function updateDetailStar(isFav) {
             const btn = document.getElementById('detail-star');
             btn.innerText = isFav ? '★' : '☆';
             btn.className = `star-btn ${isFav ? 'active' : ''}`;
             btn.onclick = (e) => toggleFavorite(e, currentNodeId, isFav);
+        }
+
+        // 載入所有最愛節點的歷史遙測資料 (修正數據過濾邏輯)
+        async function loadFavoritesTelemetry() {
+            const favNodes = allNodes.filter(n => n.is_favorite);
+            if (favNodes.length === 0) return;
+
+            // 為了簡化，從 API 抓取最近 100 筆全局資料並按節點分類
+            const res = await fetch(`${API_BASE}/api/telemetry?limit=100`);
+            const data = await res.json();
+            
+            // 重置圖表數據集
+            favoritesChart.data.datasets = [];
+            const nodeColors = ['#2ecc71', '#3498db', '#9b59b6', '#f1c40f', '#e67e22', '#e74c3c'];
+
+            favNodes.forEach((node, i) => {
+                const nodeData = data.filter(d => d.node_id === node.node_id).reverse();
+                if (nodeData.length > 0) {
+                    favoritesChart.data.datasets.push({
+                        label: node.short_name || node.node_id,
+                        borderColor: nodeColors[i % nodeColors.length],
+                        data: nodeData.map(d => ({ x: new Date(d.timestamp).toLocaleTimeString(), y: d.battery_level })),
+                        tension: 0.4,
+                        fill: false
+                    });
+                }
+            });
+            
+            // 統一標籤
+            const allLabels = [...new Set(data.map(d => new Date(d.timestamp).toLocaleTimeString()))].sort();
+            favoritesChart.data.labels = allLabels.slice(-20);
+            favoritesChart.update();
         }
 
         // 監聽所有原始封包
@@ -439,6 +655,11 @@
 
             // 限制日誌數量，避免瀏覽器變慢
             if (logList.childNodes.length > 50) logList.removeChild(logList.lastChild);
+
+            // 同步更新詳情頁面的封包表格
+            if (currentNodeId && data.from === currentNodeId) {
+                addPacketToTable({ timestamp: new Date(), portnum: data.portnum, snr: data.snr, rssi: data.rssi, topic: data.topic }, true);
+            }
         });
 
         function updateChart(data, isBatch = false) {
@@ -448,20 +669,44 @@
             const label = new Date(data.timestamp).toLocaleTimeString();
             
             // 避免重複加入相同時間點的資料
-            if (chart.data.labels.includes(label)) return;
+            if (powerChart.data.labels.includes(label)) return;
 
-            chart.data.labels.push(label);
-            chart.data.datasets[0].data.push(data.battery_level);
-            chart.data.datasets[1].data.push(data.temperature);
-            chart.data.datasets[2].data.push(data.snr);
-            chart.data.datasets[3].data.push(data.rssi);
+            // 更新 Power Chart
+            powerChart.data.labels.push(label);
+            powerChart.data.datasets[0].data.push(data.battery_level);
+            powerChart.data.datasets[1].data.push(data.channel_utilization);
+            powerChart.data.datasets[2].data.push(data.air_util_tx);
+
+            // 更新 Env Chart
+            envChart.data.labels.push(label);
+            envChart.data.datasets[0].data.push(data.temperature);
+            envChart.data.datasets[1].data.push(data.humidity);
+
+            // 更新 Signal Chart
+            signalChart.data.labels.push(label);
+            signalChart.data.datasets[0].data.push(data.snr);
+            signalChart.data.datasets[1].data.push(data.rssi);
+
+            // 同步更新最愛圖表
+            const favDataset = favoritesChart.data.datasets.find(d => d.label === (allNodes.find(n => n.node_id === data.node_id)?.short_name || data.node_id));
+            if (favDataset) {
+                if (!favoritesChart.data.labels.includes(label)) {
+                    favoritesChart.data.labels.push(label);
+                    if (favoritesChart.data.labels.length > 20) favoritesChart.data.labels.shift();
+                }
+                favDataset.data.push({ x: label, y: data.battery_level });
+                if (favDataset.data.length > 20) favDataset.data.shift();
+                favoritesChart.update();
+            }
 
             // 保持顯示最近 20 筆
-            if (chart.data.labels.length > 20) {
-                chart.data.labels.shift();
-                chart.data.datasets.forEach(d => d.data.shift());
-            }
-            if (!isBatch) chart.update('none');
+            allDetailCharts.forEach(c => {
+                if (c.data.labels.length > 20) {
+                    c.data.labels.shift();
+                    c.data.datasets.forEach(d => d.data.shift());
+                }
+                if (!isBatch) c.update('none');
+            });
         }
 
         // 初始化

@@ -68,14 +68,28 @@ db.serialize(() => {
             last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
             latitude REAL,
             longitude REAL,
-            is_favorite INTEGER DEFAULT 0
+            is_favorite INTEGER DEFAULT 0,
+            last_topic TEXT
+        )
+    `);
+    // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
+    db.run(`
+        CREATE TABLE IF NOT EXISTS packet_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            portnum TEXT,
+            topic TEXT,
+            snr REAL,
+            rssi REAL
         )
     `);
     // 確保舊資料庫也能加上欄位 (如果已存在則會忽略錯誤)
     db.run(`ALTER TABLE nodes ADD COLUMN is_favorite INTEGER DEFAULT 0`, (err) => {});
-
+    db.run(`ALTER TABLE nodes ADD COLUMN last_topic TEXT`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
 });
 
 // ==========================================
@@ -83,12 +97,14 @@ db.serialize(() => {
 // ==========================================
 function cleanupOldData() {
     const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-3 days')`;
+    const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-3 days')`;
     db.run(sql, function(err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
         else if (this.changes > 0) {
             console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 3 天的舊資料`);
         }
     });
+    db.run(sqlPackets);
 }
 
 // 每小時執行一次清理
@@ -142,6 +158,16 @@ app.get('/api/node/:nodeId', (req, res) => {
     db.get(`SELECT * FROM nodes WHERE node_id = ?`, [req.params.nodeId], (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(row || {});
+    });
+});
+
+// 取得單一節點的歷史封包紀錄
+app.get('/api/node/:nodeId/packets', (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const sql = `SELECT * FROM packet_logs WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?`;
+    db.all(sql, [req.params.nodeId, limit], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
     });
 });
 
@@ -235,22 +261,28 @@ function startMqtt() {
             // 更新節點最後在線時間 (不論是否為遙測封包)
             // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
             const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen) VALUES (?, CURRENT_TIMESTAMP)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen
+                INSERT INTO nodes (node_id, last_seen, last_topic) VALUES (?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic
             `;
-            db.run(nodeUpdateSql, [fromId], (err) => {
+            db.run(nodeUpdateSql, [fromId, topic], (err) => {
                 if (!err) {
                     // node_seen 會在下方解析名稱後一併推播，或在此單獨推播基礎資訊
                     io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString() });
                 }
             });
 
+            // 將封包寫入歷史紀錄表
+            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, snr, rssi) VALUES (?, ?, ?, ?, ?)`, 
+                [fromId, decodedData.portnum, topic, packet.rx_snr || null, packet.rx_rssi || null]);
+
             // 推播原始封包資訊到前端日誌視窗
             io.emit('raw_packet', {
                 from: fromId,
                 portnum: decodedData.portnum,
                 topic: topic,
-                time: new Date().toLocaleTimeString()
+                time: new Date().toLocaleTimeString(),
+                snr: packet.rx_snr || null,
+                rssi: packet.rx_rssi || null
             });
 
             // 解析節點資訊 (名稱)
@@ -259,13 +291,13 @@ function startMqtt() {
                     const user = User.decode(decodedData.payload);
                     db.run(`
                         UPDATE nodes SET long_name = ?, short_name = ? WHERE node_id = ?
-                    `, [user.longName, user.shortName, fromId], (err) => {
+                    `, [user.long_name, user.short_name, fromId], (err) => {
                         if (!err) {
-                            console.log(`👤 [節點資訊] 更新名稱: ${user.shortName} (${user.longName})`);
+                            console.log(`👤 [節點資訊] 更新名稱: ${user.short_name} (${user.long_name})`);
                             io.emit('node_seen', { 
                                 node_id: fromId, 
-                                long_name: user.longName, 
-                                short_name: user.shortName,
+                                long_name: user.long_name, 
+                                short_name: user.short_name,
                                 last_seen: new Date().toISOString() 
                             });
                         }
@@ -325,6 +357,8 @@ function startMqtt() {
                             battery_level: params[1],
                             temperature: params[3],
                             humidity: params[4],
+                            channel_utilization: params[5],
+                            air_util_tx: params[6],
                             timestamp: new Date().toISOString(),
                             snr: params[7],
                             rssi: params[8]
