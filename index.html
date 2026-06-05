@@ -15,6 +15,10 @@
         #status { font-size: 0.9em; color: #666; }
         .status-tag { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; margin-left: 5px; }
         .online { background: #e6fffa; color: #2d3748; border: 1px solid #38b2ac; }
+        .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 15px; }
+        .node-item { background: #fff; padding: 10px; border-radius: 8px; border: 1px solid #ddd; font-size: 0.85em; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        .node-id { font-weight: bold; color: #1a73e8; cursor: pointer; text-decoration: underline; }
+        .node-time { color: #888; font-size: 0.8em; }
         .log-container { margin-top: 20px; background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; }
         .log-title { margin-bottom: 10px; font-weight: bold; border-bottom: 1px solid #7f8c8d; padding-bottom: 5px; display: flex; justify-content: space-between; }
         #packetLog { height: 150px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
@@ -33,6 +37,11 @@
             <span id="mqttStatus" class="status-tag">MQTT: 檢測中</span>
         </div>
         <canvas id="telemetryChart"></canvas>
+
+        <div style="margin-top: 30px;">
+            <h3>📡 台灣頻道節點活動清單</h3>
+            <div id="nodeStatusGrid" class="node-grid"></div>
+        </div>
 
         <!-- 新增的日誌小視窗 -->
         <div class="log-container">
@@ -101,6 +110,11 @@
 
         // 2. 監聽 Socket.io 即時更新
         const socket = io();
+        
+        socket.on('connect', () => {
+            document.getElementById('status').innerText = '✅ Dashboard: 已連線';
+        });
+
         socket.on('telemetry_update', (data) => {
             console.log('收到新數據:', data);
             updateChart(data);
@@ -112,6 +126,46 @@
             el.innerText = data.connected ? 'MQTT: 已連線' : 'MQTT: 斷線';
             el.className = data.connected ? 'status-tag online' : 'status-tag';
         });
+
+        // 監聽節點活動事件 (即時更新列表)
+        socket.on('node_seen', (data) => {
+            updateNodeStatusUI(data.node_id, data.last_seen);
+        });
+
+        // 載入所有節點在線狀態
+        async function fetchNodeStatus() {
+            const res = await fetch('/api/node-status');
+            const nodes = await res.json();
+            const grid = document.getElementById('nodeStatusGrid');
+            grid.innerHTML = '';
+            nodes.forEach(node => {
+                updateNodeStatusUI(node.node_id, node.last_seen);
+            });
+        }
+
+        function updateNodeStatusUI(nodeId, lastSeen) {
+            const grid = document.getElementById('nodeStatusGrid');
+            let item = document.getElementById(`status-${nodeId}`);
+            const timeStr = new Date(lastSeen).toLocaleTimeString();
+
+            if (!item) {
+                item = document.createElement('div');
+                item.id = `status-${nodeId}`;
+                item.className = 'node-item';
+                grid.prepend(item); // 新出現的排前面
+            }
+
+            item.innerHTML = `
+                <span class="node-id" onclick="selectNode('${nodeId}')">${nodeId}</span>
+                <span class="node-time">${timeStr}</span>
+            `;
+        }
+
+        function selectNode(nodeId) {
+            const selector = document.getElementById('nodeSelector');
+            selector.value = nodeId;
+            selector.dispatchEvent(new Event('change'));
+        }
 
         // 監聽所有原始封包
         let pCount = 0;
@@ -153,6 +207,7 @@
 
         // 初始化
         refreshNodeList();
+        fetchNodeStatus();
         setInterval(refreshNodeList, 30000); // 每 30 秒更新一次節點選單
         document.getElementById('status').innerText = '✅ 即時連線中';
     </script>

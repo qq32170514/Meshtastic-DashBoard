@@ -14,12 +14,21 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+let isMqttConnected = false; // 紀錄 MQTT 連線狀態
+
 // ==========================================
 // Socket.io 連線監聽 (新增)
 // ==========================================
 io.on('connection', (socket) => {
     console.log('🔌 有新用戶連線到 Dashboard:', socket.id);
+    // 當用戶剛連線時，立即告知當前的 MQTT 狀態
+    socket.emit('mqtt_status', { connected: isMqttConnected });
     socket.on('disconnect', () => console.log('❌ 用戶已中斷連線'));
+});
+
+// 捕捉全域未處理錯誤，防止程式無預警結束
+process.on('uncaughtException', (err) => {
+    console.error('💥 偵測到未捕獲的異常 (Uncaught Exception):', err);
 });
 
 // 你的專屬節點 ID
@@ -46,6 +55,13 @@ db.serialize(() => {
             humidity REAL,
             channel_utilization REAL,
             air_util_tx REAL
+        )
+    `);
+    // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
+    db.run(`
+        CREATE TABLE IF NOT EXISTS nodes (
+            node_id TEXT PRIMARY KEY,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
     // 建立索引以加速前端查詢歷史數據的效能
@@ -97,9 +113,17 @@ app.get('/api/telemetry', (req, res) => {
 
 // 取得目前所有已知的節點清單
 app.get('/api/nodes', (req, res) => {
-    db.all(`SELECT DISTINCT node_id FROM telemetry_data`, [], (err, rows) => {
+    db.all(`SELECT node_id FROM nodes ORDER BY node_id ASC`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows.map(row => row.node_id));
+    });
+});
+
+// 取得所有節點的詳細在線狀態
+app.get('/api/node-status', (req, res) => {
+    db.all(`SELECT * FROM nodes ORDER BY last_seen DESC`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
     });
 });
 
@@ -145,15 +169,22 @@ function startMqtt() {
 
     client.on('connect', () => {
         console.log('✅ 已成功連線到 MQTT 伺服器！');
+        isMqttConnected = true;
         io.emit('mqtt_status', { connected: true });
-        client.subscribe(['msh/TW/+/c/+/+', 'msh/2/c/+/+'], (err) => {
-            if (!err) console.log(`📡 正在監聽全台灣/全球頻道，等待封包降落...\n`);
+        
+        // 只訂閱台灣區域的 Topic (# 代表監聽 TW 路徑下的所有子頻道)
+        const topics = ['msh/TW/#'];
+        client.subscribe(topics, (err) => {
+            if (!err) console.log(`📡 訂閱成功！正在監聽: ${topics.join(', ')}`);
         });
     });
 
-    client.on('error', (err) => {
-        console.error('❌ MQTT 連線錯誤:', err);
-        io.emit('mqtt_status', { connected: false, error: err.message });
+    client.on('reconnect', () => {
+        console.log('🔄 正在嘗試重新連線至 MQTT...');
+    });
+
+    client.on('offline', () => {
+        console.log('📡 MQTT 目前處於離線狀態');
     });
 
     client.on('message', (topic, message) => {
@@ -167,7 +198,18 @@ function startMqtt() {
             const packet = envelope.packet;
             const decodedData = packet.decoded;
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
+
+            // 在 Terminal 顯示收到的封包摘要
+            console.log(`📦 [收到封包] 來自: ${fromId} | Port: ${decodedData.portnum} | Topic: ${topic}`);
             
+            // 更新節點最後在線時間 (不論是否為遙測封包)
+            db.run(`REPLACE INTO nodes (node_id, last_seen) VALUES (?, CURRENT_TIMESTAMP)`, [fromId], (err) => {
+                if (!err) {
+                    // 透過 WebSocket 通知前端更新節點列表
+                    io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString() });
+                }
+            });
+
             // 推播原始封包資訊到前端日誌視窗
             io.emit('raw_packet', {
                 from: fromId,
