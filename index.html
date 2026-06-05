@@ -13,6 +13,12 @@
         .controls { text-align: center; margin-bottom: 20px; display: flex; justify-content: center; align-items: center; gap: 10px; }
         select { padding: 8px 12px; border-radius: 6px; border: 1px solid #ccc; font-size: 1em; }
         #status { font-size: 0.9em; color: #666; }
+        .status-tag { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; margin-left: 5px; }
+        .online { background: #e6fffa; color: #2d3748; border: 1px solid #38b2ac; }
+        .log-container { margin-top: 20px; background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 8px; font-family: 'Courier New', Courier, monospace; font-size: 0.85em; }
+        .log-title { margin-bottom: 10px; font-weight: bold; border-bottom: 1px solid #7f8c8d; padding-bottom: 5px; display: flex; justify-content: space-between; }
+        #packetLog { height: 150px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
+        #packetLog li { margin-bottom: 4px; border-left: 3px solid #3498db; padding-left: 8px; }
     </style>
 </head>
 <body>
@@ -23,9 +29,16 @@
             <select id="nodeSelector">
                 <option value="">-- 請選擇節點 --</option>
             </select>
-            <span id="status">正在連線...</span>
+            <span id="status">Dashboard: 正在連線...</span>
+            <span id="mqttStatus" class="status-tag">MQTT: 檢測中</span>
         </div>
         <canvas id="telemetryChart"></canvas>
+
+        <!-- 新增的日誌小視窗 -->
+        <div class="log-container">
+            <div class="log-title"><span>📡 即時通訊日誌</span><span id="packetCount">已收到: 0</span></div>
+            <ul id="packetLog"><li>等待封包中...</li></ul>
+        </div>
     </div>
 
     <script>
@@ -91,6 +104,30 @@
         socket.on('telemetry_update', (data) => {
             console.log('收到新數據:', data);
             updateChart(data);
+        });
+
+        // 監聽 MQTT 連線狀態
+        socket.on('mqtt_status', (data) => {
+            const el = document.getElementById('mqttStatus');
+            el.innerText = data.connected ? 'MQTT: 已連線' : 'MQTT: 斷線';
+            el.className = data.connected ? 'status-tag online' : 'status-tag';
+        });
+
+        // 監聽所有原始封包
+        let pCount = 0;
+        socket.on('raw_packet', (data) => {
+            const logList = document.getElementById('packetLog');
+            if (pCount === 0) logList.innerHTML = ''; // 移除等待文字
+            
+            pCount++;
+            document.getElementById('packetCount').innerText = `已收到: ${pCount}`;
+
+            const li = document.createElement('li');
+            li.innerHTML = `[${data.time}] 來自 <strong>${data.from}</strong> 的封包 (Port: ${data.portnum})`;
+            logList.insertBefore(li, logList.firstChild);
+
+            // 限制日誌數量，避免瀏覽器變慢
+            if (logList.childNodes.length > 50) logList.removeChild(logList.lastChild);
         });
 
         function updateChart(data, isBatch = false) {

@@ -63,7 +63,7 @@ function cleanupOldData() {
             console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 3 天的舊資料`);
         }
     });
-});
+}
 
 // 每小時執行一次清理
 setInterval(cleanupOldData, 60 * 60 * 1000);
@@ -145,12 +145,21 @@ function startMqtt() {
 
     client.on('connect', () => {
         console.log('✅ 已成功連線到 MQTT 伺服器！');
+        io.emit('mqtt_status', { connected: true });
         client.subscribe(['msh/TW/+/c/+/+', 'msh/2/c/+/+'], (err) => {
             if (!err) console.log(`📡 正在監聽全台灣/全球頻道，等待封包降落...\n`);
         });
     });
 
+    client.on('error', (err) => {
+        console.error('❌ MQTT 連線錯誤:', err);
+        io.emit('mqtt_status', { connected: false, error: err.message });
+    });
+
     client.on('message', (topic, message) => {
+        // Debug: 在控制台印出所有收到的 Topic，確認過濾器是否有抓到東西
+        // console.log(`📩 收到 Topic: ${topic}`);
+
         try {
             const envelope = ServiceEnvelope.decode(message);
             if (!envelope.packet || !envelope.packet.decoded) return;
@@ -159,6 +168,14 @@ function startMqtt() {
             const decodedData = packet.decoded;
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             
+            // 推播原始封包資訊到前端日誌視窗
+            io.emit('raw_packet', {
+                from: fromId,
+                portnum: decodedData.portnum,
+                topic: topic,
+                time: new Date().toLocaleTimeString()
+            });
+
             if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
                 const telemetry = Telemetry.decode(decodedData.payload);
                 const cleanJSON = Telemetry.toObject(telemetry, { enums: String, defaults: true });
