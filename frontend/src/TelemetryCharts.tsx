@@ -62,22 +62,28 @@ export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, so
     scales: {
       x: { 
         display: true,
-        grid: { display: false }, 
-        ticks: { font: { size: 8 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 6 } 
+        grid: { color: 'rgba(148, 163, 184, 0.1)' }, 
+        ticks: { color: '#64748b', font: { size: 9, weight: 'bold' }, maxRotation: 0, autoSkip: true, maxTicksLimit: 5 } 
       },
-      y: { ticks: { font: { size: 9 } } }
+      y: { 
+        grid: { color: 'rgba(148, 163, 184, 0.1)' },
+        ticks: { color: '#64748b', font: { size: 9 } } 
+      }
     }
   };
 
-  const labels = history.map(h => new Date(h.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+  const labels = history.map(h => {
+    const dateStr = h.timestamp.includes(' ') ? h.timestamp.replace(' ', 'T') + 'Z' : h.timestamp;
+    return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  });
 
   // 圖表 1: 電池與通道佔用率
   const batteryChartData = {
     labels,
     datasets: [
       { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4 },
-      { label: 'Air Util (AC)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4 },
-      { label: 'Channel Util (CU)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4 },
+      { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4 },
+      { label: 'CU (%)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4 },
     ]
   };
 

@@ -6,6 +6,7 @@ const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
@@ -189,6 +190,19 @@ app.get('/api/node/:nodeId', (req, res) => {
     });
 });
 
+// 取得全域最新封包紀錄 (提供給封包觀察分頁)
+app.get('/api/packets', (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const sql = `SELECT * FROM packet_logs ORDER BY timestamp DESC LIMIT ?`;
+    db.all(sql, [limit], (err, rows) => {
+        if (err) {
+            console.error('❌ API /api/packets SQL Error:', err.message);
+            return res.status(500).json({ error: err.message });
+        }
+        res.json(rows);
+    });
+});
+
 // 取得單一節點的歷史封包紀錄
 app.get('/api/node/:nodeId/packets', (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
@@ -248,7 +262,7 @@ server.listen(PORT, () => {
 const root = new protobuf.Root();
 root.resolvePath = (origin, target) => __dirname + '/protobufs/' + target;
 
-let ServiceEnvelope, Telemetry, User, Position, MapReport;
+let ServiceEnvelope, Telemetry, User, Position, MapReport, Data, Routing, RouteDiscovery, NeighborInfo;
 
 root.load([
     "meshtastic/mqtt.proto", 
@@ -267,6 +281,10 @@ root.load([
     User = root.lookupType("meshtastic.User");
     Position = root.lookupType("meshtastic.Position");
     MapReport = root.lookupType("meshtastic.MapReport");
+    Data = root.lookupType("meshtastic.Data");
+    Routing = root.lookupType("meshtastic.Routing");
+    RouteDiscovery = root.lookupType("meshtastic.RouteDiscovery");
+    NeighborInfo = root.lookupType("meshtastic.NeighborInfo");
     console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
     startMqttClient(); // 修正為 startMqttClient
 });
@@ -316,6 +334,61 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             const gatewayId = envelope.gateway_id || 'Unknown';
 
+            let decodedData = packet.decoded;
+
+            // --- 嘗試手動解密路徑 ---
+            if (!decodedData && packet.encrypted && packet.encrypted.length > 0) {
+                const safeBase64 = (str) => str.replace(/-/g, '+').replace(/_/g, '/');
+
+                const knownKeys = [
+                    { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") },
+                    { name: "MeshTW", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
+                    { name: "SignalTest", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
+                    { name: "Emergency!", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") }
+                ];
+
+                try {
+                    // Nonce (IV) 構造：PacketID(0-3), FromNodeID(8-11)
+                    const iv = Buffer.alloc(16); // 預設填充 0x00
+                    iv.writeUInt32LE(packet.id >>> 0, 0);
+                    iv.writeUInt32LE(packet.from >>> 0, 8); 
+                    
+                    for (const k of knownKeys) {
+                        try {
+                            if (k.key.length !== 16 && k.key.length !== 32) continue;
+                            
+                            const algo = k.key.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
+                            const decipher = crypto.createDecipheriv(algo, k.key, iv);
+                            const decrypted = Buffer.concat([decipher.update(packet.encrypted), decipher.final()]);
+                            
+                            const attempt = Data.decode(decrypted);
+                            
+                            // 🛑 核心防禦：如果 Port 是 0 或 undefined，通常是拿錯鑰匙解出的垃圾數據
+                            if (!attempt.portnum || attempt.portnum === 0 || attempt.portnum === 'UNKNOWN_APP') {
+                                continue; 
+                            }
+
+                            if (attempt && attempt.payload) {
+                                decodedData = attempt;
+                                // 優先從 Topic 中提取頻道名稱，若無則使用金鑰名稱
+                                const topicParts = topic.split('/');
+                                const topicChannel = topicParts.length >= 5 ? topicParts[4] : null;
+                                decodedData.channel_name = (topicChannel && k.name !== "MediumFast") ? topicChannel : k.name;
+                                
+                                if (decodedData.portnum === 1 || decodedData.portnum === 'TEXT_MESSAGE_APP') {
+                                    console.log(`💬 [${decodedData.channel_name}] 解密文字成功: ${decodedData.payload.toString('utf8')}`);
+                                }
+                                break; // 成功解密，跳出迴圈
+                            }
+                        } catch (e) {
+                            // 此金鑰解碼失敗，嘗試下一個
+                        }
+                    }
+                } catch (e) {
+                    // 解密失敗（可能是私有金鑰或其他頻道），保持為 null
+                }
+            }
+
             // 1. 無論封包是否解碼，都先更新節點的「最後在線」狀態
             // 這能確保即使內容加密，我們也能在儀表板看到該 Node ID 出現
             // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
@@ -333,8 +406,8 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 }
             });
 
-            // 2. 如果封包未解碼 (加密封包)，我們仍然記錄它到日誌，但不執行後續的 Payload 解析
-            if (!packet.decoded) {
+            // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED
+            if (!decodedData) {
                 console.log(`📦 [收到加密封包] 來自: ${fromId} | Topic: ${topic}`);
                 db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
                     [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null]);
@@ -355,25 +428,39 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 return; // 加封包處理結束
             }
 
-            const decodedData = packet.decoded;
-
             // --- 嘗試預先解碼 Payload 以供檢視 ---
             let payloadObj = null;
+            const port = decodedData.portnum;
+            const payloadBuffer = Buffer.isBuffer(decodedData.payload) ? decodedData.payload : Buffer.from(decodedData.payload || []);
+
             try {
-                if (decodedData.portnum === 4 || decodedData.portnum === 'NODEINFO_APP') {
-                    payloadObj = User.toObject(User.decode(decodedData.payload), { enums: String, defaults: true });
-                } else if (decodedData.portnum === 1 || decodedData.portnum === 'POSITION_APP') {
-                    payloadObj = Position.toObject(Position.decode(decodedData.payload), { enums: String, defaults: true });
-                } else if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
-                    payloadObj = Telemetry.toObject(Telemetry.decode(decodedData.payload), { enums: String, defaults: true });
-                } else if (decodedData.portnum === 73 || decodedData.portnum === 'MAP_REPORT_APP') {
-                    payloadObj = MapReport.toObject(MapReport.decode(decodedData.payload), { enums: String, defaults: true });
+                if (port === 1 || port === 'TEXT_MESSAGE_APP') {
+                    payloadObj = { text: payloadBuffer.toString('utf8') };
+                } else if (port === 3 || port === 'POSITION_APP') {
+                    payloadObj = Position.toObject(Position.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 4 || port === 'NODEINFO_APP') {
+                    payloadObj = User.toObject(User.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 5 || port === 'ROUTING_APP') {
+                    payloadObj = Routing.toObject(Routing.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 67 || port === 'TELEMETRY_APP') {
+                    payloadObj = Telemetry.toObject(Telemetry.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 70 || port === 'TRACEROUTE_APP') {
+                    payloadObj = RouteDiscovery.toObject(RouteDiscovery.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 71 || port === 'NEIGHBORINFO_APP') {
+                    payloadObj = NeighborInfo.toObject(NeighborInfo.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 73 || port === 'MAP_REPORT_APP') {
+                    payloadObj = MapReport.toObject(MapReport.decode(payloadBuffer), { enums: String, defaults: true });
                 }
             } catch (e) { /* 解析失敗則維持 null */ }
+            
+            // 確保頻道名稱被傳遞到前端
+            if (payloadObj && decodedData.channel_name) {
+                payloadObj.channel_name = decodedData.channel_name;
+            }
             const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
 
             // 在 Terminal 顯示收到的封包摘要
-            console.log(`📦 [收到封包] 來自: ${fromId} | Port: ${decodedData.portnum} | Topic: ${topic}`);
+            console.log(`📦 [處理封包] 來自: ${fromId} | Port: ${port} | Topic: ${topic}`);
             
             // 將封包寫入歷史紀錄表
             db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
@@ -382,7 +469,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             // 推播原始封包資訊到前端日誌視窗
             io.emit('raw_packet', {
                 from: fromId,
-                portnum: decodedData.portnum,
+                portnum: port,
                 topic: topic,
                 gateway_id: gatewayId,
                 time: new Date().toLocaleTimeString(),
@@ -395,7 +482,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             });
 
             // 解析節點資訊 (名稱)
-            if (decodedData.portnum === 4 || decodedData.portnum === 'NODEINFO_APP') {
+            if (port === 4 || port === 'NODEINFO_APP') {
                 try {
                     const user = User.decode(decodedData.payload);
                     db.run(`
@@ -417,7 +504,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             }
 
             // 解析位置資訊 (經緯度)
-            if (decodedData.portnum === 1 || decodedData.portnum === 'POSITION_APP') {
+            if (port === 3 || port === 'POSITION_APP') {
                 try {
                     const pos = Position.decode(decodedData.payload);
                     if (pos.latitude_i && pos.longitude_i) {
@@ -440,7 +527,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             }
 
             // 解析 MapReport (包含名稱與位置)
-            if (decodedData.portnum === 73 || decodedData.portnum === 'MAP_REPORT_APP') {
+            if (port === 73 || port === 'MAP_REPORT_APP') {
                 try {
                     const report = MapReport.decode(decodedData.payload);
                     const lat = report.latitude_i / 1e7;
@@ -464,14 +551,15 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 } catch (e) { console.error('❌ 解析 MapReport 失敗', e); }
             }
 
-            if (decodedData.portnum === 67 || decodedData.portnum === 'TELEMETRY_APP') {
+            if (port === 67 || port === 'TELEMETRY_APP') {
                 const telemetry = Telemetry.decode(decodedData.payload);
                 const cleanJSON = Telemetry.toObject(telemetry, { enums: String, defaults: true });
                 
                 const device = cleanJSON.device_metrics || cleanJSON.deviceMetrics || {};
                 const env = cleanJSON.environment_metrics || cleanJSON.environmentMetrics || {};
-                
-                if (Object.keys(device).length > 0 || Object.keys(env).length > 0) {
+                const air = cleanJSON.air_util_tx ?? device.air_util_tx ?? device.airUtilTx ?? null;
+                const cu = device.channel_utilization ?? device.channelUtilization ?? null;
+
                     const sql = `
                         INSERT INTO telemetry_data 
                         (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, hop_limit, hop_start) 
@@ -483,17 +571,17 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                         device.voltage ?? null, 
                         env.temperature ?? null, 
                         env.relative_humidity ?? env.relativeHumidity ?? null, 
-                        device.channel_utilization ?? device.channelUtilization ?? null, 
-                        device.air_util_tx ?? device.airUtilTx ?? null,
+                        cu, 
+                        air,
                         packet.rx_snr ?? null,
                         packet.rx_rssi ?? null,
                         packet.hop_limit || 0,
                         packet.hop_start || 0
                     ];
-
+    
                     db.run(sql, params, function(err) {
                         if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
-                        
+    
                         console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
                         // 透過 WebSocket 即時推播新資料到前端
                         io.emit('telemetry_update', {
@@ -502,18 +590,15 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                             voltage: params[2],
                             temperature: params[3],
                             humidity: params[4],
-                            channel_utilization: params[5],
-                            air_util_tx: params[6],
+                            channel_utilization: cu,
+                            air_util_tx: air,
                             timestamp: new Date().toISOString(),
-                            temperature: params[3],
-                            humidity: params[4],
                             snr: params[7],
                             rssi: params[8],
                             hop_limit: params[9],
                             hop_start: params[10]
                         });
                     });
-                }
             } 
         } catch (err) {
             // 忽略無法解碼的雜訊封包

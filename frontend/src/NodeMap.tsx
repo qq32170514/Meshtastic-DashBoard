@@ -1,9 +1,9 @@
-import React from 'react';
-import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline } from 'react-leaflet';
+import React, { useState } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { Node } from './App';
-import { Info } from 'lucide-react';
+import { Info, ChevronDown, ChevronUp } from 'lucide-react';
 
 // 修正 Leaflet 預設圖示路徑問題
 import markerIcon from 'leaflet/dist/images/marker-icon.png';
@@ -46,13 +46,26 @@ const createColoredIcon = (role?: string) => {
   });
 };
 
-// 顏色映射函數：跳數越少，顏色越深
-const getHopColor = (hopStart?: number, hopLimit?: number) => {
-  const hops = (hopStart || 0) - (hopLimit || 0);
-  if (hops <= 0) return '#1e3a8a'; // 0跳 (深藍色)
-  if (hops === 1) return '#3b82f6'; // 1跳 (藍色)
-  if (hops === 2) return '#60a5fa'; // 2跳 (淺藍色)
-  return '#bfdbfe'; // 3跳以上 (極淺藍)
+// 顏色映射函數：活躍時間越近，顏色越深
+const getRecencyColor = (lastSeen?: string) => {
+  if (!lastSeen) return '#cbd5e1';
+  const diffHours = (Date.now() - new Date(lastSeen).getTime()) / 3600000;
+  if (diffHours < 2) return '#1e3a8a';   // 2小時內
+  if (diffHours < 6) return '#3b82f6';   // 2~6小時
+  if (diffHours < 12) return '#60a5fa';  // 6~12小時
+  if (diffHours < 24) return '#93c5fd';  // 12~24小時
+  return '#cbd5e1';                      // 24小時以上
+};
+
+// 顏色映射函數：活躍時間越近，透明度越高 (越清晰)
+const getRecencyOpacity = (lastSeen?: string) => {
+  if (!lastSeen) return 0.15;
+  const diffHours = (Date.now() - new Date(lastSeen).getTime()) / 3600000;
+  if (diffHours < 2) return 0.9;   // 2小時內：非常清晰
+  if (diffHours < 6) return 0.6;   // 2~6小時
+  if (diffHours < 12) return 0.4;  // 6~12小時
+  if (diffHours < 24) return 0.2;  // 12~24小時
+  return 0.1;                      // 24小時以上：幾乎淡出
 };
 
 interface NodeMapProps {
@@ -61,9 +74,11 @@ interface NodeMapProps {
   gateways?: any[];       // 新增：目前節點關聯的閘道統計
   onSelectNode: (id: string) => void;
   onShowDetail?: (id: string) => void; // 新增：顯示漂浮詳情頁的回呼
+  isDetailView?: boolean; // 新增：是否為節點詳情模式
 }
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false }: NodeMapProps) => {
+  const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
   
   // 找出有座標的 Gateway 節點
@@ -122,7 +137,8 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                   {(() => {
                     if (!node.last_topic) return '-';
                     const parts = node.last_topic.split('/');
-                    return parts.length >= 5 ? parts[4] : (parts[2] || '-');
+                    const channelName = parts.length >= 5 ? parts[4] : (parts[2] || '-');
+                    return channelName === 'MediumFast' ? '⚡ ' + channelName : channelName;
                   })()}
                 </span>
               </div>
@@ -132,13 +148,15 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
       ))}
 
       {/* 繪製 Gateway 節點 (圓點表示) */}
-      {gatewayMarkers.map((gw: any) => (
+      {gatewayMarkers.map((gw: any) => {
+        const hops = gw.hop_start - gw.hop_limit;
+        return (
         <React.Fragment key={gw.gateway_id}>
           <CircleMarker
             center={[gw.latitude, gw.longitude]}
             radius={8}
             pathOptions={{ 
-              fillColor: getHopColor(gw.hop_start, gw.hop_limit), 
+              fillColor: getRecencyColor(gw.last_seen), 
               color: '#fff', 
               weight: 2, 
               fillOpacity: 0.9 
@@ -147,30 +165,56 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
             <Popup>
               <div className="font-sans">
                 <strong>Gateway: {gw.short_name || gw.gateway_id}</strong><br/>
-                Hops: {gw.hop_start - gw.hop_limit}<br/>
+                Hops: {hops}<br/>
                 Packets: {gw.count}
               </div>
             </Popup>
           </CircleMarker>
           
           {/* 繪製連線 (如果主節點有 GPS) */}
-          {nodesWithGPS[0] && (
+          {isDetailView && nodesWithGPS[0] && (
             <Polyline 
               positions={[[nodesWithGPS[0].latitude!, nodesWithGPS[0].longitude!], [gw.latitude, gw.longitude]]}
-              pathOptions={{ color: getHopColor(gw.hop_start, gw.hop_limit), weight: 1, dashArray: '5, 5', opacity: 0.5 }}
-            />
+              pathOptions={{ 
+                color: getRecencyColor(gw.last_seen), 
+                weight: Math.min(12, 2 + (gw.count / 5)), // 優化公式：每 5 個封包增加 1px，最大寬度 12px
+                dashArray: hops > 0 ? '5, 5' : undefined, 
+                opacity: getRecencyOpacity(gw.last_seen) 
+              }}
+            >
+              <Tooltip sticky>
+                <div className="text-xs font-sans p-1">
+                  <div className="font-bold border-b border-slate-100 mb-1 pb-1">路徑資訊 Path Info</div>
+                  <div className="flex justify-between gap-4">
+                    <span className="text-slate-400">跳數 Hops:</span>
+                    <span className="font-bold text-blue-600">{hops}</span>
+                  </div>
+                  <div className="flex justify-between gap-4">
+                    <span className="text-slate-400">最後收信:</span>
+                    <span className="text-slate-600">{new Date(gw.last_seen).toLocaleString()}</span>
+                  </div>
+                </div>
+              </Tooltip>
+            </Polyline>
           )}
         </React.Fragment>
-      ))}
+      );})}
     </MapContainer>
 
     {/* 圖例 Legend Overlay */}
-    <div className="absolute bottom-4 right-4 bg-white/90 backdrop-blur-sm p-3 rounded-xl shadow-xl z-[1000] border border-slate-200 pointer-events-none min-w-[140px]">
-      <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 border-b border-slate-100 pb-1 flex items-center gap-1">
-        <Info size={12} /> 地圖圖例 Legend
-      </h4>
+    <div className="absolute bottom-4 right-4 bg-white/90 backdrop-blur-sm p-3 rounded-xl shadow-xl z-[1000] border border-slate-200 pointer-events-auto min-w-[160px] transition-all duration-300">
+      <div 
+        className="flex items-center justify-between cursor-pointer group"
+        onClick={() => setIsLegendExpanded(!isLegendExpanded)}
+      >
+        <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
+          <Info size={12} /> 地圖圖例 Legend
+        </h4>
+        {isLegendExpanded ? <ChevronDown size={14} className="text-slate-400 group-hover:text-cyan-500" /> : <ChevronUp size={14} className="text-slate-400 group-hover:text-cyan-500" />}
+      </div>
       
-      <div className="space-y-3">
+      {isLegendExpanded && (
+        <div className="space-y-3 mt-2 pt-2 border-t border-slate-100 overflow-y-auto max-h-[60vh]">
         {/* 角色分組 */}
         <div>
           <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">節點角色 Roles</div>
@@ -193,25 +237,70 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           </div>
         </div>
 
-        {/* 跳數分組 */}
+        {/* 連線粗細分組 */}
         <div className="pt-1 border-t border-slate-100">
-          <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">閘道跳數 Hops</div>
+          <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">連線粗細 Thickness</div>
           <div className="space-y-1">
             <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#1e3a8a]"></span> 0 跳 (最深)
+              <span className="w-5 h-0.5 bg-slate-400"></span> 細：通訊量少 (Low Traffic)
             </div>
             <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#3b82f6]"></span> 1 跳
+              <span className="w-5 h-1.5 bg-slate-400 rounded-full"></span> 粗：通訊量大 (High Traffic)
+            </div>
+          </div>
+        </div>
+
+        {/* 路徑類型分組 */}
+        <div className="pt-1 border-t border-slate-100">
+          <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">路徑類型 Path Type</div>
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-5 h-0.5 bg-slate-400"></span> 實線：直接接收 (0 跳)
             </div>
             <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#60a5fa]"></span> 2 跳
+              <span className="w-5 h-0.5 border-t-2 border-dashed border-slate-400"></span> 虛線：中繼轉發 (Relayed)
+            </div>
+          </div>
+        </div>
+
+        {/* 連線透明度分組 */}
+        <div className="pt-1 border-t border-slate-100">
+          <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">連線透明度 Transparency</div>
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-5 h-0.5 bg-slate-400 opacity-100"></span> 不透明：近期數據
             </div>
             <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#bfdbfe]"></span> 3+ 跳 (最淺)
+              <span className="w-5 h-0.5 bg-slate-400 opacity-25"></span> 越透明：資料越陳舊
+            </div>
+          </div>
+        </div>
+
+        {/* 活躍時間分組 - 根據模式切換標題 */}
+        <div className="pt-1 border-t border-slate-100">
+          <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">
+            {isDetailView ? '節點收信間隔 (Node Heard)' : '閘道最後活躍 (GW Recency)'}
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#1e3a8a]"></span> &lt; 2 小時
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#3b82f6]"></span> 2 ~ 6 小時
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#60a5fa]"></span> 6 ~ 12 小時
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#93c5fd]"></span> 12 ~ 24 小時
+            </div>
+            <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#cbd5e1]"></span> 24 小時以上
             </div>
           </div>
         </div>
       </div>
+      )}
     </div>
     </div>
   );
