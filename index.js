@@ -1,6 +1,7 @@
 const mqtt = require('mqtt');
 const protobuf = require('protobufjs');
 const sqlite3 = require('sqlite3').verbose();
+const { createClient } = require('@libsql/client');
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
@@ -9,6 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const cron = require('node-cron');
+const os = require('os');
 require('dotenv').config(); // 讀取 .env 檔案
 
 const app = express();
@@ -33,6 +35,15 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => console.log('❌ 用戶已中斷連線'));
 });
 
+// 🛡️ 解密引擎預處理
+const safeBase64 = (str) => str.replace(/-/g, '+').replace(/_/g, '/');
+const knownKeys = [
+    { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") },
+    { name: "MeshTW", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
+    { name: "SignalTest", key: Buffer.from(safeBase64("y1HciVgpl5Hzh05KJUe/umWUH8XhG3UjR1rvZHfUHFU="), "base64") },
+    { name: "Emergency!", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") }
+];
+
 // 捕捉全域未處理錯誤，防止程式無預警結束
 process.on('uncaughtException', (err) => {
     console.error('💥 偵測到未捕獲的異常 (Uncaught Exception):', err);
@@ -48,12 +59,29 @@ app.use(express.static(__dirname));
 // ==========================================
 // 1. 初始化 SQLite 資料庫
 // ==========================================
-// 支援自定義資料庫路徑（Render Persistent Disk 使用）
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'meshtastic.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) console.error('❌ 資料庫連線失敗:', err.message);
-    else console.log(`🗄️ SQLite 資料庫已連線至: ${dbPath}`);
-});
+// ⚡ 雲端轉型：如果偵測到 TURSO_URL，則連線至雲端資料庫，否則使用本地 SQLite
+let db;
+if (process.env.TURSO_URL) {
+    const client = createClient({
+        url: process.env.TURSO_URL,
+        authToken: process.env.TURSO_TOKEN,
+    });
+    // 建立一個相容 sqlite3 語法的包裝器
+    db = {
+        run: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb && cb.call({ lastID: Number(r.lastInsertRowid) }, null)).catch(cb),
+        all: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows)).catch(cb),
+        get: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows[0])).catch(cb),
+        serialize: (fn) => fn()
+    };
+    console.log(`☁️ 已連線至 Turso 雲端資料庫`);
+} else {
+    const sqlite3 = require('sqlite3').verbose();
+    const dbPath = path.join(__dirname, 'meshtastic.db');
+    db = new sqlite3.Database(dbPath, (err) => {
+        if (err) console.error('❌ 本地資料庫連線失敗:', err.message);
+        else console.log(`🗄️ 本地資料庫連線成功: ${dbPath}`);
+    });
+}
 
 db.serialize(() => {
     db.run(`
@@ -94,7 +122,8 @@ db.serialize(() => {
             voltage REAL,
             current REAL,
             temperature REAL,
-            humidity REAL
+            humidity REAL,
+            last_gateway TEXT
         )
     `);
     // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
@@ -153,6 +182,7 @@ db.serialize(() => {
     db.run(`ALTER TABLE nodes ADD COLUMN current REAL`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN temperature REAL`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN humidity REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN last_gateway TEXT`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
@@ -275,6 +305,24 @@ app.get('/api/gateways/leaderboard', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
+});
+
+// 取得系統狀態與健康度 (Dashboard Health)
+app.get('/api/sys-status', (req, res) => {
+    try {
+        const dbFile = path.join(__dirname, 'meshtastic.db');
+        let dbSize = 0;
+        if (fs.existsSync(dbFile)) {
+            dbSize = fs.statSync(dbFile).size;
+        }
+        res.json({
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            cpu_load: os.loadavg(),
+            db_size: dbSize,
+            node_version: process.version
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 取得目前網路的所有鄰居關係 (拓撲層使用)
@@ -433,16 +481,6 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             // 🔥 1. 多頻道神級解密引擎 🔥
             // ==========================================
             if (!decodedData && packet.encrypted && packet.encrypted.length > 0) {
-                
-                // 🛡️ 安全過濾：將 Base64URL 轉為標準 Base64，避免金鑰破損
-                const safeBase64 = (str) => str.replace(/-/g, '+').replace(/_/g, '/');
-
-                const knownKeys = [
-                    { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") },
-                    { name: "MeshTW", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
-                    { name: "SignalTest", key: Buffer.from(safeBase64("y1HciVgpl5Hzh05KJUe/umWUH8XhG3UjR1rvZHfUHFU="), "base64") },
-                    { name: "Emergency!", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") }
-                ];
 
                 try {
                     // Nonce 構造：必須遵守硬體層 64-bit 記憶體對齊
@@ -480,10 +518,10 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 
             // 1. 更新節點最後在線狀態 (Discovery)
             const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen, last_topic, channel, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, channel=COALESCE(excluded.channel, nodes.channel), hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
+                INSERT INTO nodes (node_id, last_seen, last_topic, channel, hop_limit, hop_start, last_gateway) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, channel=COALESCE(excluded.channel, nodes.channel), hop_limit=excluded.hop_limit, hop_start=excluded.hop_start, last_gateway=excluded.last_gateway
             `;
-            db.run(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0]);
+            db.run(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0, gatewayId]);
             io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString(), last_topic: topic, channel: resolvedChannel });
 
             // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED

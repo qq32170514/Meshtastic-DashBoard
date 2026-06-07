@@ -27,6 +27,7 @@ export interface Node {
   channel_utilization?: number;
   temperature?: number;
   humidity?: number;
+  last_gateway?: string;
 }
 
 interface Packet {
@@ -93,6 +94,7 @@ function App() {
   const [loadingPackets, setLoadingPackets] = useState(false); // New state for loading indicator
   const [selectedPacket, setSelectedPacket] = useState<Packet | null>(null); // 控制封包詳情彈窗
   const [chatFilter, setChatFilter] = useState({ favoritesOnly: false, nodeId: '', searchText: '' }); // 新增對話過濾
+  const [sysStatus, setSysStatus] = useState<any>(null); // 系統健康度狀態
 
   // 新增：從本地瀏覽器讀取最愛清單
   const [favoriteIdSet, setFavoriteNodeIds] = useState<Set<string>>(() => {
@@ -404,10 +406,21 @@ function App() {
       } : n));
     });
 
+    // 5. 抓取系統健康度
+    const fetchSysStatus = () => {
+      fetch('/api/sys-status')
+        .then(res => res.json())
+        .then(data => setSysStatus(data))
+        .catch(() => {});
+    };
+    fetchSysStatus();
+    const sysInterval = setInterval(fetchSysStatus, 30000); // 每 30 秒更新一次
+
     return () => {
       socket.off('mqtt_status');
       socket.off('node_seen');
       socket.off('raw_packet');
+      clearInterval(sysInterval);
     };
   }, []);
 
@@ -651,7 +664,7 @@ function App() {
   };
 
   return (
-    <div className={`min-h-screen transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans`}>
+    <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans`}>
       {/* Top Navbar */}
       <nav className={`${darkMode ? 'bg-slate-900' : 'bg-[#1e293b]'} text-white px-6 py-3 flex justify-between items-center shadow-lg border-b ${darkMode ? 'border-slate-800' : 'border-slate-700'}`}>
         <div className="flex items-center gap-3">
@@ -1014,6 +1027,14 @@ function App() {
                       </div>
                       <h3 className={`text-lg font-black truncate leading-tight ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{node.long_name || 'Unknown'}</h3>
                       <p className="text-xs text-blue-500 font-bold opacity-80">({node.short_name || '??'})</p>
+                      
+                      {/* 新增：收信路徑標籤 */}
+                      {node.last_gateway && (
+                        <div className="mt-2 flex items-center gap-1.5 opacity-60">
+                          <Signal size={10} className="text-slate-400" />
+                          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-tighter">Via: {node.last_gateway}</span>
+                        </div>
+                      )}
                     </div>
                     <button 
                       onClick={(e) => { e.stopPropagation(); toggleFavorite(node.node_id); }} 
@@ -1890,6 +1911,24 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* 系統健康度頁尾 */}
+      <footer className={`mt-auto p-4 border-t text-[10px] font-bold ${darkMode ? 'bg-slate-900/50 border-slate-800 text-slate-500' : 'bg-white border-slate-100 text-slate-400'}`}>
+        <div className="max-w-7xl mx-auto flex flex-wrap justify-between items-center gap-4">
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-1.5"><Cpu size={12} className="text-cyan-500"/> 系統負載: {sysStatus?.cpu_load?.[0]?.toFixed(2) || '--'}</div>
+            <div className="flex items-center gap-1.5"><Database size={12} className="text-purple-500"/> 程序記憶體: {sysStatus?.memory ? (sysStatus.memory.rss / 1024 / 1024).toFixed(1) : '--'} MB</div>
+            <div className="flex items-center gap-1.5"><HardDrive size={12} className="text-emerald-500"/> 資料庫大小: {sysStatus?.db_size ? (sysStatus.db_size / 1024 / 1024).toFixed(2) : '--'} MB</div>
+          </div>
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-1.5 uppercase tracking-widest">
+              <Activity size={12} className="text-orange-500" /> 
+              連續運行時間: {sysStatus?.uptime ? `${Math.floor(sysStatus.uptime / 3600)}h ${Math.floor((sysStatus.uptime % 3600) / 60)}m` : '--'}
+            </div>
+            <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v1.0</div>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
