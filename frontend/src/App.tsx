@@ -95,6 +95,7 @@ function App() {
   const [selectedPacket, setSelectedPacket] = useState<Packet | null>(null); // 控制封包詳情彈窗
   const [chatFilter, setChatFilter] = useState({ favoritesOnly: false, nodeId: '', searchText: '' }); // 新增對話過濾
   const [sysStatus, setSysStatus] = useState<any>(null); // 系統健康度狀態
+  const [nodeActivity, setNodeActivity] = useState<Record<string, number>>({}); // 節點發包密度
 
   // 新增：從本地瀏覽器讀取最愛清單
   const [favoriteIdSet, setFavoriteNodeIds] = useState<Set<string>>(() => {
@@ -350,8 +351,17 @@ function App() {
     const loadNetworkStats = async () => {
       try {
         const [nRes, gRes] = await Promise.all([fetch('/api/neighbors'), fetch('/api/gateways/leaderboard')]);
+        const [nRes, gRes, aRes] = await Promise.all([
+          fetch('/api/neighbors'), 
+          fetch('/api/gateways/leaderboard'),
+          fetch('/api/nodes/activity')
+        ]);
         setNeighbors(await nRes.json());
         setGatewayLeaderboard(await gRes.json());
+        const activityData = await aRes.json();
+        const activityMap: Record<string, number> = {};
+        activityData.forEach((item: any) => activityMap[item.node_id] = item.count);
+        setNodeActivity(activityMap);
       } catch (e) { console.error("Network stats load failed", e); }
     };
     loadNetworkStats();
@@ -412,9 +422,21 @@ function App() {
         .then(res => res.json())
         .then(data => setSysStatus(data))
         .catch(() => {});
+    const fetchDashboardUpdates = async () => {
+      try {
+        const [sRes, aRes] = await Promise.all([fetch('/api/sys-status'), fetch('/api/nodes/activity')]);
+        setSysStatus(await sRes.json());
+        const activityData = await aRes.json();
+        const activityMap: Record<string, number> = {};
+        activityData.forEach((item: any) => activityMap[item.node_id] = item.count);
+        setNodeActivity(activityMap);
+      } catch (e) {}
     };
     fetchSysStatus();
     const sysInterval = setInterval(fetchSysStatus, 30000); // 每 30 秒更新一次
+
+    fetchDashboardUpdates();
+    const sysInterval = setInterval(fetchDashboardUpdates, 30000); // 每 30 秒更新一次
 
     return () => {
       socket.off('mqtt_status');
@@ -610,6 +632,16 @@ function App() {
                  {data.text}
                </div>
              </div>
+                <div className={`p-4 rounded-2xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <div className="text-[10px] font-black text-slate-500 uppercase tracking-tighter mb-1">最活躍節點 (24h)</div>
+                  <div className="text-sm font-black text-yellow-500 truncate mt-1">
+                    {(() => {
+                      const topNodeId = Object.entries(nodeActivity).sort((a, b) => b[1] - a[1])[0]?.[0];
+                      const topNode = nodes.find(n => n.node_id === topNodeId);
+                      return topNode ? `${topNode.short_name || topNodeId} (${nodeActivity[topNodeId!]})` : '--';
+                    })()}
+                  </div>
+                </div>
           </div>
         );
       }
@@ -760,6 +792,7 @@ function App() {
                     <th className="px-6 py-4">節點名稱 (Short)</th>
                     <th className="px-6 py-4">硬體型號</th>
                     <th className="px-6 py-4">頻道</th>
+                    <th className="px-6 py-4">24h 密度</th>
                     <th className="px-6 py-4">最後活動</th>
                   </tr>
                 </thead>
@@ -812,6 +845,16 @@ function App() {
                             })() : rawChannel;
                             return channelName === 'MediumFast' ? '⚡ ' + channelName : channelName;
                           })()}
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex flex-col">
+                          <span className={`text-[11px] font-black ${nodeActivity[node.node_id] > 50 ? 'text-orange-500' : 'text-slate-400'}`}>
+                            {nodeActivity[node.node_id] || 0} <span className="text-[9px] font-normal opacity-60">pkts</span>
+                          </span>
+                          <div className="w-12 h-1 bg-slate-200 dark:bg-slate-800 rounded-full mt-1 overflow-hidden">
+                            <div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, (nodeActivity[node.node_id] || 0) * 2)}%` }}></div>
+                          </div>
                         </div>
                       </td>
                       <td className="px-6 py-4 text-xs font-medium text-slate-500 whitespace-nowrap">

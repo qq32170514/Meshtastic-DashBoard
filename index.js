@@ -325,6 +325,19 @@ app.get('/api/sys-status', (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 取得節點通訊密度統計 (過去 24 小時發包量)
+app.get('/api/nodes/activity', (req, res) => {
+    const sql = `
+        SELECT node_id, COUNT(*) as count 
+        FROM packet_logs 
+        WHERE timestamp > datetime('now', '-1 day')
+        GROUP BY node_id`;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // 取得目前網路的所有鄰居關係 (拓撲層使用)
 app.get('/api/neighbors', (req, res) => {
     db.all(`SELECT * FROM neighbors WHERE last_seen > datetime('now', '-2 days')`, [], (err, rows) => {
