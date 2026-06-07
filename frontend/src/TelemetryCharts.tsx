@@ -11,6 +11,7 @@ import {
   Legend,
   Filler
 } from 'chart.js';
+import { Smartphone } from 'lucide-react';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
@@ -26,7 +27,7 @@ interface Telemetry {
   current?: number;
 }
 
-export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, socket: any }) {
+export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { nodeId: string, socket: any, node?: any, darkMode?: boolean }) {
   const [history, setHistory] = useState<Telemetry[]>([]);
 
   useEffect(() => {
@@ -132,9 +133,33 @@ export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, so
         <Line data={batteryChartData} options={commonOptions} />
       </div>
 
-      {/* 象限 2: 右上 - 預留分析空間 */}
-      <div className="h-56 col-start-2 row-start-1 flex items-center justify-center border border-dashed border-slate-100 rounded-xl">
-        <span className="text-[9px] text-slate-300 font-bold uppercase tracking-[0.3em]">Advanced Analysis Ready</span>
+      {/* 象限 2: 右上 - 節點身份資訊 - 確保 node 更新時重繪 */}
+      <div key={`identity-${node?.node_id}`} className={`h-56 col-start-2 row-start-1 p-5 rounded-xl border shadow-inner ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50 border-slate-100'}`}>
+        <h5 className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest flex items-center gap-2">
+          <Smartphone size={14} className="text-cyan-500" /> 節點身份資訊 Node Identity
+        </h5>
+        {node && node.node_id ? (
+          <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Long Name</span>
+              <span className="font-bold truncate" title={node.long_name}>{node.long_name || 'Unknown'}</span>
+            </div>
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Short Name</span>
+              <span className="font-bold">{node.short_name || '??'}</span>
+            </div>
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span>
+              <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
+            </div>
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Role</span>
+              <span className="font-bold text-cyan-500">{node.role || 'CLIENT'}</span>
+            </div>
+          </div>
+        ) : (
+          <p className="text-[10px] text-slate-400 italic">無身份資料</p>
+        )}
       </div>
 
       {/* 象限 3: 左下 - 電力監測 */}

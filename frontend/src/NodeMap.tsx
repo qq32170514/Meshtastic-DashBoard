@@ -35,32 +35,27 @@ const getRoleColor = (role?: string) => {
  * 越新鮮的節點：越亮 (Brightness)、越飽和 (Saturation)、且尺寸越大 (Scale)
  */
 const getRecencyVisuals = (lastSeen?: string) => {
-  if (!lastSeen) return { filter: 'grayscale(1) brightness(0.4)', glow: false };
+  if (!lastSeen) return { filter: 'grayscale(1) brightness(0.4)' };
   const diffMs = Date.now() - new Date(lastSeen).getTime();
   const diffHours = diffMs / 3600000;
   const diffMinutes = diffMs / 60000;
 
-  // 5分鐘內：極度活躍，帶有發光效果與放大
-  if (diffMinutes < 5)   return { filter: 'brightness(1.3) saturate(2)', glow: true };
-  // 2小時內：標準活耀
-  if (diffHours < 2)     return { filter: 'brightness(1.1) saturate(1.4)', glow: false };
-  // 12小時內：能量流失，開始變暗變灰
-  if (diffHours < 12)    return { filter: 'brightness(0.8) saturate(0.7)', glow: false };
-  // 24小時內：低能量，顯著暗淡
-  if (diffHours < 24)    return { filter: 'brightness(0.6) saturate(0.3)', glow: false };
-  // 超過 24 小時：乾枯狀態，完全灰色
-  return { filter: 'grayscale(1) brightness(0.4)', glow: false };
+  if (diffMinutes < 5)   return { filter: 'brightness(1.3) saturate(2)' };
+  if (diffHours < 2)     return { filter: 'brightness(1.1) saturate(1.4)' };
+  if (diffHours < 12)    return { filter: 'brightness(0.8) saturate(0.7)' };
+  if (diffHours < 24)    return { filter: 'brightness(0.6) saturate(0.3)' };
+  return { filter: 'grayscale(1) brightness(0.4)' };
 };
 
 // 建立自定義彩色圖標 (SVG 渲染)
 const createColoredIcon = (role?: string, lastSeen?: string) => {
   const color = getRoleColor(role);
-  const { filter, glow } = getRecencyVisuals(lastSeen);
-  const glowStyle = glow ? `filter: drop-shadow(0 0 6px ${color});` : '';
+  const { filter } = getRecencyVisuals(lastSeen);
+  const baseShadow = 'drop-shadow(0 2px 4px rgba(0,0,0,0.3))';
 
   return L.divIcon({
     html: `
-      <svg width="25" height="41" viewBox="0 0 25 41" fill="none" xmlns="http://www.w3.org/2000/svg" style="${glowStyle} filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)) ${filter}; transition: filter 0.5s ease;">
+      <svg width="25" height="41" viewBox="0 0 25 41" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: ${baseShadow} ${filter}; transition: filter 0.5s ease;">
         <path d="M12.5 0C5.596 0 0 5.596 0 12.5C0 21.875 12.5 41 12.5 41C12.5 41 25 21.875 25 12.5C25 5.596 19.404 0 12.5 0Z" fill="${color}" stroke="white" stroke-width="1.5"/>
         <circle cx="12.5" cy="12.5" r="4.5" fill="white" />
       </svg>
@@ -76,11 +71,11 @@ const createColoredIcon = (role?: string, lastSeen?: string) => {
 const getRecencyColor = (lastSeen?: string) => {
   if (!lastSeen) return '#cbd5e1';
   const diffHours = (Date.now() - new Date(lastSeen).getTime()) / 3600000;
-  if (diffHours < 2) return '#1e3a8a';   // 2小時內
-  if (diffHours < 6) return '#3b82f6';   // 2~6小時
-  if (diffHours < 12) return '#60a5fa';  // 6~12小時
-  if (diffHours < 24) return '#93c5fd';  // 12~24小時
-  return '#cbd5e1';                      // 24小時以上
+  if (diffHours < 2) return '#1e3a8a';   // 2小時內 - 深藍
+  if (diffHours < 6) return '#3b82f6';   // 2~6小時 - 鮮藍
+  if (diffHours < 12) return '#60a5fa';  // 6~12小時 - 天藍
+  if (diffHours < 24) return '#93c5fd';  // 12~24小時 - 淺藍
+  return '#cbd5e1';                      // 24小時以上 - 灰色
 };
 
 interface NodeMapProps {
@@ -90,12 +85,15 @@ interface NodeMapProps {
   onSelectNode: (id: string) => void;
   onShowDetail?: (id: string) => void; // 新增：顯示漂浮詳情頁的回呼
   isDetailView?: boolean; // 新增：是否為節點詳情模式
+  showTopology?: boolean;  // 新增：顯示拓撲圖層
+  showUtilization?: boolean; // 新增：顯示利用率圖層
+  neighbors?: any[];       // 新增：鄰居關係資料
 }
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, neighbors = [] }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
-  
+
   // 找出有座標的 Gateway 節點
   const gatewayMarkers = gateways.map(gw => {
     const gwInfo = allNodes.find(n => n.node_id === gw.gateway_id);
@@ -164,6 +162,39 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           </Popup>
         </Marker>
       ))}
+
+      {/* 繪製網路拓撲圖層 (NeighborInfo Lines) */}
+      {showTopology && neighbors.map((rel, idx) => {
+        const source = nodes.find(n => n.node_id === rel.node_id);
+        const target = nodes.find(n => n.node_id === rel.neighbor_id);
+        if (source?.latitude && target?.latitude) {
+          return (
+            <Polyline 
+              key={`topo-${idx}`}
+              positions={[[source.latitude, source.longitude], [target.latitude, target.longitude]]}
+              pathOptions={{ color: '#06b6d4', weight: Math.max(0.5, rel.snr / 2), opacity: 0.4, dashArray: '3, 6' }}
+            />
+          );
+        }
+        return null;
+      })}
+
+      {/* 繪製頻道利用率圖層 (Utilization Heat Rings) */}
+      {showUtilization && nodesWithGPS.map(node => {
+        const util = node.channel_utilization || 0;
+        if (util === 0) return null;
+        const color = util > 40 ? '#ef4444' : util > 20 ? '#f59e0b' : '#22c55e';
+        return (
+          <CircleMarker
+            key={`util-${node.node_id}`}
+            center={[node.latitude!, node.longitude!]}
+            radius={15 + (util / 2)}
+            pathOptions={{ fillColor: color, color: color, weight: 1, fillOpacity: 0.2 }}
+          >
+            <Tooltip direction="top">利用率: {util.toFixed(1)}%</Tooltip>
+          </CircleMarker>
+        );
+      })}
 
       {/* 繪製 Gateway 節點 (圓點表示) */}
       {gatewayMarkers.map((gw: any) => {

@@ -87,7 +87,12 @@ db.serialize(() => {
             hop_start INTEGER,
             role TEXT,
             channel TEXT,
-            hw_model TEXT
+            hw_model TEXT,
+            battery_level REAL,
+            voltage REAL,
+            current REAL,
+            temperature REAL,
+            humidity REAL
         )
     `);
     // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
@@ -105,6 +110,16 @@ db.serialize(() => {
             hop_start INTEGER,
             payload_json TEXT,
             raw_hex TEXT
+        )
+    `);
+    // 新增 neighbors 資料表，紀錄節點間的鄰居關係 (拓撲核心)
+    db.run(`
+        CREATE TABLE IF NOT EXISTS neighbors (
+            node_id TEXT,
+            neighbor_id TEXT,
+            snr REAL,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(node_id, neighbor_id)
         )
     `);
     // 新增 chat_messages 資料表，專門儲存解密後的文字訊息
@@ -131,6 +146,11 @@ db.serialize(() => {
     db.run(`ALTER TABLE nodes ADD COLUMN role TEXT`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN channel TEXT`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN hw_model TEXT`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN battery_level REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN voltage REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN current REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN temperature REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN humidity REAL`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
@@ -241,6 +261,28 @@ app.get('/api/chat-history/:channel', (req, res) => {
     });
 });
 
+// 取得全域閘道器排行榜
+app.get('/api/gateways/leaderboard', (req, res) => {
+    const sql = `
+        SELECT gateway_id, COUNT(*) as total_packets, AVG(snr) as avg_snr, MAX(timestamp) as last_active 
+        FROM packet_logs 
+        WHERE gateway_id IS NOT NULL AND gateway_id != '' AND gateway_id != 'Unknown'
+        GROUP BY gateway_id 
+        ORDER BY total_packets DESC LIMIT 20`;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 取得目前網路的所有鄰居關係 (拓撲層使用)
+app.get('/api/neighbors', (req, res) => {
+    db.all(`SELECT * FROM neighbors WHERE last_seen > datetime('now', '-2 days')`, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // 取得單一節點的歷史封包紀錄
 app.get('/api/node/:nodeId/packets', (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
@@ -276,15 +318,6 @@ app.get('/api/node/:nodeId/packet-stats', (req, res) => {
     db.all(sql, [req.params.nodeId], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
-    });
-});
-
-// 切換節點最愛狀態
-app.post('/api/node/:nodeId/favorite', (req, res) => {
-    const { is_favorite } = req.body;
-    db.run(`UPDATE nodes SET is_favorite = ? WHERE node_id = ?`, [is_favorite ? 1 : 0, req.params.nodeId], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true, is_favorite: is_favorite });
     });
 });
 
@@ -497,7 +530,15 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 } else if (port === 70 || port === 'TRACEROUTE_APP') {
                     payloadObj = RouteDiscovery.toObject(RouteDiscovery.decode(payloadBuffer), { enums: String, defaults: true });
                 } else if (port === 71 || port === 'NEIGHBORINFO_APP') {
-                    payloadObj = NeighborInfo.toObject(NeighborInfo.decode(payloadBuffer), { enums: String, defaults: true });
+                    const ni = NeighborInfo.decode(payloadBuffer);
+                    payloadObj = NeighborInfo.toObject(ni, { enums: String, defaults: true });
+                    // 寫入拓撲關係
+                    if (ni.neighbors && ni.neighbors.length > 0) {
+                        ni.neighbors.forEach(n => {
+                            const nId = `!${n.node_id.toString(16).padStart(8, '0')}`;
+                            db.run(`INSERT INTO neighbors (node_id, neighbor_id, snr) VALUES (?, ?, ?) ON CONFLICT(node_id, neighbor_id) DO UPDATE SET snr=excluded.snr, last_seen=CURRENT_TIMESTAMP`, [fromId, nId, n.snr]);
+                        });
+                    }
                 } else if (port === 73 || port === 'MAP_REPORT_APP') {
                     payloadObj = MapReport.toObject(MapReport.decode(payloadBuffer), { enums: String, defaults: true });
                 }
@@ -631,6 +672,11 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                         packet.hop_limit || 0,
                         packet.hop_start || 0
                     ];
+                    
+                    // 同步更新 nodes 表，確保 Dashboard 數據能正確載入
+                    db.run(`
+                        UPDATE nodes SET battery_level = ?, voltage = ?, current = ?, temperature = ?, humidity = ? WHERE node_id = ?
+                    `, [params[1], finalVoltage, finalCurrent, params[3], params[4], fromId]);
     
                     db.run(sql, params, function(err) {
                         if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
@@ -667,9 +713,11 @@ cron.schedule('0 */12 * * *', () => {
     // 原始資料庫路徑
     const sourceDbPath = path.join(__dirname, 'meshtastic.db');
     
-    // 您指定的 Google Drive 同步資料夾路徑
-    const googleDrivePath = 'D:\\雲端硬碟同步用\\Meshtastic_Backup'; 
+    // 雲端環境適應：從環境變數讀取備份路徑，若無則不執行備份
+    const googleDrivePath = process.env.BACKUP_PATH; 
     
+    if (!googleDrivePath) return;
+
     // 如果資料夾不存在，就自動建立
     if (!fs.existsSync(googleDrivePath)){
         fs.mkdirSync(googleDrivePath, { recursive: true });
