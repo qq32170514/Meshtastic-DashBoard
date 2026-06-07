@@ -632,16 +632,6 @@ function App() {
                  {data.text}
                </div>
              </div>
-                <div className={`p-4 rounded-2xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                  <div className="text-[10px] font-black text-slate-500 uppercase tracking-tighter mb-1">最活躍節點 (24h)</div>
-                  <div className="text-sm font-black text-yellow-500 truncate mt-1">
-                    {(() => {
-                      const topNodeId = Object.entries(nodeActivity).sort((a, b) => b[1] - a[1])[0]?.[0];
-                      const topNode = nodes.find(n => n.node_id === topNodeId);
-                      return topNode ? `${topNode.short_name || topNodeId} (${nodeActivity[topNodeId!]})` : '--';
-                    })()}
-                  </div>
-                </div>
           </div>
         );
       }
