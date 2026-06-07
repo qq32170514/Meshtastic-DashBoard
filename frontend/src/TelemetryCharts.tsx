@@ -23,6 +23,7 @@ interface Telemetry {
   humidity?: number;
   channel_utilization?: number;
   air_util_tx?: number;
+  current?: number;
 }
 
 export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, socket: any }) {
@@ -40,6 +41,7 @@ export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, so
         setHistory(prev => [...prev, { 
           ...data, 
           voltage: data.voltage || 0,
+          current: data.current || 0,
           air_util_tx: data.air_util_tx || 0,
           channel_utilization: data.channel_utilization || 0
         }].slice(-30));
@@ -87,12 +89,28 @@ export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, so
     ]
   };
 
-  // 圖表 2: 電力監測 (電壓)
+  // 圖表 2: 綜合電力監測 (電壓 + 電流) - 整合至 Q3
   const powerChartData = {
     labels,
     datasets: [
-      { label: '電壓 (V)', data: history.map(h => h.voltage), borderColor: '#f59e0b', backgroundColor: '#f59e0b20', fill: true, tension: 0.4 },
+      { label: '電壓 (V)', data: history.map(h => h.voltage), borderColor: '#f59e0b', backgroundColor: '#f59e0b20', fill: true, tension: 0.4, yAxisID: 'y' },
+      { label: '電流 (mA)', data: history.map(h => h.current), borderColor: '#10b981', backgroundColor: '#10b98110', fill: false, tension: 0.4, yAxisID: 'y1' },
     ]
+  };
+
+  // 針對電力圖表的特殊配置 (雙 Y 軸)
+  const powerOptions = {
+    ...commonOptions,
+    scales: {
+      ...commonOptions.scales,
+      y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } },
+      y1: { 
+        position: 'right' as const, 
+        grid: { drawOnChartArea: false }, 
+        ticks: { color: '#10b981', font: { size: 9 } },
+        suggestedMin: 0
+      }
+    }
   };
 
   // 圖表 3: 環境監測
@@ -114,17 +132,17 @@ export default function TelemetryCharts({ nodeId, socket }: { nodeId: string, so
         <Line data={batteryChartData} options={commonOptions} />
       </div>
 
-      {/* 象限 2: 右上 - 預留留白 (或放置統計摘要) */}
+      {/* 象限 2: 右上 - 預留分析空間 */}
       <div className="h-56 col-start-2 row-start-1 flex items-center justify-center border border-dashed border-slate-100 rounded-xl">
-        <span className="text-[9px] text-slate-300 font-bold uppercase tracking-[0.3em]">Analysis Node Ready</span>
+        <span className="text-[9px] text-slate-300 font-bold uppercase tracking-[0.3em]">Advanced Analysis Ready</span>
       </div>
 
       {/* 象限 3: 左下 - 電力監測 */}
       <div className="h-56 col-start-1 row-start-2">
         <div className="flex justify-between items-center mb-2">
-          <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備電力監測 (Voltage)</span>
+          <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備綜合電力監測 (V / mA)</span>
         </div>
-        <Line data={powerChartData} options={commonOptions} />
+        <Line data={powerChartData} options={powerOptions} />
       </div>
 
       {/* 象限 4: 右下 - 環境遙測 */}

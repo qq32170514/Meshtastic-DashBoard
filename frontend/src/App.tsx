@@ -1,6 +1,7 @@
-import { useEffect, useState, useMemo, useRef } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin } from 'lucide-react';
+import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import NodeMap from './NodeMap'; // 兩者都在 src 下，保持不變
 import TelemetryCharts from './TelemetryCharts';
 import PacketTypePieChart from './PacketTypePieChart';
@@ -12,11 +13,14 @@ export interface Node {
   last_seen: string;
   is_favorite: number;
   role?: string;
+  channel?: string;
+  hw_model?: string;
   latitude?: number;
   longitude?: number;
   last_topic?: string;
   battery_level?: number;
   voltage?: number;
+  current?: number;
   snr?: number;
   rssi?: number;
   air_util_tx?: number;
@@ -30,6 +34,7 @@ interface Packet {
   portnum: string;
   topic: string;
   time: string;
+  timestamp?: string; // 新增：原始時間戳記
   snr?: number;
   rssi?: number;
   gateway_id?: string;
@@ -79,15 +84,26 @@ function App() {
   const [mapShowFavoritesOnly, setMapShowFavoritesOnly] = useState(false);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false); // 控制漂浮詳情頁
   const [currentChatChannel, setCurrentChatChannel] = useState('MediumFast'); // 預設 MediumFast
+  const [unreadChannels, setUnreadChannels] = useState<Record<string, boolean>>({}); // 紀錄未讀頻道
   const [gatewayStats, setGatewayStats] = useState<GatewayStat[]>([]);
   const [packetStats, setPacketStats] = useState<PacketStat[]>([]);
   const [nodePackets, setNodePackets] = useState<Packet[]>([]);
+  const [chatHistory, setChatHistory] = useState<any[]>([]); // 儲存資料庫抓取的歷史訊息
   const [darkMode, setDarkMode] = useState(true); // 預設開啟暗色模式
   const [loadingPackets, setLoadingPackets] = useState(false); // New state for loading indicator
   const [selectedPacket, setSelectedPacket] = useState<Packet | null>(null); // 控制封包詳情彈窗
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null); // 用於自動捲動
   const selectedNodeIdRef = useRef<string | null>(null);
+  const activeTabRef = useRef(activeTab);
+  const currentChatChannelRef = useRef(currentChatChannel);
+
+  // 同步狀態到 Ref，確保 Socket 回呼函數能讀到最新值
+  useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+  useEffect(() => { currentChatChannelRef.current = currentChatChannel; }, [currentChatChannel]);
+
+  // 計算是否有任何頻道未讀 (用於主標籤)
+  const hasAnyUnreadChat = useMemo(() => Object.values(unreadChannels).some(v => v), [unreadChannels]);
 
   // 計算過濾後的列表
   const filteredNodes = useMemo(() => {
@@ -102,12 +118,55 @@ function App() {
     return nodes.filter(n => n.is_favorite === 1);
   }, [nodes]);
 
-  // 過濾出用於對話視窗的文字訊息
+  // 整合歷史訊息與即時收到的文字訊息
   const chatMessages = useMemo(() => {
-    return packets
-      .filter(p => (PORTNUM_NAMES[p.portnum] === 'TEXT_MESSAGE' || p.portnum === '1' || p.portnum === 1) && p.payload_json?.text && (p.payload_json?.channel_name === currentChatChannel))
-      .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime()); // 由舊到新排序
-  }, [packets, currentChatChannel]);
+    const liveMsgs = packets
+      .filter(p => (PORTNUM_NAMES[p.portnum] === 'TEXT_MESSAGE' || p.portnum === '1' || p.portnum === 1) && p.payload_json?.text && p.payload_json?.channel_name === currentChatChannel)
+      .map(p => ({
+        node_id: p.from,
+        message: p.payload_json.text,
+        timestamp: p.timestamp || new Date().toISOString(),
+        isLive: true
+      }));
+
+    // 合併並徹底移除重複 (根據 node_id, message, timestamp 三者結合判斷)
+    const combined = [...chatHistory, ...liveMsgs];
+    return combined
+      .filter((msg, index, self) => 
+        index === self.findIndex((t) => (
+          t.node_id === msg.node_id && t.message === msg.message && t.timestamp === msg.timestamp
+        ))
+      )
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  }, [packets, chatHistory, currentChatChannel]);
+
+  // 切換頻道時抓取歷史紀錄
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      fetch(`/api/chat-history/${encodeURIComponent(currentChatChannel)}`)
+        .then(res => res.json())
+        .then(data => setChatHistory(data));
+    }
+  }, [currentChatChannel, activeTab]);
+
+  // 自動捲動到底部
+  useEffect(() => {
+    if (activeTab === 'chat') {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages]);
+
+  // 當使用者進入特定頻道時，清除未讀標記
+  useEffect(() => {
+    if (activeTab === 'chat' && unreadChannels[currentChatChannel]) {
+      setUnreadChannels(prev => {
+        if (!prev[currentChatChannel]) return prev;
+        const next = { ...prev };
+        next[currentChatChannel] = false;
+        return next;
+      });
+    }
+  }, [activeTab, currentChatChannel, unreadChannels]);
 
   useEffect(() => {
     // 1. 初始抓取節點狀態
@@ -136,10 +195,23 @@ function App() {
 
     // 監聽原始封包
     socket.on('raw_packet', (packet) => {
-      // 不再即時更新全域 packets 列表以節省伺服器與前端效能
-      // 如果當前收到的封包來自正在檢視的節點，則同步更新詳情頁列表
+      // 更新時間戳記與 RAW Data 支援
+      const now = new Date();
+      packet.timestamp = now.toISOString();
+      packet.time = now.toLocaleTimeString('zh-TW', { hour12: false });
+
       if (selectedNodeIdRef.current && packet.from === selectedNodeIdRef.current) {
         setNodePackets(prev => [packet, ...prev].slice(0, 20));
+      }
+
+      // 未讀訊息點點邏輯
+      const isText = (PORTNUM_NAMES[packet.portnum] === 'TEXT_MESSAGE' || packet.portnum === '1' || packet.portnum === 1);
+      if (isText && packet.payload_json?.text && packet.payload_json?.channel_name) {
+        const msgChan = packet.payload_json.channel_name;
+        // 如果使用者目前不在對話頁面，或者不在該頻道，則點亮紅點
+        if (activeTabRef.current !== 'chat' || currentChatChannelRef.current !== msgChan) {
+          setUnreadChannels(prev => ({ ...prev, [msgChan]: true }));
+        }
       }
     });
 
@@ -149,6 +221,7 @@ function App() {
         ...n, 
         battery_level: data.battery_level, 
         voltage: data.voltage,
+        current: data.current,
         snr: data.snr,
         rssi: data.rssi,
         air_util_tx: data.air_util_tx,
@@ -175,14 +248,54 @@ function App() {
         from: p.node_id,
         portnum: p.portnum,
         topic: p.topic,
-        time: new Date(p.timestamp).toLocaleTimeString(),
+        time: (() => {
+          const dateStr = p.timestamp.includes(' ') ? p.timestamp.replace(' ', 'T') + 'Z' : p.timestamp;
+          return new Date(dateStr).toLocaleTimeString('zh-TW', { hour12: false });
+        })(),
+        timestamp: p.timestamp,
         snr: p.snr,
         rssi: p.rssi,
         gateway_id: p.gateway_id,
+        rawData: p.raw_hex,
         payload_json: p.payload_json ? (typeof p.payload_json === 'string' ? JSON.parse(p.payload_json) : p.payload_json) : null
       })));
     } catch (error) {
       console.error("Failed to fetch packets:", error);
+    } finally {
+      setLoadingPackets(false);
+    }
+  };
+
+  // 新增：抓取單一節點的詳細統計與封包紀錄
+  const fetchNodeStats = async (nodeId: string) => {
+    setLoadingPackets(true);
+    try {
+      const [gwRes, statRes, pktRes] = await Promise.all([
+        fetch(`/api/node/${encodeURIComponent(nodeId)}/gateways`),
+        fetch(`/api/node/${encodeURIComponent(nodeId)}/packet-stats`),
+        fetch(`/api/node/${encodeURIComponent(nodeId)}/packets?limit=20`)
+      ]);
+
+      setGatewayStats(await gwRes.json());
+      setPacketStats(await statRes.json());
+      const pktData = await pktRes.json();
+      setNodePackets(pktData.map((p: any) => ({
+        from: p.node_id,
+        portnum: p.portnum,
+        topic: p.topic,
+        time: (() => {
+          const dateStr = p.timestamp.includes(' ') ? p.timestamp.replace(' ', 'T') + 'Z' : p.timestamp;
+          return new Date(dateStr).toLocaleTimeString('zh-TW', { hour12: false });
+        })(),
+        timestamp: p.timestamp,
+        snr: p.snr,
+        rssi: p.rssi,
+        gateway_id: p.gateway_id,
+        rawData: p.raw_hex,
+        payload_json: p.payload_json ? (typeof p.payload_json === 'string' ? JSON.parse(p.payload_json) : p.payload_json) : null
+      })));
+    } catch (error) {
+      console.error("Failed to fetch node stats:", error);
     } finally {
       setLoadingPackets(false);
     }
@@ -193,33 +306,7 @@ function App() {
     const node = nodes.find(n => n.node_id === selectedNodeId);
     selectedNodeIdRef.current = selectedNodeId;
     if (node) setSelectedNode(node);
-
-    if (selectedNodeId) {
-      // 抓取該節點的額外統計資訊 (原本 index.html 的深度功能)
-      fetch(`/api/node/${encodeURIComponent(selectedNodeId)}/gateways`)
-        .then(res => res.json())
-        .then(data => setGatewayStats(data))
-        .catch(() => setGatewayStats([]));
-
-      fetch(`/api/node/${encodeURIComponent(selectedNodeId)}/packet-stats`)
-        .then(res => res.json())
-        .then(data => setPacketStats(data))
-        .catch(() => setPacketStats([]));
-
-      fetch(`/api/node/${encodeURIComponent(selectedNodeId)}/packets?limit=20`)
-        .then(res => res.json())
-        .then(data => setNodePackets(data.map((p: any) => ({
-          from: p.node_id,
-          portnum: p.portnum,
-          topic: p.topic,
-          time: new Date(p.timestamp).toLocaleTimeString(),
-          snr: p.snr,
-          rssi: p.rssi,
-          gateway_id: p.gateway_id,
-          payload_json: p.payload_json ? (typeof p.payload_json === 'string' ? JSON.parse(p.payload_json) : p.payload_json) : null
-        }))))
-        .catch(() => setNodePackets([]));
-    }
+    if (selectedNodeId) fetchNodeStats(selectedNodeId);
   }, [selectedNodeId, nodes]);
 
   // 切換最愛狀態
@@ -243,6 +330,143 @@ function App() {
   const handleShowModal = (nodeId: string) => {
     setSelectedNodeId(nodeId);
     setIsDetailModalOpen(true);
+  };
+
+  // 渲染封包詳情中的專屬視覺化元件
+  const renderPacketVisualizer = (packet: Packet) => {
+    const type = PORTNUM_NAMES[packet.portnum] || packet.portnum;
+    const data = packet.payload_json;
+    if (!data) return null;
+
+    switch (type) {
+      case 'TELEMETRY': {
+        const metrics: any = { 
+          ...(data.device_metrics || data.deviceMetrics || {}),
+          ...(data.environment_metrics || data.environmentMetrics || {}),
+          ...(data.power_metrics || data.powerMetrics || {})
+        };
+        return (
+          <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+            <h5 className="text-[10px] font-black uppercase text-slate-500 mb-3 tracking-widest flex items-center gap-2">
+              <Activity size={14} className="text-blue-500" /> 遙測數據指標 Telemetry Metrics
+            </h5>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+              {Object.entries(metrics).map(([key, val]: [string, any]) => (
+                <div key={key} className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
+                  <span className="text-slate-400 font-medium uppercase tracking-tighter text-[9px]">{key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ')}</span>
+                  <span className={`font-mono font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+                    {typeof val === 'number' ? (val % 1 === 0 ? val : val.toFixed(2)) : String(val)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      }
+      case 'POSITION': {
+        const lat = data.latitude_i ? data.latitude_i / 1e7 : data.latitude;
+        const lon = data.longitude_i ? data.longitude_i / 1e7 : data.longitude;
+        if (!lat || !lon) return null;
+        return (
+          <div className="space-y-2">
+            <h5 className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2">
+              <MapPin size={14} className="text-green-500" /> 位置廣播 Position Broadcast
+            </h5>
+            <div className="h-48 rounded-xl overflow-hidden border border-slate-300">
+               <MapContainer center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
+                 <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                 <CircleMarker center={[lat, lon]} radius={8} pathOptions={{ fillColor: '#22c55e', color: 'white', weight: 2, fillOpacity: 0.9 }} />
+               </MapContainer>
+            </div>
+          </div>
+        );
+      }
+      case 'NODEINFO': {
+        const fields = [
+          { label: 'Long Name', val: data.long_name || data.longName },
+          { label: 'Short Name', val: data.short_name || data.shortName },
+          { label: 'Role', val: data.role, color: 'text-cyan-500' },
+          { label: 'Hardware', val: data.hw_model || data.hwModel },
+          { label: 'ID', val: data.id }
+        ];
+        return (
+          <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+             <h5 className="text-[10px] font-black uppercase text-slate-500 mb-3 tracking-widest flex items-center gap-2">
+               <Smartphone size={14} className="text-cyan-500" /> 節點身份資訊 Node Identity
+             </h5>
+             <div className="grid grid-cols-2 gap-4 text-xs">
+               {fields.map(f => f.val && (
+                 <div key={f.label} className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                   <span className="text-slate-400 text-[9px] uppercase font-bold">{f.label}</span>
+                   <span className={`font-bold truncate ${f.color || ''}`}>{f.val}</span>
+                 </div>
+               ))}
+             </div>
+          </div>
+        );
+      }
+      case 'TEXT_MESSAGE': {
+        return (
+          <div className="space-y-2">
+             <h5 className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2">
+               <MessageCircle size={14} className="text-purple-500" /> 訊息內容 Message Content
+             </h5>
+             <div className="flex justify-start">
+               <div className={`px-4 py-2 rounded-2xl rounded-tl-none text-sm shadow-sm ${darkMode ? 'bg-slate-800 text-slate-100 border border-slate-700' : 'bg-white text-slate-800 border border-slate-200'}`}>
+                 {data.text}
+               </div>
+             </div>
+          </div>
+        );
+      }
+      case 'TRACEROUTE': {
+        const routeRaw = data.route || [];
+        const route = routeRaw.map((id: number | string) => 
+          typeof id === 'number' ? `!${id.toString(16).padStart(8, '0')}` : id
+        );
+        const sourceNode = nodes.find(n => n.node_id === packet.from);
+        const destId = route[route.length - 1];
+        const destNode = nodes.find(n => n.node_id === destId);
+        
+        const points: [number, number][] = [];
+        if (sourceNode?.latitude && sourceNode?.longitude) points.push([sourceNode.latitude, sourceNode.longitude]);
+        if (destNode?.latitude && destNode?.longitude) points.push([destNode.latitude, destNode.longitude]);
+
+        return (
+          <div className="space-y-2">
+             <h5 className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2">
+               <Zap size={14} className="text-yellow-500" /> 路徑追蹤 Traceroute Path
+             </h5>
+             {points.length === 2 ? (
+               <div className="h-48 rounded-xl overflow-hidden border border-slate-300">
+                 <MapContainer bounds={points} style={{ height: '100%', width: '100%' }} zoomControl={false} boundsOptions={{ padding: [20, 20] }}>
+                   <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                   <CircleMarker center={points[0]} radius={6} pathOptions={{ fillColor: '#eab308', color: 'white', weight: 2, fillOpacity: 1 }} />
+                   <CircleMarker center={points[1]} radius={6} pathOptions={{ fillColor: '#ef4444', color: 'white', weight: 2, fillOpacity: 1 }} />
+                   <Polyline positions={points} color="#eab308" weight={2} dashArray="5, 5" />
+                 </MapContainer>
+               </div>
+             ) : (
+               <div className={`p-4 rounded-xl text-center text-[10px] italic ${darkMode ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-400'}`}>
+                 無法顯示地圖：來源或目的地節點缺少 GPS 座標
+               </div>
+             )}
+             <div className="flex flex-wrap gap-1 mt-2">
+               {route.map((id: string, i: number) => (
+                 <div key={i} className="flex items-center gap-1">
+                   <span className="px-1.5 py-0.5 bg-slate-200 dark:bg-slate-800 rounded text-[9px] font-mono text-slate-500">
+                     {id}
+                   </span>
+                   {i < route.length - 1 && <span className="text-slate-400">→</span>}
+                 </div>
+               ))}
+             </div>
+          </div>
+        );
+      }
+      default:
+        return null;
+    }
   };
 
   return (
@@ -285,9 +509,12 @@ function App() {
           </button>
           <button 
             onClick={() => setActiveTab('chat')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'chat' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all relative ${activeTab === 'chat' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
           >
             <MessageCircle size={16} /> 頻道對話
+            {hasAnyUnreadChat && (
+              <span className="absolute top-3 right-3 w-2 h-2 bg-red-500 rounded-full border-2 border-white dark:border-slate-900 animate-pulse"></span>
+            )}
           </button>
           <button 
             onClick={() => setActiveTab('details')}
@@ -330,8 +557,8 @@ function App() {
                     <th className="px-6 py-4">最愛</th>
                     <th className="px-6 py-4">Node ID</th>
                     <th className="px-6 py-4">角色</th>
-                    <th className="px-6 py-4">Short Name</th>
-                    <th className="px-6 py-4">Long Name</th>
+                    <th className="px-6 py-4">節點名稱 (Short)</th>
+                    <th className="px-6 py-4">硬體型號</th>
                     <th className="px-6 py-4">頻道</th>
                     <th className="px-6 py-4">最後活動</th>
                   </tr>
@@ -351,16 +578,38 @@ function App() {
                       <td className="px-6 py-4 font-mono font-bold text-cyan-600">
                         {node.node_id}
                       </td>
-                      <td className="px-6 py-4"><span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>{node.role || 'CLIENT'}</span></td>
-                      <td className="px-6 py-4 font-black">{node.short_name || '??'}</td>
-                      <td className={`px-6 py-4 ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>{node.long_name || 'Unknown'}</td>
+                      <td className="px-6 py-4">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                          node.role?.includes('ROUTER') ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' :
+                          node.role?.includes('BASE') ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
+                          node.role?.includes('REPEATER') ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
+                          node.role?.includes('TRACKER') ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
+                          darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'
+                        }`}>
+                          {node.role?.replace('_', ' ') || 'CLIENT'}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-1.5">
+                          <span className={`font-black truncate max-w-[120px] ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{node.long_name || 'Unknown'}</span>
+                          <span className="text-[10px] font-bold text-cyan-500 bg-cyan-500/10 px-1 rounded">({node.short_name || '??'})</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className={`px-2 py-0.5 rounded text-[9px] font-mono border uppercase tracking-tighter ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>
+                          {node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}
+                        </span>
+                      </td>
                       <td className="px-6 py-4">
                         <div className={`text-[10px] max-w-[120px] truncate font-bold ${darkMode ? 'text-cyan-400/80' : 'text-cyan-700'}`} title={node.last_topic}>
                           {(() => {
-                            if (!node.last_topic) return '-';
-                            const parts = node.last_topic.split('/');
-                            // 支援標準 Topic 格式解析頻道名
-                            const channelName = parts.length >= 5 ? parts[4] : (parts[2] || '-');
+                            const rawChannel = node.channel || '';
+                            // 過濾掉純數字(版本號)與明顯錯誤的系統標籤
+                            const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
+                            const channelName = isInvalid ? (() => {
+                                const parts = (node.last_topic || '').split('/');
+                                return parts.find(p => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
+                            })() : rawChannel;
                             return channelName === 'MediumFast' ? '⚡ ' + channelName : channelName;
                           })()}
                         </div>
@@ -394,13 +643,16 @@ function App() {
                   <button
                     key={chan}
                     onClick={() => setCurrentChatChannel(chan)}
-                    className={`px-4 py-2 rounded-t-lg text-[10px] font-black uppercase tracking-tighter transition-all whitespace-nowrap border-b-2 ${
+                    className={`px-4 py-2 rounded-t-lg text-[10px] font-black uppercase tracking-tighter transition-all whitespace-nowrap border-b-2 relative ${
                       currentChatChannel === chan 
                         ? 'border-cyan-500 text-cyan-500 bg-cyan-500/5' 
                         : 'border-transparent text-slate-500 hover:text-slate-300'
                     }`}
                   >
                     {chan === 'Emergency!' ? '🚨 ' + chan : chan}
+                    {unreadChannels[chan] && (
+                      <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-red-500 rounded-full shadow-[0_0_5px_rgba(239,68,68,0.8)] animate-pulse"></span>
+                    )}
                   </button>
                 ))}
               </div>
@@ -414,22 +666,35 @@ function App() {
                 </div>
               )}
               {chatMessages.map((msg, idx) => {
-                const sender = nodes.find(n => n.node_id === msg.from);
+                // 關鍵修正：對話結構中使用 node_id 進行比對，確保能識別「最愛節點」
+                const sender = nodes.find(n => n.node_id === msg.node_id);
                 const isFavorite = sender?.is_favorite === 1;
                 
                 return (
                   <div key={idx} className={`flex ${isFavorite ? 'justify-end' : 'justify-start'} w-full animate-in fade-in slide-in-from-bottom-2`}>
                     <div className={`flex gap-3 max-w-[80%] ${isFavorite ? 'flex-row-reverse' : 'flex-row'}`}>
                       {/* Avatar */}
-                      <div className={`w-10 h-10 rounded-full flex items-center justify-center text-[10px] font-black border-2 flex-shrink-0 ${isFavorite ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-700 border-slate-600 text-slate-300'}`}>
+                      <div 
+                        onClick={() => handleShowModal(msg.node_id)}
+                        className={`w-10 h-10 rounded-full flex items-center justify-center text-[10px] font-black border-2 flex-shrink-0 cursor-pointer hover:opacity-80 transition-opacity ${isFavorite ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-700 border-slate-600 text-slate-300'}`}
+                      >
                         {sender?.short_name || '??'}
                       </div>
                       
                       {/* Bubble */}
                       <div className={`flex flex-col ${isFavorite ? 'items-end' : 'items-start'}`}>
                         <div className="flex items-center gap-2 mb-1 px-1">
-                          {!isFavorite && <span className="text-[10px] font-bold text-cyan-500">{sender?.long_name || msg.from}</span>}
-                          <span className="text-[9px] text-slate-500 font-mono">{msg.time}</span>
+                          {/* 名稱點擊跳轉 */}
+                          <button onClick={() => handleShowModal(msg.node_id)} className={`text-[10px] font-bold hover:underline ${isFavorite ? 'text-yellow-500' : 'text-cyan-500'}`}>
+                            {msg.node_id} {sender?.long_name ? `(${sender.long_name})` : ''}
+                          </button>
+                          <span className="text-[9px] text-slate-500 font-mono">
+                            {(() => {
+                              // 修正時區：強制視為 UTC 並轉換為台灣本地時間
+                              const dateStr = msg.timestamp.includes(' ') ? msg.timestamp.replace(' ', 'T') + 'Z' : msg.timestamp;
+                              return new Date(dateStr).toLocaleTimeString('zh-TW', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                            })()}
+                          </span>
                           {isFavorite && <span className="text-[10px] font-bold text-yellow-500">YOU (FAV)</span>}
                         </div>
                         <div className={`px-4 py-2 rounded-2xl text-sm shadow-sm break-all ${
@@ -439,13 +704,14 @@ function App() {
                               ? 'bg-slate-800 text-slate-100 border border-slate-700 rounded-tl-none' 
                               : 'bg-white text-slate-800 border border-slate-200 rounded-tl-none'
                         }`}>
-                          {msg.payload_json.text}
+                          {msg.message}
                         </div>
                       </div>
                     </div>
                   </div>
                 );
               })}
+              <div ref={chatEndRef} />
             </div>
             <div className={`p-3 text-center text-[9px] font-bold tracking-widest text-slate-500 border-t ${darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-100 border-slate-200'}`}>
               MESSAGES LOADED FROM MQTT CACHE
@@ -486,63 +752,6 @@ function App() {
           </div>
         )}
 
-        {activeTab === 'chat' && (
-          <div className={`flex flex-col h-[75vh] rounded-2xl border shadow-xl overflow-hidden ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
-            <div className={`p-4 border-b flex justify-between items-center ${darkMode ? 'bg-slate-800/50' : 'bg-white'}`}>
-              <div className="flex items-center gap-2">
-                <MessageCircle className="text-cyan-500" size={20} />
-                <h3 className="font-black uppercase tracking-widest text-sm">Public Channel Messages</h3>
-              </div>
-              <button onClick={fetchPackets} className="p-2 hover:bg-slate-200/20 rounded-full transition-colors"><RefreshCw size={16} className={loadingPackets ? 'animate-spin' : ''}/></button>
-            </div>
-            
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin">
-              {chatMessages.length === 0 && (
-                <div className="h-full flex flex-col items-center justify-center text-slate-400 italic">
-                  <MessageCircle size={48} className="mb-4 opacity-10" />
-                  <p>尚無文字訊息紀錄</p>
-                </div>
-              )}
-              {chatMessages.map((msg, idx) => {
-                const sender = nodes.find(n => n.node_id === msg.from);
-                const isFavorite = sender?.is_favorite === 1;
-                
-                return (
-                  <div key={idx} className={`flex ${isFavorite ? 'justify-end' : 'justify-start'} w-full animate-in fade-in slide-in-from-bottom-2`}>
-                    <div className={`flex gap-3 max-w-[80%] ${isFavorite ? 'flex-row-reverse' : 'flex-row'}`}>
-                      {/* Avatar */}
-                      <div className={`w-10 h-10 rounded-full flex items-center justify-center text-[10px] font-black border-2 flex-shrink-0 ${isFavorite ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-700 border-slate-600 text-slate-300'}`}>
-                        {sender?.short_name || '??'}
-                      </div>
-                      
-                      {/* Bubble */}
-                      <div className={`flex flex-col ${isFavorite ? 'items-end' : 'items-start'}`}>
-                        <div className="flex items-center gap-2 mb-1 px-1">
-                          {!isFavorite && <span className="text-[10px] font-bold text-cyan-500">{sender?.long_name || msg.from}</span>}
-                          <span className="text-[9px] text-slate-500 font-mono">{msg.time}</span>
-                          {isFavorite && <span className="text-[10px] font-bold text-yellow-500">YOU (FAV)</span>}
-                        </div>
-                        <div className={`px-4 py-2 rounded-2xl text-sm shadow-sm break-all ${
-                          isFavorite 
-                            ? 'bg-cyan-600 text-white rounded-tr-none' 
-                            : darkMode 
-                              ? 'bg-slate-800 text-slate-100 border border-slate-700 rounded-tl-none' 
-                              : 'bg-white text-slate-800 border border-slate-200 rounded-tl-none'
-                        }`}>
-                          {msg.payload_json.text}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <div className={`p-3 text-center text-[9px] font-bold tracking-widest text-slate-500 border-t ${darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-100 border-slate-200'}`}>
-              MESSAGES LOADED FROM MQTT CACHE
-            </div>
-          </div>
-        )}
-
         {activeTab === 'details' && (
           <div className="space-y-6">
             {selectedNode ? (
@@ -555,9 +764,18 @@ function App() {
                     </div>
                     <div className="text-slate-400 text-sm font-mono mt-1">ID: {selectedNode.node_id} | Topic: {selectedNode.last_topic}</div>
                   </div>
-                  <div className="text-right">
-                    <div className="text-xs text-slate-500 uppercase font-bold tracking-widest">最後活動</div>
-                    <div className="text-blue-400 font-mono text-lg">{new Date(selectedNode.last_seen).toLocaleString()}</div>
+                  <div className="flex items-center gap-4 text-right">
+                    <button 
+                      onClick={() => fetchNodeStats(selectedNode!.node_id)} 
+                      className="p-2 hover:bg-slate-800 rounded-full transition-colors text-slate-400"
+                      title="重新整理數據"
+                    >
+                      <RefreshCw size={20} className={loadingPackets ? 'animate-spin' : ''} />
+                    </button>
+                    <div>
+                      <div className="text-xs text-slate-500 uppercase font-bold tracking-widest">最後活動</div>
+                      <div className="text-blue-400 font-mono text-lg">{new Date(selectedNode.last_seen).toLocaleString()}</div>
+                    </div>
                   </div>
                 </div>
 
@@ -604,18 +822,21 @@ function App() {
                             </tr>
                           </thead>
                           <tbody>
-                            {packetStats.map((p, i) => (
+                            {packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map((p, i) => (
                               <tr key={i} className={`border-b last:border-0 ${darkMode ? 'border-slate-700/50' : 'border-slate-200'}`}>
-                                <td className={`py-2 font-medium ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{p.portnum}</td>
+                                <td className={`py-2 font-medium ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{PORTNUM_NAMES[p.portnum] || p.portnum}</td>
                                 <td className="py-2 text-right font-bold text-slate-500">{p.count}</td>
                               </tr>
                             ))}
                           </tbody>
                         </table>
-                        {packetStats.length === 0 && <div className="text-xs text-slate-300 italic mt-2">無資料</div>}
+                        {packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').length === 0 && <div className="text-xs text-slate-300 italic mt-2">無資料</div>}
                       </div>
                       <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
-                        <PacketTypePieChart packetStats={packetStats} />
+                        <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
+                          ...ps,
+                          portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
+                        }))} />
                       </div>
                     </div>
                   </section>
@@ -709,8 +930,11 @@ function App() {
                                     <span className="text-[10px] text-slate-400 font-medium whitespace-nowrap">
                                       {(() => {
                                         const m = p.payload_json.device_metrics || p.payload_json.deviceMetrics;
-                                        if (!m) return '';
-                                        return `${m.battery_level ?? m.batteryLevel ?? '?'}% ${m.voltage?.toFixed(2) || ''}V | AU:${(m.air_util_tx ?? m.airUtilTx ?? 0).toFixed(1)}% CU:${(m.channel_utilization ?? m.channelUtilization ?? 0).toFixed(1)}%`;
+                                        const pwr = p.payload_json.power_metrics || p.payload_json.powerMetrics;
+                                        if (!m && !pwr) return '';
+                                        const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage ?? m?.voltage;
+                                        const c = pwr?.ch1_current ?? pwr?.ch1Current;
+                                        return `${m?.battery_level ?? m?.batteryLevel ?? '?'}% ${v?.toFixed(2) || ''}V ${c ? `(${c.toFixed(0)}mA)` : ''} | AU:${(m?.air_util_tx ?? m?.airUtilTx ?? 0).toFixed(1)}% CU:${(m?.channel_utilization ?? m?.channelUtilization ?? 0).toFixed(1)}%`;
                                       })()}
                                     </span>
                                   )}
@@ -778,7 +1002,7 @@ function App() {
                 Map Visualization: {mapShowFavoritesOnly ? favoriteNodes.length : nodes.length} Nodes
               </div>
             </div>
-            <div className="h-[70vh] rounded-2xl overflow-hidden border-4 border-slate-100 shadow-inner relative">
+            <div className={`h-[70vh] rounded-2xl overflow-hidden border-4 shadow-inner relative transition-colors ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
               <NodeMap 
                 nodes={mapShowFavoritesOnly ? favoriteNodes : nodes} 
                 onSelectNode={(id) => setSelectedNodeId(id)} 
@@ -813,12 +1037,21 @@ function App() {
                     ID: {selectedNode.node_id}
                   </button>
                 </div>
-                <button 
-                  onClick={() => setIsDetailModalOpen(false)}
-                  className="p-2 hover:bg-slate-800 rounded-full transition-colors"
-                >
-                  <X size={24} />
-                </button>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={() => fetchNodeStats(selectedNode.node_id)} 
+                    className="p-2 hover:bg-slate-800 rounded-full transition-colors text-slate-400"
+                    title="重新整理數據"
+                  >
+                    <RefreshCw size={20} className={loadingPackets ? 'animate-spin' : ''} />
+                  </button>
+                  <button 
+                    onClick={() => setIsDetailModalOpen(false)}
+                    className="p-2 hover:bg-slate-800 rounded-full transition-colors"
+                  >
+                    <X size={24} />
+                  </button>
+                </div>
               </div>
 
               {/* Modal Body (複用原本詳情頁的內容) */}
@@ -839,7 +1072,7 @@ function App() {
                           <tr><th className="pb-2">Portnum</th><th className="pb-2 text-right">Count</th></tr>
                         </thead>
                         <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                          {packetStats.map((p, i) => (
+                          {packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map((p, i) => (
                             <tr key={i} className="border-b border-slate-200 last:border-0">
                               <td className="py-2 text-slate-700 font-bold">
                                 {PORTNUM_NAMES[p.portnum] || p.portnum}
@@ -851,7 +1084,10 @@ function App() {
                       </table>
                     </div>
                     <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-100'}`}>
-                      <PacketTypePieChart packetStats={packetStats} />
+                      <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
+                        ...ps,
+                        portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
+                      }))} />
                     </div>
                   </div>
                 </section>
@@ -966,6 +1202,8 @@ function App() {
                   </div>
                 </div>
 
+                {renderPacketVisualizer(selectedPacket)}
+
                 <div>
                   <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block">Decoded JSON Data</span>
                   <div className={`p-4 rounded-xl font-mono text-xs overflow-x-auto ${darkMode ? 'bg-black text-emerald-400' : 'bg-slate-900 text-slate-200'}`}>
@@ -981,7 +1219,7 @@ function App() {
 
                 {selectedPacket.rawData && (
                   <div>
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block">Raw Hex Stream</span>
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block">Raw Payload (Hex / 原始數據)</span>
                     <div className="p-3 bg-slate-100 rounded-lg font-mono text-[9px] text-slate-500 break-all border border-slate-200">
                       {selectedPacket.rawData}
                     </div>

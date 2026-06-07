@@ -7,6 +7,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const cron = require('node-cron');
 
 const app = express();
 const server = http.createServer(app);
@@ -15,6 +17,8 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
 
 let isMqttConnected = false; // 紀錄 MQTT 連線狀態
 
@@ -63,6 +67,7 @@ db.serialize(() => {
             air_util_tx REAL,
             snr REAL,
             rssi REAL,
+            current REAL,
             hop_limit INTEGER,
             hop_start INTEGER
         )
@@ -79,7 +84,10 @@ db.serialize(() => {
             is_favorite INTEGER DEFAULT 0,
             last_topic TEXT,
             hop_limit INTEGER,
-            hop_start INTEGER
+            hop_start INTEGER,
+            role TEXT,
+            channel TEXT,
+            hw_model TEXT
         )
     `);
     // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
@@ -95,18 +103,34 @@ db.serialize(() => {
             rssi REAL,
             hop_limit INTEGER,
             hop_start INTEGER,
-            payload_json TEXT
+            payload_json TEXT,
+            raw_hex TEXT
+        )
+    `);
+    // 新增 chat_messages 資料表，專門儲存解密後的文字訊息
+    db.run(`
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            message TEXT,
+            channel_name TEXT
         )
     `);
     // 確保舊資料庫也能加上欄位 (如果已存在則會忽略錯誤)
     db.run(`ALTER TABLE nodes ADD COLUMN is_favorite INTEGER DEFAULT 0`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN last_topic TEXT`, (err) => {});
     db.run(`ALTER TABLE packet_logs ADD COLUMN gateway_id TEXT`, (err) => {});
+    db.run(`ALTER TABLE telemetry_data ADD COLUMN current REAL`, (err) => {});
     db.run(`ALTER TABLE packet_logs ADD COLUMN hop_limit INTEGER`, (err) => {});
     db.run(`ALTER TABLE packet_logs ADD COLUMN hop_start INTEGER`, (err) => {});
     db.run(`ALTER TABLE packet_logs ADD COLUMN payload_json TEXT`, (err) => {});
+    db.run(`ALTER TABLE packet_logs ADD COLUMN raw_hex TEXT`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN hop_limit INTEGER`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN hop_start INTEGER`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN role TEXT`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN channel TEXT`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN hw_model TEXT`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
@@ -118,6 +142,9 @@ db.serialize(() => {
 function cleanupOldData() {
     const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-3 days')`;
     const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-3 days')`;
+    // 新增：聊天紀錄保留 30 天，避免資料庫無限增長
+    const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-30 days')`;
+
     db.run(sql, function(err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
         else if (this.changes > 0) {
@@ -125,6 +152,7 @@ function cleanupOldData() {
         }
     });
     db.run(sqlPackets);
+    db.run(sqlChat);
 }
 
 // 每小時執行一次清理
@@ -200,6 +228,16 @@ app.get('/api/packets', (req, res) => {
             return res.status(500).json({ error: err.message });
         }
         res.json(rows);
+    });
+});
+
+// 取得特定頻道的歷史對話紀錄 (翻閱功能)
+app.get('/api/chat-history/:channel', (req, res) => {
+    const channel = req.params.channel;
+    const sql = `SELECT * FROM chat_messages WHERE channel_name = ? ORDER BY timestamp DESC LIMIT 100`;
+    db.all(sql, [channel], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows.reverse()); // 由舊到新排序回傳
     });
 });
 
@@ -321,9 +359,6 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
     });
 
     client.on('message', (topic, message) => {
-        // Debug: 在控制台印出所有收到的 Topic，確認過濾器是否有抓到東西
-        // console.log(`📩 收到 Topic: ${topic}`);
-
         const rawHex = message.toString('hex').toUpperCase();
 
         try {
@@ -334,108 +369,123 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             const gatewayId = envelope.gateway_id || 'Unknown';
 
+            // 🛑 封包去重過濾器：檢查「發送者 + 封包ID」
+            const packetKey = `${fromId}-${packet.id}`;
+            if (seenPackets.has(packetKey)) return; 
+            
+            seenPackets.add(packetKey);
+            
+            // 自動清理快取：保留最近 1000 個封包 ID，避免記憶體洩漏
+            if (seenPackets.size > 1000) {
+                const iter = seenPackets.values();
+                seenPackets.delete(iter.next().value);
+            }
+
+            // 解析頻道名稱：優先尋找 /c/ 標籤，若無則過濾保留字
+            const topicParts = topic.split('/');
+            const cIndex = topicParts.indexOf('c');
+            const jsonIndex = topicParts.indexOf('json');
+            let resolvedChannel = (cIndex !== -1 && topicParts[cIndex + 1]) ? topicParts[cIndex + 1] : (jsonIndex !== -1 ? topicParts[jsonIndex + 1] : null);
+            if (!resolvedChannel) {
+                resolvedChannel = topicParts.find(p => 
+                    !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat'].includes(p) && !p.startsWith('!') && p !== ''
+                ) || null;
+            }
+
             let decodedData = packet.decoded;
 
-            // --- 嘗試手動解密路徑 ---
+            // ==========================================
+            // 🔥 1. 多頻道神級解密引擎 🔥
+            // ==========================================
             if (!decodedData && packet.encrypted && packet.encrypted.length > 0) {
+                
+                // 🛡️ 安全過濾：將 Base64URL 轉為標準 Base64，避免金鑰破損
                 const safeBase64 = (str) => str.replace(/-/g, '+').replace(/_/g, '/');
 
                 const knownKeys = [
                     { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") },
                     { name: "MeshTW", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
-                    { name: "SignalTest", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
+                    { name: "SignalTest", key: Buffer.from(safeBase64("y1HciVgpl5Hzh05KJUe/umWUH8XhG3UjR1rvZHfUHFU="), "base64") },
                     { name: "Emergency!", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") }
                 ];
 
                 try {
-                    // Nonce (IV) 構造：PacketID(0-3), FromNodeID(8-11)
-                    const iv = Buffer.alloc(16); // 預設填充 0x00
+                    // Nonce 構造：必須遵守硬體層 64-bit 記憶體對齊
+                    const iv = Buffer.alloc(16);
                     iv.writeUInt32LE(packet.id >>> 0, 0);
-                    iv.writeUInt32LE(packet.from >>> 0, 8); 
+                    iv.writeUInt32LE(packet.from >>> 0, 8); // 👉 關鍵修正：From ID 必須在 Offset 8
                     
                     for (const k of knownKeys) {
                         try {
                             if (k.key.length !== 16 && k.key.length !== 32) continue;
-                            
+
                             const algo = k.key.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
                             const decipher = crypto.createDecipheriv(algo, k.key, iv);
                             const decrypted = Buffer.concat([decipher.update(packet.encrypted), decipher.final()]);
                             
                             const attempt = Data.decode(decrypted);
+                            const port = attempt.portnum;
                             
-                            // 🛑 核心防禦：如果 Port 是 0 或 undefined，通常是拿錯鑰匙解出的垃圾數據
-                            if (!attempt.portnum || attempt.portnum === 0 || attempt.portnum === 'UNKNOWN_APP') {
+                            // 🛑 破除「假成功」陷阱：過濾掉拿錯鑰匙產生的亂碼
+                            if (port === 0 || port === 'UNKNOWN_APP' || port === undefined) {
                                 continue; 
                             }
 
-                            if (attempt && attempt.payload) {
-                                decodedData = attempt;
-                                // 優先從 Topic 中提取頻道名稱，若無則使用金鑰名稱
-                                const topicParts = topic.split('/');
-                                const topicChannel = topicParts.length >= 5 ? topicParts[4] : null;
-                                decodedData.channel_name = (topicChannel && k.name !== "MediumFast") ? topicChannel : k.name;
-                                
-                                if (decodedData.portnum === 1 || decodedData.portnum === 'TEXT_MESSAGE_APP') {
-                                    console.log(`💬 [${decodedData.channel_name}] 解密文字成功: ${decodedData.payload.toString('utf8')}`);
-                                }
-                                break; // 成功解密，跳出迴圈
-                            }
-                        } catch (e) {
-                            // 此金鑰解碼失敗，嘗試下一個
-                        }
+                            // 🎯 成功解密！
+                            decodedData = attempt;
+                            
+                            // 核心優化：優先使用解密後確認的頻道名稱
+                            decodedData.channel_name = resolvedChannel || k.name;
+                            
+                            break; 
+                        } catch (e) { /* 此金鑰失敗，繼續 */ }
                     }
-                } catch (e) {
-                    // 解密失敗（可能是私有金鑰或其他頻道），保持為 null
-                }
+                } catch (e) { console.error('❌ 解密引擎結構錯誤', e); }
             }
 
-            // 1. 無論封包是否解碼，都先更新節點的「最後在線」狀態
-            // 這能確保即使內容加密，我們也能在儀表板看到該 Node ID 出現
-            // 使用 INSERT ON CONFLICT 避免覆蓋掉已存在的名稱
+            // 1. 更新節點最後在線狀態 (Discovery)
             const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen, last_topic, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
+                INSERT INTO nodes (node_id, last_seen, last_topic, channel, hop_limit, hop_start) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, channel=COALESCE(excluded.channel, nodes.channel), hop_limit=excluded.hop_limit, hop_start=excluded.hop_start
             `;
-            db.run(nodeUpdateSql, [fromId, topic, packet.hop_limit || 0, packet.hop_start || 0], (err) => {
-                if (!err) {
-                    io.emit('node_seen', { 
-                        node_id: fromId, 
-                        last_seen: new Date().toISOString(),
-                        last_topic: topic
-                    });
-                }
-            });
+            db.run(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0]);
+            io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString(), last_topic: topic, channel: resolvedChannel });
 
             // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED
             if (!decodedData) {
-                console.log(`📦 [收到加密封包] 來自: ${fromId} | Topic: ${topic}`);
-                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
-                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null]);
-                
-                io.emit('raw_packet', {
-                    from: fromId,
-                    portnum: 'ENCRYPTED',
-                    topic: topic,
-                    gateway_id: gatewayId,
-                    time: new Date().toLocaleTimeString(),
-                    snr: packet.rx_snr || null,
-                    rssi: packet.rx_rssi || null,
-                    hop_limit: packet.hop_limit || 0,
-                    hop_start: packet.hop_start || 0,
-                    payload_json: null,
-                    rawData: rawHex
+                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null, rawHex]);
+                io.emit('raw_packet', { 
+                    from: fromId, 
+                    portnum: 'ENCRYPTED', 
+                    topic: topic, 
+                    gateway_id: gatewayId, 
+                    timestamp: new Date().toISOString(),
+                    time: new Date().toLocaleTimeString(), 
+                    snr: packet.rx_snr, 
+                    rssi: packet.rx_rssi, 
+                    rawData: rawHex 
                 });
-                return; // 加封包處理結束
+                return;
             }
 
-            // --- 嘗試預先解碼 Payload 以供檢視 ---
+            // ==========================================
+            // 💬 3. 業務邏輯解析 (文字、遙測等)
+            // ==========================================
             let payloadObj = null;
             const port = decodedData.portnum;
             const payloadBuffer = Buffer.isBuffer(decodedData.payload) ? decodedData.payload : Buffer.from(decodedData.payload || []);
 
             try {
                 if (port === 1 || port === 'TEXT_MESSAGE_APP') {
-                    payloadObj = { text: payloadBuffer.toString('utf8') };
+                    const textMessage = payloadBuffer.toString('utf8');
+                    const channelName = decodedData.channel_name || 'MediumFast';
+                    payloadObj = { text: textMessage, channel_name: channelName };
+                    
+                    console.log(`💬 [頻道: ${channelName}] ${fromId} 說: ${textMessage}`);
+                    
+                    // 寫入聊天紀錄表
+                    db.run(`INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)`, [fromId, textMessage, channelName]);
                 } else if (port === 3 || port === 'POSITION_APP') {
                     payloadObj = Position.toObject(Position.decode(payloadBuffer), { enums: String, defaults: true });
                 } else if (port === 4 || port === 'NODEINFO_APP') {
@@ -451,50 +501,47 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 } else if (port === 73 || port === 'MAP_REPORT_APP') {
                     payloadObj = MapReport.toObject(MapReport.decode(payloadBuffer), { enums: String, defaults: true });
                 }
-            } catch (e) { /* 解析失敗則維持 null */ }
+            } catch (e) { console.error('❌ Payload 解析失敗', e); }
             
-            // 確保頻道名稱被傳遞到前端
             if (payloadObj && decodedData.channel_name) {
                 payloadObj.channel_name = decodedData.channel_name;
             }
+
+            // 3. 寫入封包日誌並推播
             const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
+            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex]);
 
-            // 在 Terminal 顯示收到的封包摘要
-            console.log(`📦 [處理封包] 來自: ${fromId} | Port: ${port} | Topic: ${topic}`);
-            
-            // 將封包寫入歷史紀錄表
-            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
-                [fromId, decodedData.portnum, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson]);
-
-            // 推播原始封包資訊到前端日誌視窗
-            io.emit('raw_packet', {
-                from: fromId,
-                portnum: port,
-                topic: topic,
-                gateway_id: gatewayId,
-                time: new Date().toLocaleTimeString(),
-                snr: packet.rx_snr || null,
-                rssi: packet.rx_rssi || null,
-                hop_limit: packet.hop_limit || 0,
-                hop_start: packet.hop_start || 0,
-                payload_json: payloadObj,
-                rawData: rawHex
+            io.emit('raw_packet', { 
+                from: fromId, 
+                portnum: port, 
+                topic: topic, 
+                gateway_id: gatewayId, 
+                timestamp: new Date().toISOString(),
+                time: new Date().toLocaleTimeString(), 
+                snr: packet.rx_snr, 
+                rssi: packet.rx_rssi, 
+                payload_json: payloadObj, 
+                rawData: rawHex 
             });
 
             // 解析節點資訊 (名稱)
             if (port === 4 || port === 'NODEINFO_APP') {
                 try {
-                    const user = User.decode(decodedData.payload);
+                    const user = User.toObject(User.decode(payloadBuffer), { enums: String });
+                    const finalRole = user.role || 'CLIENT';
+                    const hwModel = user.hw_model || user.hwModel || null;
                     db.run(`
-                        UPDATE nodes SET long_name = ?, short_name = ?, role = ? WHERE node_id = ?
-                    `, [user.long_name, user.short_name, user.role, fromId], (err) => {
+                        UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ? WHERE node_id = ?
+                    `, [user.long_name, user.short_name, finalRole, hwModel, fromId], (err) => {
                         if (!err) {
-                            console.log(`👤 [節點資訊] 更新名稱: ${user.short_name} (${user.long_name})`);
+                            console.log(`👤 [節點資訊] 更新: ${user.short_name} 角色: ${finalRole}`);
                             io.emit('node_seen', { 
                                 node_id: fromId, 
                                 long_name: user.long_name, 
                                 short_name: user.short_name,
-                                role: user.role,
+                                role: finalRole,
+                                hw_model: hwModel,
                                 last_seen: new Date().toISOString(),
                                 last_topic: topic
                             });
@@ -557,24 +604,30 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 
                 const device = cleanJSON.device_metrics || cleanJSON.deviceMetrics || {};
                 const env = cleanJSON.environment_metrics || cleanJSON.environmentMetrics || {};
+                const power = cleanJSON.power_metrics || cleanJSON.powerMetrics || {};
                 const air = cleanJSON.air_util_tx ?? device.air_util_tx ?? device.airUtilTx ?? null;
                 const cu = device.channel_utilization ?? device.channelUtilization ?? null;
 
-                    const sql = `
-                        INSERT INTO telemetry_data 
-                        (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, hop_limit, hop_start) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    `;
+                // 優先權邏輯：I2C 電壓/電流 (Power Metrics) > ADC 設備電壓 (Device Metrics)
+                const finalVoltage = power.ch1_voltage ?? power.ch1Voltage ?? device.voltage ?? null;
+                const finalCurrent = power.ch1_current ?? power.ch1Current ?? null;
+
+                const sql = `
+                    INSERT INTO telemetry_data 
+                    (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, current, hop_limit, hop_start) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `;
                     const params = [
                         fromId, 
                         device.battery_level ?? device.batteryLevel ?? null, 
-                        device.voltage ?? null, 
+                        finalVoltage, 
                         env.temperature ?? null, 
                         env.relative_humidity ?? env.relativeHumidity ?? null, 
                         cu, 
                         air,
                         packet.rx_snr ?? null,
                         packet.rx_rssi ?? null,
+                        finalCurrent,
                         packet.hop_limit || 0,
                         packet.hop_start || 0
                     ];
@@ -587,7 +640,8 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                         io.emit('telemetry_update', {
                             node_id: fromId,
                             battery_level: params[1],
-                            voltage: params[2],
+                            voltage: finalVoltage,
+                            current: finalCurrent,
                             temperature: params[3],
                             humidity: params[4],
                             channel_utilization: cu,
@@ -605,3 +659,32 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
         }
     });
 }
+
+// ==========================================
+// 💾 4. 每 12 小時自動備份資料庫至雲端
+// ==========================================
+cron.schedule('0 */12 * * *', () => {
+    // 原始資料庫路徑
+    const sourceDbPath = path.join(__dirname, 'meshtastic.db');
+    
+    // 您指定的 Google Drive 同步資料夾路徑
+    const googleDrivePath = 'D:\\雲端硬碟同步用\\Meshtastic_Backup'; 
+    
+    // 如果資料夾不存在，就自動建立
+    if (!fs.existsSync(googleDrivePath)){
+        fs.mkdirSync(googleDrivePath, { recursive: true });
+    }
+
+    // 取得今天的日期作為檔名後綴
+    const dateStr = new Date().toISOString().slice(0, 10); 
+    const backupFileName = `meshtastic_backup_${dateStr}.db`;
+    const targetBackupPath = path.join(googleDrivePath, backupFileName);
+
+    try {
+        // 執行檔案複製 (靜態副本)
+        fs.copyFileSync(sourceDbPath, targetBackupPath);
+        console.log(`\n📦 [雲端備份成功] ${new Date().toLocaleString()} - 資料庫已安全複製至: ${backupFileName}`);
+    } catch (err) {
+        console.error('\n❌ [雲端備份失敗] 發生錯誤:', err);
+    }
+});
