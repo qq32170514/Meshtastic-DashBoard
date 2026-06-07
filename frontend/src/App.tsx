@@ -758,7 +758,7 @@ function App() {
                       className={`cursor-pointer transition-colors group text-sm ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}
                     >
                       <td className="px-6 py-4" onClick={(e) => e.stopPropagation()}>
-                        <button onClick={() => toggleFavorite(node.node_id, node.is_favorite)} className={node.is_favorite ? 'text-yellow-500' : 'text-slate-300 hover:text-slate-400'}>
+                        <button onClick={() => toggleFavorite(node.node_id)} className={node.is_favorite ? 'text-yellow-500' : 'text-slate-300 hover:text-slate-400'}>
                           <Star fill={node.is_favorite ? "currentColor" : "none"} size={18} />
                         </button>
                       </td>
@@ -1016,7 +1016,7 @@ function App() {
                       <p className="text-xs text-blue-500 font-bold opacity-80">({node.short_name || '??'})</p>
                     </div>
                     <button 
-                      onClick={(e) => { e.stopPropagation(); toggleFavorite(node.node_id, node.is_favorite); }} 
+                      onClick={(e) => { e.stopPropagation(); toggleFavorite(node.node_id); }} 
                       className="text-yellow-500 p-2 hover:scale-110 transition-transform bg-yellow-500/10 rounded-full"
                       title="從最愛移除"
                     >
@@ -1200,7 +1200,7 @@ function App() {
                     <div className="text-3xl font-black tracking-tight flex items-center gap-3">
                       {selectedNode.long_name}
                       <span className="text-blue-400 text-lg">({selectedNode.short_name})</span>
-                      <button onClick={() => toggleFavorite(selectedNode.node_id, selectedNode.is_favorite)} className={selectedNode.is_favorite ? 'text-yellow-500 ml-2' : 'text-white/40 ml-2 hover:text-white/80'}>
+                      <button onClick={() => toggleFavorite(selectedNode.node_id)} className={selectedNode.is_favorite ? 'text-yellow-500 ml-2' : 'text-white/40 ml-2 hover:text-white/80'}>
                         <Star fill={selectedNode.is_favorite ? "currentColor" : "none"} size={24} />
                       </button>
                     </div>
@@ -1489,7 +1489,7 @@ function App() {
                   <div className="text-2xl font-black tracking-tight flex items-center gap-3">
                     {selectedNode.long_name}
                     <span className="text-blue-400 text-lg">({selectedNode.short_name})</span>
-                    <button onClick={() => toggleFavorite(selectedNode.node_id, selectedNode.is_favorite)} className={selectedNode.is_favorite ? 'text-yellow-500' : 'text-slate-500 hover:text-slate-400'}>
+                    <button onClick={() => toggleFavorite(selectedNode.node_id)} className={selectedNode.is_favorite ? 'text-yellow-500' : 'text-slate-500 hover:text-slate-400'}>
                       <Star fill={selectedNode.is_favorite ? "currentColor" : "none"} size={20} />
                     </button>
                   </div>

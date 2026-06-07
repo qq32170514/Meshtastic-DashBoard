@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const cron = require('node-cron');
+require('dotenv').config(); // 讀取 .env 檔案
 
 const app = express();
 const server = http.createServer(app);
@@ -47,7 +48,8 @@ app.use(express.static(__dirname));
 // ==========================================
 // 1. 初始化 SQLite 資料庫
 // ==========================================
-const dbPath = path.join(__dirname, 'meshtastic.db');
+// 支援自定義資料庫路徑（Render Persistent Disk 使用）
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'meshtastic.db');
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error('❌ 資料庫連線失敗:', err.message);
     else console.log(`🗄️ SQLite 資料庫已連線至: ${dbPath}`);
@@ -364,9 +366,9 @@ root.load([
 // 3. 啟動 MQTT 監聽與資料寫入
 // ==========================================
 function startMqttClient() { // 修正函數名稱為 startMqttClient
-    const client = mqtt.connect('mqtt://mqtt.meshtastic.org', {
-        username: 'meshdev',
-        password: 'large4cats',
+    const client = mqtt.connect(process.env.MQTT_BROKER || 'mqtt://mqtt.meshtastic.org', {
+        username: process.env.MQTT_USER || 'meshdev',
+        password: process.env.MQTT_PASSWORD || 'large4cats',
         clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10), 
         connectTimeout: 5000 
     });
@@ -377,7 +379,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
         io.emit('mqtt_status', { connected: true });
         
         // 只訂閱台灣區域的 Topic (# 代表監聽 TW 路徑下的所有子頻道)
-        const topics = ['msh/TW/#'];
+        const topics = (process.env.MQTT_TOPICS || 'msh/TW/#').split(',');
         client.subscribe(topics, (err) => {
             if (!err) console.log(`📡 訂閱成功！正在監聽: ${topics.join(', ')}`);
         });
