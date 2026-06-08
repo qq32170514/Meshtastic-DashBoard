@@ -153,6 +153,14 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
               <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
             </div>
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span>
+              <span className="font-bold truncate text-slate-500" title={node.firmware_version}>{node.firmware_version || 'UNKNOWN'}</span>
+            </div>
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Build</span>
+              <span className="font-bold truncate text-slate-500" title={node.firmware_build_num}>{node.firmware_build_num || 'UNKNOWN'}</span>
+            </div>
+            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
               <span className="text-slate-400 text-[9px] uppercase font-bold">Role</span>
               <span className="font-bold text-cyan-500">{node.role || 'CLIENT'}</span>
             </div>

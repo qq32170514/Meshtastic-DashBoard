@@ -21,6 +21,9 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// 讓 Express 信任 Cloudflare 轉發的標頭 (這對於取得真實訪客 IP 很重要)
+app.set('trust proxy', true);
+
 const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
 
 let isMqttConnected = false; // 紀錄 MQTT 連線狀態
@@ -29,7 +32,9 @@ let isMqttConnected = false; // 紀錄 MQTT 連線狀態
 // Socket.io 連線監聽 (新增)
 // ==========================================
 io.on('connection', (socket) => {
-    console.log('🔌 有新用戶連線到 Dashboard:', socket.id);
+    // 取得真實訪客 IP (相容 Cloudflare)
+    const clientIp = socket.handshake.headers['cf-connecting-ip'] || socket.handshake.address;
+    console.log(`🔌 有新用戶連線 [IP: ${clientIp}] 到 Dashboard:`, socket.id);
     // 當用戶剛連線時，立即告知當前的 MQTT 狀態
     socket.emit('mqtt_status', { connected: isMqttConnected });
     socket.on('disconnect', () => console.log('❌ 用戶已中斷連線'));
@@ -123,6 +128,8 @@ db.serialize(() => {
             current REAL,
             temperature REAL,
             humidity REAL,
+            firmware_version TEXT,
+            firmware_build_num TEXT,
             last_gateway TEXT
         )
     `);
@@ -182,6 +189,8 @@ db.serialize(() => {
     db.run(`ALTER TABLE nodes ADD COLUMN current REAL`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN temperature REAL`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN humidity REAL`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN firmware_version TEXT`, (err) => {});
+    db.run(`ALTER TABLE nodes ADD COLUMN firmware_build_num TEXT`, (err) => {});
     db.run(`ALTER TABLE nodes ADD COLUMN last_gateway TEXT`, (err) => {});
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
@@ -192,15 +201,15 @@ db.serialize(() => {
 // 1.2 資料清理任務 (保留 3 天)
 // ==========================================
 function cleanupOldData() {
-    const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-3 days')`;
-    const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-3 days')`;
+    const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-14 days')`;
+    const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-14 days')`;
     // 新增：聊天紀錄保留 30 天，避免資料庫無限增長
     const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-30 days')`;
 
     db.run(sql, function(err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
         else if (this.changes > 0) {
-            console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 3 天的舊資料`);
+            console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 14 天的舊資料`);
         }
     });
     db.run(sqlPackets);
@@ -625,9 +634,11 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     const user = User.toObject(User.decode(payloadBuffer), { enums: String });
                     const finalRole = user.role || 'CLIENT';
                     const hwModel = user.hw_model || user.hwModel || null;
+                    const firmwareVersion = user.firmware_version || user.firmwareVersion || null;
+                    const firmwareBuildNum = user.firmware_build_num || user.firmwareBuildNum || null;
                     db.run(`
-                        UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ? WHERE node_id = ?
-                    `, [user.long_name, user.short_name, finalRole, hwModel, fromId], (err) => {
+                        UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ?, firmware_version = ?, firmware_build_num = ? WHERE node_id = ?
+                    `, [user.long_name, user.short_name, finalRole, hwModel, firmwareVersion, firmwareBuildNum, fromId], (err) => {
                         if (!err) {
                             console.log(`👤 [節點資訊] 更新: ${user.short_name} 角色: ${finalRole}`);
                             io.emit('node_seen', { 
@@ -636,6 +647,8 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                                 short_name: user.short_name,
                                 role: finalRole,
                                 hw_model: hwModel,
+                                firmware_version: firmwareVersion,
+                                firmware_build_num: firmwareBuildNum,
                                 last_seen: new Date().toISOString(),
                                 last_topic: topic
                             });

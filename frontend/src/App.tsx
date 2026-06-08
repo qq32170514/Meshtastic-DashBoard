@@ -27,6 +27,8 @@ export interface Node {
   channel_utilization?: number;
   temperature?: number;
   humidity?: number;
+  firmware_version?: string;
+  firmware_build_num?: string;
   last_gateway?: string;
 }
 
@@ -416,27 +418,22 @@ function App() {
       } : n));
     });
 
-    // 5. 抓取系統健康度
-    const fetchSysStatus = () => {
-      fetch('/api/sys-status')
-        .then(res => res.json())
-        .then(data => setSysStatus(data))
-        .catch(() => {});
-    const fetchDashboardUpdates = async () => {
+    // 5. 抓取系統健康度與節點密度更新 (合併邏輯)
+    const refreshDashboardData = async () => {
       try {
         const [sRes, aRes] = await Promise.all([fetch('/api/sys-status'), fetch('/api/nodes/activity')]);
-        setSysStatus(await sRes.json());
-        const activityData = await aRes.json();
+        const sData = await sRes.json();
+        const aData = await aRes.json();
+        
+        setSysStatus(sData);
         const activityMap: Record<string, number> = {};
-        activityData.forEach((item: any) => activityMap[item.node_id] = item.count);
+        aData.forEach((item: any) => activityMap[item.node_id] = item.count);
         setNodeActivity(activityMap);
       } catch (e) {}
     };
-    fetchSysStatus();
-    const sysInterval = setInterval(fetchSysStatus, 30000); // 每 30 秒更新一次
 
-    fetchDashboardUpdates();
-    const sysInterval = setInterval(fetchDashboardUpdates, 30000); // 每 30 秒更新一次
+    refreshDashboardData();
+    const sysInterval = setInterval(refreshDashboardData, 30000); // 每 30 秒更新一次
 
     return () => {
       socket.off('mqtt_status');
