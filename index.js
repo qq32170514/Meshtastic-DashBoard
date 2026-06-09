@@ -151,6 +151,7 @@ db.serialize(() => {
         )
     `);
     // 新增 neighbors 資料表，紀錄節點間的鄰居關係 (拓撲核心)
+    db.run(`PRAGMA journal_mode = WAL;`);
     db.run(`
         CREATE TABLE IF NOT EXISTS neighbors (
             node_id TEXT,
@@ -170,28 +171,34 @@ db.serialize(() => {
             channel_name TEXT
         )
     `);
-    // 確保舊資料庫也能加上欄位 (如果已存在則會忽略錯誤)
-    db.run(`ALTER TABLE nodes ADD COLUMN is_favorite INTEGER DEFAULT 0`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN last_topic TEXT`, (err) => {});
-    db.run(`ALTER TABLE packet_logs ADD COLUMN gateway_id TEXT`, (err) => {});
-    db.run(`ALTER TABLE telemetry_data ADD COLUMN current REAL`, (err) => {});
-    db.run(`ALTER TABLE packet_logs ADD COLUMN hop_limit INTEGER`, (err) => {});
-    db.run(`ALTER TABLE packet_logs ADD COLUMN hop_start INTEGER`, (err) => {});
-    db.run(`ALTER TABLE packet_logs ADD COLUMN payload_json TEXT`, (err) => {});
-    db.run(`ALTER TABLE packet_logs ADD COLUMN raw_hex TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN hop_limit INTEGER`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN hop_start INTEGER`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN role TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN channel TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN hw_model TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN battery_level REAL`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN voltage REAL`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN current REAL`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN temperature REAL`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN humidity REAL`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN firmware_version TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN firmware_build_num TEXT`, (err) => {});
-    db.run(`ALTER TABLE nodes ADD COLUMN last_gateway TEXT`, (err) => {});
+
+    const cols = [
+        { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
+        { t: 'nodes', c: 'last_topic', d: 'TEXT' },
+        { t: 'packet_logs', c: 'gateway_id', d: 'TEXT' },
+        { t: 'telemetry_data', c: 'current', d: 'REAL' },
+        { t: 'packet_logs', c: 'hop_limit', d: 'INTEGER' },
+        { t: 'packet_logs', c: 'hop_start', d: 'INTEGER' },
+        { t: 'packet_logs', c: 'payload_json', d: 'TEXT' },
+        { t: 'packet_logs', c: 'raw_hex', d: 'TEXT' },
+        { t: 'nodes', c: 'hop_limit', d: 'INTEGER' },
+        { t: 'nodes', c: 'hop_start', d: 'INTEGER' },
+        { t: 'nodes', c: 'role', d: 'TEXT' },
+        { t: 'nodes', c: 'channel', d: 'TEXT' },
+        { t: 'nodes', c: 'hw_model', d: 'TEXT' },
+        { t: 'nodes', c: 'battery_level', d: 'REAL' },
+        { t: 'nodes', c: 'voltage', d: 'REAL' },
+        { t: 'nodes', c: 'current', d: 'REAL' },
+        { t: 'nodes', c: 'temperature', d: 'REAL' },
+        { t: 'nodes', c: 'humidity', d: 'REAL' },
+        { t: 'nodes', c: 'firmware_version', d: 'TEXT' },
+        { t: 'nodes', c: 'firmware_build_num', d: 'TEXT' },
+        { t: 'nodes', c: 'last_gateway', d: 'TEXT' }
+    ];
+    cols.forEach(col => {
+        db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => {});
+    });
+
     // 建立索引以加速前端查詢歷史數據的效能
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
@@ -223,6 +230,52 @@ cleanupOldData(); // 啟動時先執行一次
 // ==========================================
 // 1.5 API 路由設定 (提供給前端)
 // ==========================================
+
+// 🛸 輔助函式：構建封包查詢條件
+const buildPacketQuery = (req, baseSql) => {
+    let sql = baseSql;
+    const params = [];
+    const conditions = [];
+
+    if (req.params.nodeId) {
+        conditions.push("node_id = ?");
+        params.push(req.params.nodeId);
+    }
+    if (req.query.node_ids) {
+        const ids = req.query.node_ids.split(',');
+        conditions.push(`node_id IN (${ids.map(() => '?').join(',')})`);
+        params.push(...ids);
+    }
+    if (req.query.portnum) {
+        conditions.push("portnum = ?");
+        params.push(req.query.portnum);
+    }
+    if (req.query.gateway_id) {
+        conditions.push("gateway_id LIKE ?");
+        params.push(`%${req.query.gateway_id}%`);
+    }
+    if (req.query.timeStart) {
+        conditions.push("timestamp >= ?");
+        params.push(req.query.timeStart);
+    }
+    if (req.query.timeEnd) {
+        conditions.push("timestamp <= ?");
+        params.push(req.query.timeEnd);
+    }
+    if (req.query.minSnr) {
+        conditions.push("snr >= ?");
+        params.push(parseFloat(req.query.minSnr));
+    }
+    if (req.query.minRssi) {
+        conditions.push("rssi >= ?");
+        params.push(parseFloat(req.query.minRssi));
+    }
+
+    if (conditions.length > 0) {
+        sql += " WHERE " + conditions.join(" AND ");
+    }
+    return { sql, params };
+};
 
 // 取得所有或特定節點的最新遙測資料
 app.get('/api/telemetry', (req, res) => {
@@ -281,14 +334,27 @@ app.get('/api/node/:nodeId', (req, res) => {
 
 // 取得全域最新封包紀錄 (提供給封包觀察分頁)
 app.get('/api/packets', (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
-    const sql = `SELECT * FROM packet_logs ORDER BY timestamp DESC LIMIT ?`;
-    db.all(sql, [limit], (err, rows) => {
+    const { sql, params } = buildPacketQuery(req, "SELECT * FROM packet_logs");
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+
+    const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+    db.all(finalSql, [...params, limit, offset], (err, rows) => {
         if (err) {
             console.error('❌ API /api/packets SQL Error:', err.message);
             return res.status(500).json({ error: err.message });
         }
         res.json(rows);
+    });
+});
+
+// 🚀 新增：全域封包總數統計
+app.get('/api/packets/count', (req, res) => {
+    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
+    db.get(sql, params, (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ count: row?.count || 0 });
     });
 });
 
@@ -357,11 +423,24 @@ app.get('/api/neighbors', (req, res) => {
 
 // 取得單一節點的歷史封包紀錄
 app.get('/api/node/:nodeId/packets', (req, res) => {
-    const limit = parseInt(req.query.limit) || 50;
-    const sql = `SELECT * FROM packet_logs WHERE node_id = ? ORDER BY timestamp DESC LIMIT ?`;
-    db.all(sql, [req.params.nodeId, limit], (err, rows) => {
+    const { sql, params } = buildPacketQuery(req, "SELECT * FROM packet_logs");
+    const limit = parseInt(req.query.limit) || 20;
+    const page = parseInt(req.query.page) || 1;
+    const offset = (page - 1) * limit;
+
+    const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+    db.all(finalSql, [...params, limit, offset], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
+    });
+});
+
+// 🚀 新增：單一節點封包總數統計
+app.get('/api/node/:nodeId/packets/count', (req, res) => {
+    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
+    db.get(sql, params, (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ count: row?.count || 0 });
     });
 });
 

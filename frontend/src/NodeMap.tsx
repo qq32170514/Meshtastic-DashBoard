@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip } from 'react-leaflet';
-import 'leaflet/dist/leaflet.css';
+import React, { useState, useEffect } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
@@ -88,11 +87,22 @@ interface NodeMapProps {
   showTopology?: boolean;  // 新增：顯示拓撲圖層
   showUtilization?: boolean; // 新增：顯示利用率圖層
   neighbors?: any[];       // 新增：鄰居關係資料
+  activeTab?: string;
 }
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, neighbors = [] }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, neighbors = [], activeTab }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
+
+  const MapInvalidator = () => {
+    const map = useMap();
+    useEffect(() => {
+      setTimeout(() => {
+        map.invalidateSize();
+      }, 100);
+    }, [activeTab, map]);
+    return null;
+  };
 
   // 找出有座標的 Gateway 節點
   const gatewayMarkers = gateways.map(gw => {
@@ -110,7 +120,8 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
 
   return (
     <div className="relative w-full h-full">
-      <MapContainer center={[23.6, 121]} zoom={7} style={{ height: '100%', width: '100%' }}>
+      <MapContainer center={[23.6, 121]} zoom={7} className="w-full h-full" style={{ width: '100%', height: '100%' }}>
+      <MapInvalidator />
       <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
       
       {/* 繪製主節點 */}

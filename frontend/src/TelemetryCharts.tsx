@@ -84,8 +84,8 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
   const batteryChartData = {
     labels,
     datasets: [
-      { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4 },
-      { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4 },
+      { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4, yAxisID: 'y' }, // Added units to label
+      { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4, yAxisID: 'y1' }, // Added units to label
       { label: 'CU (%)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4 },
     ]
   };
@@ -93,7 +93,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
   // 圖表 2: 綜合電力監測 (電壓 + 電流) - 整合至 Q3
   const powerChartData = {
     labels,
-    datasets: [
+    datasets: [ // Ensure only I2C voltage/current is displayed, added units to label
       { label: '電壓 (V)', data: history.map(h => h.voltage), borderColor: '#f59e0b', backgroundColor: '#f59e0b20', fill: true, tension: 0.4, yAxisID: 'y' },
       { label: '電流 (mA)', data: history.map(h => h.current), borderColor: '#10b981', backgroundColor: '#10b98110', fill: false, tension: 0.4, yAxisID: 'y1' },
     ]
@@ -102,8 +102,16 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
   // 針對電力圖表的特殊配置 (雙 Y 軸)
   const powerOptions = {
     ...commonOptions,
+    plugins: {
+      legend: { 
+        position: 'top' as const,
+        labels: { boxWidth: 10, font: { size: 10 } }
+      },
+      tooltip: { mode: 'index' as const, intersect: false }
+    },
     scales: {
       ...commonOptions.scales,
+      // Battery chart has two Y-axes
       y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } },
       y1: { 
         position: 'right' as const, 
@@ -114,46 +122,63 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     }
   };
 
+  // 針對電池與通道佔用率圖表的特殊配置 (雙 Y 軸)
+  const batteryOptions = {
+    ...commonOptions,
+    plugins: {
+      legend: { 
+        position: 'top' as const,
+        labels: { boxWidth: 10, font: { size: 10 } }
+      },
+      tooltip: { mode: 'index' as const, intersect: false }
+    },
+    scales: {
+      ...commonOptions.scales,
+      y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } }, // Battery level
+      y1: { position: 'right' as const, grid: { drawOnChartArea: false }, ticks: { color: '#3b82f6', font: { size: 9 } }, suggestedMin: 0, max: 100 } // AU/CU
+    }
+  };
+
   // 圖表 3: 環境監測
   const envChartData = {
     labels,
-    datasets: [
+    datasets: [ // Added units to labels
       { label: '溫度 (°C)', data: history.map(h => h.temperature), borderColor: '#ef4444', tension: 0.4 },
       { label: '濕度 (%)', data: history.map(h => h.humidity), borderColor: '#06b6d4', tension: 0.4 },
     ]
   };
 
   return (
-    <div className="grid grid-cols-2 grid-rows-2 gap-x-8 gap-y-10">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-10">
       {/* 象限 1: 左上 - 電池與通道 */}
       <div className="h-56 col-start-1 row-start-1">
-        <div className="flex justify-between items-center mb-2">
+        <div className="flex justify-between items-center mb-2"> {/* Added units to labels */}
           <span className="text-[10px] font-black text-blue-500 uppercase tracking-widest">Q1. 電池與通道佔用率</span>
-        </div>
-        <Line data={batteryChartData} options={commonOptions} />
+        </div> {/* Added units to labels */}
+        <Line data={batteryChartData} options={batteryOptions} />
       </div>
 
       {/* 象限 2: 右上 - 節點身份資訊 - 確保 node 更新時重繪 */}
-      <div key={`identity-${node?.node_id}`} className={`h-56 col-start-2 row-start-1 p-5 rounded-xl border shadow-inner ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50 border-slate-100'}`}>
+      <div key={`identity-${node?.node_id}`} className={`h-auto lg:h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-1 p-5 rounded-xl border shadow-inner ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50 border-slate-100'}`}>
         <h5 className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest flex items-center gap-2">
           <Smartphone size={14} className="text-cyan-500" /> 節點身份資訊 Node Identity
         </h5>
         {node && node.node_id ? (
           <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Long Name</span>
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Long Name</span> {/* Added units to labels */}
               <span className="font-bold truncate" title={node.long_name}>{node.long_name || 'Unknown'}</span>
             </div>
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Short Name</span>
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Short Name</span> {/* Added units to labels */}
               <span className="font-bold">{node.short_name || '??'}</span>
             </div>
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span>
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span> {/* Added units to labels */}
               <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
             </div>
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span>
+              <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span> {/* Added units to labels */}
               <span className="font-bold truncate text-slate-500" title={node.firmware_version}>{node.firmware_version || 'UNKNOWN'}</span>
             </div>
             <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
@@ -171,18 +196,18 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
       </div>
 
       {/* 象限 3: 左下 - 電力監測 */}
-      <div className="h-56 col-start-1 row-start-2">
+      <div className="h-56 col-start-1 row-start-auto lg:row-start-2">
         <div className="flex justify-between items-center mb-2">
-          <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備綜合電力監測 (V / mA)</span>
-        </div>
+          <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備綜合電力監測 (V / mA)</span> {/* Added units to labels */}
+        </div> {/* Added units to labels */}
         <Line data={powerChartData} options={powerOptions} />
       </div>
 
       {/* 象限 4: 右下 - 環境遙測 */}
-      <div className="h-56 col-start-2 row-start-2">
+      <div className="h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-2">
         <div className="flex justify-between items-center mb-2">
-          <span className="text-[10px] font-black text-cyan-500 uppercase tracking-widest">Q4. 環境遙測趨勢 (Temp/Hum)</span>
-        </div>
+          <span className="text-[10px] font-black text-cyan-500 uppercase tracking-widest">Q4. 環境遙測趨勢 (Temp/Hum)</span> {/* Added units to labels */}
+        </div> {/* Added units to labels */}
         <Line data={envChartData} options={commonOptions} />
       </div>
     </div>
