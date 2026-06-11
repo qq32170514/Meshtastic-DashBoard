@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle } from 'react-leaflet';
 import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
@@ -88,9 +88,24 @@ interface NodeMapProps {
   showUtilization?: boolean; // 新增：顯示利用率圖層
   neighbors?: any[];       // 新增：鄰居關係資料
   activeTab?: string;
+  showTraceroute?: boolean;
+  showHopGrid?: boolean;
+  coverageData?: any[];
+  traceroutePath?: any[];
 }
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, neighbors = [], activeTab }: NodeMapProps) => {
+const getHopColor = (hops: number) => {
+  const h = hops || 0;
+  if (h <= 0) return "#22c55e"; // 0 跳: 綠色 (直接接收)
+  if (h === 1) return "#84cc16"; // 1 跳: 萊姆綠
+  if (h === 2) return "#eab308"; // 2 跳: 黃色
+  if (h === 3) return "#f59e0b"; // 3 跳: 琥珀色
+  if (h === 4) return "#f97316"; // 4 跳: 橘色
+  if (h === 5) return "#ea580c"; // 5 跳: 深橘色
+  return "#ef4444";             // 5+ 跳: 紅色
+};
+
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, neighbors = [], activeTab, showTraceroute = false, showHopGrid = false, coverageData = [], traceroutePath = [] }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
 
@@ -124,6 +139,86 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
       <MapInvalidator />
       <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
       
+      {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
+      {(showTraceroute || showHopGrid) && coverageData.map((grid, i) => {
+        // 計算網格邊界 (對應後端 0.005 的精度)
+        const lat = Number(grid.grid_lat);
+        const lng = Number(grid.grid_lng);
+        const bounds = [
+          [lat - 0.0025, lng - 0.0025],
+          [lat + 0.0025, lng + 0.0025]
+        ];
+
+        if (showHopGrid) {
+          // 跳轉分析模式：根據 latest_hops 著色
+          return (
+            <Rectangle
+              key={`hop-grid-${i}`}
+              bounds={bounds as any}
+              pathOptions={{
+                fillColor: getHopColor(grid.latest_hops),
+                fillOpacity: 0.6,
+                stroke: true,
+                color: 'white',
+                weight: 0.5
+              }}
+            >
+              <Tooltip sticky>
+                <div className="text-[11px] font-black p-1">
+                  🚀 網格跳轉監控 (Hop Trace)<br/>
+                  <span className="text-indigo-600">最新跳數: {grid.latest_hops ?? 0} Hops</span><br/>
+                  <span className="text-blue-500">歷史最優: {grid.min_hops} Hops</span><br/>
+                  <span className="text-slate-400">總計封包: {grid.packet_count} pkts</span>
+                </div>
+              </Tooltip>
+            </Rectangle>
+          );
+        } else if (showTraceroute) {
+          // 覆蓋範圍模式：顯示訊號密度 (單色青色漸層)
+          const opacity = Math.min(0.8, 0.2 + (grid.packet_count / 20));
+          return (
+            <Rectangle
+              key={`cov-grid-${i}`}
+              bounds={bounds as any}
+              pathOptions={{
+                fillColor: '#06b6d4',
+                fillOpacity: opacity,
+                stroke: false
+              }}
+            >
+              <Tooltip sticky>
+                <div className="text-[11px] font-black p-1">
+                  📡 區域訊號覆蓋 (Coverage)<br/>
+                  <span className="text-cyan-600">封包密度: {grid.packet_count} pkts</span><br/>
+                  <span className="text-slate-500">平均 SNR: {grid.avg_snr?.toFixed(2)} dB</span>
+                </div>
+              </Tooltip>
+            </Rectangle>
+          );
+        }
+        return null;
+      })}
+
+      {/* 2. 繪製最新 Traceroute 路徑 */}
+      {showTraceroute && traceroutePath.length >= 2 && (
+        <React.Fragment>
+          <Polyline 
+            positions={traceroutePath.map(n => [n.latitude, n.longitude]) as any}
+            pathOptions={{ color: '#f59e0b', weight: 4, dashArray: '10, 10', opacity: 0.8 }}
+          />
+          {traceroutePath.map((p, idx) => (
+            <CircleMarker 
+              key={`tr-${idx}`} 
+              center={[p.latitude, p.longitude]} 
+              radius={idx === 0 || idx === traceroutePath.length - 1 ? 6 : 4} 
+              pathOptions={{ fillColor: idx === 0 ? '#f59e0b' : '#ef4444', color: 'white', weight: 2, fillOpacity: 1 }} 
+            >
+              <Tooltip>路徑節點: {p.short_name || p.node_id}</Tooltip>
+            </CircleMarker>
+          ))}
+        </React.Fragment>
+      )}
+
       {/* 繪製主節點 */}
       {nodesWithGPS.map(node => (
         <Marker 
@@ -275,6 +370,33 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
       
       {isLegendExpanded && (
         <div className="space-y-3 mt-2 pt-2 border-t border-slate-100 overflow-y-auto max-h-[60vh]">
+          {/* 網格圖層說明 */}
+          {(showTraceroute || showHopGrid) && (
+            <div>
+              <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">分析圖層分析 Analytics</div>
+              <div className="space-y-1">
+                {showTraceroute && (
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                    <span className="w-2.5 h-2.5 bg-cyan-500 opacity-60"></span> 覆蓋密度 (Density)
+                  </div>
+                )}
+                {showHopGrid && (
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                      <span className="w-2.5 h-2.5 bg-[#22c55e]"></span> 0 跳 (直接)
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                      <span className="w-2.5 h-2.5 bg-[#eab308]"></span> 2 跳 (中繼)
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                      <span className="w-2.5 h-2.5 bg-[#ef4444]"></span> 5+ 跳 (多級)
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* 0. 角色分組 (還原複雜圖例) */}
           <div>
             <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">節點角色 Roles</div>

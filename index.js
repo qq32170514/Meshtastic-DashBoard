@@ -171,6 +171,19 @@ db.serialize(() => {
             channel_name TEXT
         )
     `);
+    // 🚀 新增：實體 RF 攔截專用位置表
+    db.run(`
+        CREATE TABLE IF NOT EXISTS position_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT,
+            latitude REAL,
+            longitude REAL,
+            snr REAL,
+            rssi REAL,
+            source TEXT DEFAULT 'direct_rf',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
 
     const cols = [
         { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
@@ -193,7 +206,10 @@ db.serialize(() => {
         { t: 'nodes', c: 'humidity', d: 'REAL' },
         { t: 'nodes', c: 'firmware_version', d: 'TEXT' },
         { t: 'nodes', c: 'firmware_build_num', d: 'TEXT' },
-        { t: 'nodes', c: 'last_gateway', d: 'TEXT' }
+        { t: 'nodes', c: 'last_gateway', d: 'TEXT' },
+        { t: 'packet_logs', c: 'latitude', d: 'REAL' },
+        { t: 'packet_logs', c: 'longitude', d: 'REAL' },
+        { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' }
     ];
     cols.forEach(col => {
         db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => {});
@@ -204,14 +220,32 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
 });
 
+// 🛸 輔助映射：將前端名稱對應回 Protobuf ID，確保 API 查詢正確
+const PORT_NAME_TO_ID = {
+    'TEXT_MESSAGE': 1,
+    'POSITION': 3,
+    'NODEINFO': 4,
+    'ROUTING': 5,
+    'ADMIN': 6,
+    'STAT_LOG': 64,
+    'WAYPOINT': 65,
+    'TELEMETRY': 67,
+    'TRACEROUTE': 70,
+    'NEIGHBORINFO': 71,
+    'MAP_REPORT': 73,
+    'ENCRYPTED': 'ENCRYPTED'
+};
+
 // ==========================================
 // 1.2 資料清理任務 (保留 3 天)
 // ==========================================
+const DATA_RETENTION_DAYS = 30; // 🚀 在這裡設定你想要保留數據的天數 (例如 30 天)
+
 function cleanupOldData() {
-    const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-14 days')`;
-    const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-14 days')`;
+    const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
+    const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     // 新增：聊天紀錄保留 30 天，避免資料庫無限增長
-    const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-30 days')`;
+    const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
 
     db.run(sql, function(err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
@@ -247,8 +281,15 @@ const buildPacketQuery = (req, baseSql) => {
         params.push(...ids);
     }
     if (req.query.portnum) {
-        conditions.push("portnum = ?");
-        params.push(req.query.portnum);
+        const pid = PORT_NAME_TO_ID[req.query.portnum];
+        if (pid) {
+            // 同時查詢名稱與數字 ID，確保相容性
+            conditions.push("(portnum = ? OR portnum = ?)");
+            params.push(req.query.portnum, pid.toString());
+        } else {
+            conditions.push("portnum = ?");
+            params.push(req.query.portnum);
+        }
     }
     if (req.query.gateway_id) {
         conditions.push("gateway_id LIKE ?");
@@ -413,6 +454,63 @@ app.get('/api/nodes/activity', (req, res) => {
     });
 });
 
+// 🚀 新增：太陽能電壓預測 API
+// 🚀 新增：取得最新一筆 Traceroute 路徑 API
+app.get('/api/traceroute/latest', (req, res) => {
+    const sql = `SELECT payload_json FROM packet_logs WHERE portnum = '70' OR portnum = 'TRACEROUTE_APP' ORDER BY timestamp DESC LIMIT 1`;
+    db.get(sql, [], (err, row) => {
+        if (err || !row) return res.json([]);
+        try {
+            const payload = JSON.parse(row.payload_json);
+            const route = payload.route || [];
+            
+            // 將十進位 ID 轉為 !hex 格式 (例如 !f0b78d83)
+            const hexIds = route.map(id => `!${(id >>> 0).toString(16).padStart(8, '0')}`);
+            const placeholders = hexIds.map(() => '?').join(',');
+            
+            db.all(`SELECT node_id, latitude, longitude, short_name FROM nodes WHERE node_id IN (${placeholders})`, hexIds, (err, nodes) => {
+                if (err) return res.status(500).json({ error: err.message });
+                // 依照原始 route 的順序排序返回，並過濾掉沒有座標的節點
+                const sortedPath = hexIds.map(id => nodes.find(n => n.node_id === id)).filter(n => n && n.latitude);
+                res.json(sortedPath);
+            });
+        } catch (e) {
+            res.json([]);
+        }
+    });
+});
+
+// 🚀 新增：覆蓋率地圖資料 API
+// 🚀 核心升級：網格化覆蓋率聚合 API (Grid Binning)
+// 🚀 核心升級：網格化覆蓋率聚合 API
+app.get('/api/coverage/griddata', (req, res) => {
+    const sql = `
+        SELECT 
+            CAST(ROUND(latitude / 0.005) * 0.005 AS REAL) AS grid_lat, 
+            CAST(ROUND(longitude / 0.005) * 0.005 AS REAL) AS grid_lng,
+            COUNT(*) as packet_count,
+            AVG(snr) AS avg_snr,
+            MIN(hops_away) AS min_hops,
+            (
+                SELECT p2.hops_away FROM packet_logs p2 
+                WHERE p2.latitude IS NOT NULL 
+                  AND CAST(ROUND(p2.latitude / 0.005) * 0.005 AS REAL) = CAST(ROUND(p1.latitude / 0.005) * 0.005 AS REAL)
+                  AND CAST(ROUND(p2.longitude / 0.005) * 0.005 AS REAL) = CAST(ROUND(p1.longitude / 0.005) * 0.005 AS REAL)
+                ORDER BY timestamp DESC LIMIT 1
+            ) AS latest_hops
+        FROM packet_logs p1
+        WHERE latitude IS NOT NULL 
+          AND longitude IS NOT NULL 
+          AND node_id != gateway_id
+          AND gateway_id != 'Unknown'
+        GROUP BY grid_lat, grid_lng
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // 取得目前網路的所有鄰居關係 (拓撲層使用)
 app.get('/api/neighbors', (req, res) => {
     db.all(`SELECT * FROM neighbors WHERE last_seen > datetime('now', '-2 days')`, [], (err, rows) => {
@@ -476,6 +574,8 @@ app.get('/api/node/:nodeId/packet-stats', (req, res) => {
 server.listen(PORT, () => {
     console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
     console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
+    // 啟動 RF 監聽
+    setupRFListener(io, db);
 });
 
 // ==========================================
@@ -483,6 +583,14 @@ server.listen(PORT, () => {
 // ==========================================
 const root = new protobuf.Root();
 root.resolvePath = (origin, target) => __dirname + '/protobufs/' + target;
+
+// 檢查基礎檔案是否存在
+const checkPath = path.join(__dirname, 'protobufs', 'meshtastic', 'mqtt.proto');
+if (!fs.existsSync(checkPath)) {
+    console.error(`\n⚠️  錯誤：找不到 Protobuf 定義檔！`);
+    console.error(`請確保檔案位於: ${checkPath}`);
+    console.error(`你可以從 https://github.com/meshtastic/protobufs 下載檔案並放入該目錄。\n`);
+}
 
 let ServiceEnvelope, Telemetry, User, Position, MapReport, Data, Routing, RouteDiscovery, NeighborInfo;
 
@@ -627,8 +735,9 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 
             // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED
             if (!decodedData) {
-                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
-                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null, rawHex]);
+                const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
+                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null, rawHex, hopsAway]);
                 io.emit('raw_packet', { 
                     from: fromId, 
                     portnum: 'ENCRYPTED', 
@@ -648,6 +757,10 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             // ==========================================
             let payloadObj = null;
             const port = decodedData.portnum;
+            // 🛡️ 初始化為 null，確保 SQL 寫入正確
+            let packetLat = undefined;
+            let packetLng = undefined;
+            
             const payloadBuffer = Buffer.isBuffer(decodedData.payload) ? decodedData.payload : Buffer.from(decodedData.payload || []);
 
             try {
@@ -660,8 +773,14 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     
                     // 寫入聊天紀錄表
                     db.run(`INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)`, [fromId, textMessage, channelName]);
-                } else if (port === 3 || port === 'POSITION_APP') {
-                    payloadObj = Position.toObject(Position.decode(payloadBuffer), { enums: String, defaults: true });
+                } else if (port === 3 || port === 'POSITION_APP' || port === '3') {
+                    // 確保我們正確解碼 Meshtastic 標準位置
+                    const posMessage = Position.decode(payloadBuffer);
+                    payloadObj = Position.toObject(posMessage, { enums: String, defaults: true });
+                    
+                    // 🛸 強化座標讀取，避免數值為 0 被誤判
+                    packetLat = (payloadObj.latitude_i !== undefined) ? payloadObj.latitude_i / 1e7 : payloadObj.latitude;
+                    packetLng = (payloadObj.longitude_i !== undefined) ? payloadObj.longitude_i / 1e7 : payloadObj.longitude;
                 } else if (port === 4 || port === 'NODEINFO_APP') {
                     payloadObj = User.toObject(User.decode(payloadBuffer), { enums: String, defaults: true });
                 } else if (port === 5 || port === 'ROUTING_APP') {
@@ -681,7 +800,10 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                         });
                     }
                 } else if (port === 73 || port === 'MAP_REPORT_APP') {
-                    payloadObj = MapReport.toObject(MapReport.decode(payloadBuffer), { enums: String, defaults: true });
+                    const report = MapReport.decode(payloadBuffer);
+                    payloadObj = MapReport.toObject(report, { enums: String, defaults: true });
+                    packetLat = report.latitude_i ? report.latitude_i / 1e7 : report.latitude;
+                    packetLng = report.longitude_i ? report.longitude_i / 1e7 : report.longitude;
                 }
             } catch (e) { console.error('❌ Payload 解析失敗', e); }
             
@@ -691,8 +813,17 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 
             // 3. 寫入封包日誌並推播
             const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
-            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
-                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex]);
+            const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
+            
+            // 🚀 同步更新 nodes 表中的座標，讓地圖 Marker 能即時移動
+            if (packetLat && packetLng) {
+                db.run(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [packetLat, packetLng, fromId]);
+            }
+
+            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, latitude, longitude, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex, packetLat, packetLng, hopsAway], (err) => {
+                    if (err) console.error('❌ 封包寫入失敗:', err.message);
+                });
 
             io.emit('raw_packet', { 
                 from: fromId, 
@@ -702,7 +833,10 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 timestamp: new Date().toISOString(),
                 time: new Date().toLocaleTimeString(), 
                 snr: packet.rx_snr, 
-                rssi: packet.rx_rssi, 
+                rssi: packet.rx_rssi,
+                latitude: packetLat,   // 💡 新增推播欄位
+                longitude: packetLng,  // 💡 新增推播欄位
+                hops_away: hopsAway,   // 💡 新增推播欄位
                 payload_json: payloadObj, 
                 rawData: rawHex 
             });
@@ -794,8 +928,8 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 const air = cleanJSON.air_util_tx ?? device.air_util_tx ?? device.airUtilTx ?? null;
                 const cu = device.channel_utilization ?? device.channelUtilization ?? null;
 
-                // 優先權邏輯：I2C 電壓/電流 (Power Metrics) > ADC 設備電壓 (Device Metrics)
-                const finalVoltage = power.ch1_voltage ?? power.ch1Voltage ?? device.voltage ?? null;
+                // 修改：只顯示 I2C 設備讀到的電壓 (Power Metrics)，忽略板載 ADC 設備電壓 (device.voltage)
+                const finalVoltage = power.ch1_voltage ?? power.ch1Voltage ?? null;
                 const finalCurrent = power.ch1_current ?? power.ch1Current ?? null;
 
                 const sql = `

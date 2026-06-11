@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import NodeMap from './NodeMap'; 
@@ -86,7 +86,7 @@ function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [mapShowFavoritesOnly, setMapShowFavoritesOnly] = useState(false);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false); 
-  const [currentChatChannel, setCurrentChatChannel] = useState('MediumFast'); 
+  const [currentChatChannel, setCurrentChatChannel] = useState('LongFast'); 
   const [unreadChannels, setUnreadChannels] = useState<Record<string, boolean>>({}); 
   const [gatewayStats, setGatewayStats] = useState<GatewayStat[]>([]);
   const [packetStats, setPacketStats] = useState<PacketStat[]>([]);
@@ -98,6 +98,10 @@ function App() {
   const [chatFilter, setChatFilter] = useState({ favoritesOnly: false, nodeId: '', searchText: '' }); 
   const [sysStatus, setSysStatus] = useState<any>(null); 
   const [appLoading, setAppLoading] = useState(true); 
+  const [coverageData, setCoverageData] = useState<any[]>([]);
+  const [showTraceroute, setShowTraceroute] = useState(false);
+  const [showHopGrid, setShowHopGrid] = useState(false);
+  const [traceroutePath, setTraceroutePath] = useState<any[]>([]);
 
   // Pagination states
   const packetsPerPage = 20; 
@@ -686,6 +690,12 @@ function App() {
       const now = new Date();
       packet.timestamp = now.toISOString();
       packet.time = now.toLocaleTimeString('zh-TW', { hour12: false });
+      
+      // 📍 當收到 Position 封包 (Port 3) 時，立即刷新網格數據
+      const isPos = (PORTNUM_NAMES[packet.portnum] === 'POSITION' || packet.portnum === 3 || packet.portnum === '3');
+      if (isPos) {
+        setTimeout(() => fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData), 1000);
+      }
 
       setPackets(prev => {
         const formattedPkt = {
@@ -723,7 +733,18 @@ function App() {
       } : n));
     });
 
+    // 抓取網格化聚合數據
+    fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData);
+
+    // 抓取 Traceroute 數據
+    const fetchTraceroute = () => fetch('/api/traceroute/latest').then(res => res.json()).then(setTraceroutePath);
+    fetchTraceroute();
+
     const sysInterval = setInterval(refreshDashboardData, 30000); 
+    const coverageInterval = setInterval(() => {
+      fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData);
+    }, 120000); // 每 2 分鐘更新一次地圖背景點位
+    const tracerouteInterval = setInterval(fetchTraceroute, 60000); // 每分鐘更新最新路徑
 
     return () => { 
       socket.off('mqtt_status');
@@ -731,6 +752,8 @@ function App() {
       socket.off('raw_packet');
       socket.off('telemetry_update');
       clearInterval(sysInterval);
+      clearInterval(coverageInterval);
+      clearInterval(tracerouteInterval);
     };
   }, [fetchGlobalPackets, fetchFavoritePackets, loadNetworkStats, refreshDashboardData, globalPacketsCurrentPage, globalFilter, favPacketsCurrentPage, favLogFilter]);
 
@@ -792,7 +815,7 @@ function App() {
 
       {/* Tabs Menu */}
       <div className={`border-b sticky top-0 z-50 shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-        <div className="max-w-6xl mx-auto flex">
+        <div className="max-w-6xl mx-auto flex overflow-x-auto no-scrollbar whitespace-nowrap">
           <button 
             onClick={() => setActiveTab('favorites')}
             className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'favorites' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
@@ -969,7 +992,7 @@ function App() {
                   </div>
                   
                   <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
-                    {['MediumFast', 'MeshTW', 'SignalTest', 'Emergency!'].map(chan => (
+                    {['LongFast', 'MediumFast', 'MeshTW', 'SignalTest', 'Emergency!'].map(chan => (
                       <button
                         key={chan}
                         onClick={() => setCurrentChatChannel(chan)}
@@ -1227,8 +1250,11 @@ function App() {
                   <div className={`h-[400px] rounded-2xl overflow-hidden border-2 shadow-inner relative ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-100 bg-white'}`}>
                     <NodeMap 
                       nodes={favoriteNodes} 
-                      onSelectNode={(id) => { setSelectedNodeId(id); handleShowModal(id); }}
+                      onSelectNode={handleShowModal}
                       activeTab={activeTab}
+                      coverageData={coverageData}
+                      showTraceroute={showTraceroute}
+                      showHopGrid={showHopGrid}
                     />
                   </div>
                 </div>
@@ -1375,6 +1401,9 @@ function App() {
                               activeTab={activeTab}
                               isDetailView={true}
                               onSelectNode={() => {}} 
+                              coverageData={coverageData}
+                              showTraceroute={showTraceroute}
+                              showHopGrid={showHopGrid}
                             />
                           ) : (
                             <div className="h-full flex items-center justify-center bg-slate-50 text-slate-400 text-sm italic">
@@ -1507,7 +1536,7 @@ function App() {
                                             const m = p.payload_json.device_metrics || p.payload_json.deviceMetrics;
                                             const pwr = p.payload_json.power_metrics || p.payload_json.powerMetrics;
                                             if (!m && !pwr) return '';
-                                            const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage ?? m?.voltage;
+                                            const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage;
                                             const c = pwr?.ch1_current ?? pwr?.ch1Current;
                                             return `${m?.battery_level ?? m?.batteryLevel ?? '?'}% ${v?.toFixed(2) || ''}V ${c ? `(${c.toFixed(0)}mA)` : ''} | AU:${(m?.air_util_tx ?? m?.airUtilTx ?? 0).toFixed(1)}% CU:${(m?.channel_utilization ?? m?.channelUtilization ?? 0).toFixed(1)}%`;
                                           })()}
@@ -1573,6 +1602,18 @@ function App() {
                       >
                         <Activity size={12}/> 利用率圖層
                       </button>
+                      <button 
+                        onClick={() => setShowTraceroute(!showTraceroute)}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showTraceroute ? 'bg-amber-500 border-amber-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                      >
+                        <Zap size={12}/> 覆蓋範圍
+                      </button>
+                      <button 
+                        onClick={() => setShowHopGrid(!showHopGrid)}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showHopGrid ? 'bg-green-600 border-green-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                      >
+                        <TrendingDown size={12}/> 跳轉分析
+                      </button>
                     </div>
                     <div className={`flex rounded-lg p-1 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
                       <button 
@@ -1598,12 +1639,16 @@ function App() {
                 <div className={`w-full h-[70vh] rounded-2xl overflow-hidden border shadow-sm relative transition-colors ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
                   <NodeMap
                     nodes={mapShowFavoritesOnly ? favoriteNodes : nodes} 
-                    onSelectNode={(id) => { setSelectedNodeId(id); setActiveTab('details'); }} 
+                    onSelectNode={handleShowModal} 
                       activeTab={activeTab}
                     onShowDetail={handleShowModal}
                     showTopology={showTopology}
                     showUtilization={showUtilization}
+                    showTraceroute={showTraceroute}
+                    showHopGrid={showHopGrid}
+                    traceroutePath={traceroutePath} 
                     neighbors={neighbors}
+                    coverageData={coverageData}
                   />
                 </div>
               </div>
@@ -1657,6 +1702,31 @@ function App() {
                   <div className="p-6 space-y-8">
                     <section>
                       <TelemetryCharts nodeId={selectedNode.node_id} socket={socket} node={selectedNode} darkMode={darkMode} />
+                    </section>
+
+                    <section>
+                      <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4 border-b pb-2 flex items-center gap-2">
+                        <MapIcon size={14} /> 節點位置
+                      </h4>
+                      <div className="h-[400px] rounded-xl overflow-hidden border border-slate-200">
+                        {selectedNode.latitude || gatewayStats.length > 0 ? (
+                          <NodeMap 
+                            nodes={[selectedNode]} 
+                            allNodes={nodes} 
+                            gateways={gatewayStats}
+                            activeTab={activeTab}
+                            isDetailView={true}
+                            onSelectNode={() => {}} 
+                            coverageData={coverageData}
+                            showTraceroute={showTraceroute}
+                            showHopGrid={showHopGrid}
+                          />
+                        ) : (
+                          <div className="h-full flex items-center justify-center bg-slate-50 text-slate-400 text-sm italic">
+                            此節點尚未回報 GPS 位置
+                          </div>
+                        )}
+                      </div>
                     </section>
 
                     <section>
@@ -1753,8 +1823,10 @@ function App() {
                                     <span className="ml-2 text-[10px] text-slate-400 font-normal">
                                       {(() => {
                                         const m = p.payload_json.device_metrics || p.payload_json.deviceMetrics;
+                                        const pwr = p.payload_json.power_metrics || p.payload_json.powerMetrics;
                                         if (!m) return '';
-                                        return `${m.battery_level ?? m.batteryLevel ?? '?'}% ${m.voltage?.toFixed(2) || ''}V | AU:${(m.air_util_tx ?? m.airUtilTx ?? 0).toFixed(1)}% CU:${(m.channel_utilization ?? m.channelUtilization ?? 0).toFixed(1)}%`;
+                                        const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage;
+                                        return `${m.battery_level ?? m.batteryLevel ?? '?'}% ${v ? v.toFixed(2) + 'V' : ''} | AU:${(m.air_util_tx ?? m.airUtilTx ?? 0).toFixed(1)}% CU:${(m.channel_utilization ?? m.channelUtilization ?? 0).toFixed(1)}%`;
                                       })()}
                                     </span>
                                   )}
