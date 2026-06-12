@@ -168,6 +168,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                   🚀 網格跳轉監控 (Hop Trace)<br/>
                   <span className="text-indigo-600">最新跳數: {grid.latest_hops ?? 0} Hops</span><br/>
                   <span className="text-blue-500">歷史最優: {grid.min_hops} Hops</span><br/>
+                  <span className="text-slate-400">最後更新: {grid.latest_time ? new Date(grid.latest_time.replace(' ', 'T') + 'Z').toLocaleString() : '--'}</span><br/>
                   <span className="text-slate-400">總計封包: {grid.packet_count} pkts</span>
                 </div>
               </Tooltip>
@@ -190,6 +191,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                 <div className="text-[11px] font-black p-1">
                   📡 區域訊號覆蓋 (Coverage)<br/>
                   <span className="text-cyan-600">封包密度: {grid.packet_count} pkts</span><br/>
+                  <span className="text-slate-500">最新收到: {grid.latest_time ? new Date(grid.latest_time.replace(' ', 'T') + 'Z').toLocaleString() : '--'}</span><br/>
                   <span className="text-slate-500">平均 SNR: {grid.avg_snr?.toFixed(2)} dB</span>
                 </div>
               </Tooltip>

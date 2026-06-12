@@ -31,6 +31,8 @@ export interface Node {
   firmware_version?: string;
   firmware_build_num?: string;
   last_gateway?: string;
+  source?: string;       // 🚀 新增來源站點
+  sourceLabel?: string;  // 🚀 新增來源標籤
 }
 
 interface Packet {
@@ -44,6 +46,8 @@ interface Packet {
   gateway_id?: string;
   rawData?: string;
   payload_json?: any;
+  source?: string;       // 🚀 新增來源站點
+  sourceLabel?: string;  // 🚀 新增來源標籤
 }
 
 interface GatewayStat {
@@ -86,7 +90,7 @@ function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [mapShowFavoritesOnly, setMapShowFavoritesOnly] = useState(false);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false); 
-  const [currentChatChannel, setCurrentChatChannel] = useState('LongFast'); 
+  const [currentChatChannel, setCurrentChatChannel] = useState('MediumFast'); // 預設改為 MediumFast
   const [unreadChannels, setUnreadChannels] = useState<Record<string, boolean>>({}); 
   const [gatewayStats, setGatewayStats] = useState<GatewayStat[]>([]);
   const [packetStats, setPacketStats] = useState<PacketStat[]>([]);
@@ -691,19 +695,30 @@ function App() {
       packet.timestamp = now.toISOString();
       packet.time = now.toLocaleTimeString('zh-TW', { hour12: false });
       
+      // 🎯 修正：只有非中繼站 (MQTT) 來源才更新地圖 Marker 的座標，中繼封包僅用於染色
+      setNodes(prev => prev.map(n => n.node_id === packet.from ? { 
+        ...n, 
+        latitude: !packet.source ? (packet.latitude || n.latitude) : n.latitude, 
+        longitude: !packet.source ? (packet.longitude || n.longitude) : n.longitude,
+        last_seen: now.toISOString()
+      } : n));
+
       // 📍 當收到 Position 封包 (Port 3) 時，立即刷新網格數據
       const isPos = (PORTNUM_NAMES[packet.portnum] === 'POSITION' || packet.portnum === 3 || packet.portnum === '3');
       if (isPos) {
         setTimeout(() => fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData), 1000);
       }
 
-      setPackets(prev => {
-        const formattedPkt = {
-          ...packet,
-          payload_json: packet.payload_json ? (typeof packet.payload_json === 'string' ? JSON.parse(packet.payload_json) : packet.payload_json) : null
-        };
-        return [formattedPkt, ...prev].slice(0, 50); 
-      });
+      // 🚀 隱身術：只有非中繼站（MQTT）的封包才放入「封包觀察」清單
+      if (!packet.source) {
+        setPackets(prev => {
+          const formattedPkt = {
+            ...packet,
+            payload_json: packet.payload_json ? (typeof packet.payload_json === 'string' ? JSON.parse(packet.payload_json) : packet.payload_json) : null
+          };
+          return [formattedPkt, ...prev].slice(0, 50); 
+        });
+      }
 
       if (selectedNodeIdRef.current && packet.from === selectedNodeIdRef.current) {
         setNodePackets(prev => [packet, ...prev].slice(0, 20));
@@ -992,7 +1007,7 @@ function App() {
                   </div>
                   
                   <div className="flex gap-2 pb-1 overflow-x-auto no-scrollbar">
-                    {['LongFast', 'MediumFast', 'MeshTW', 'SignalTest', 'Emergency!'].map(chan => (
+                    {['MediumFast', 'MeshTW', 'SignalTest', 'Emergency!'].map(chan => (
                       <button
                         key={chan}
                         onClick={() => setCurrentChatChannel(chan)}

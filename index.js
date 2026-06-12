@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const cron = require('node-cron');
 const os = require('os');
+const net = require('net'); // 🚀 引入 Node.js 原生 TCP 模組
 require('dotenv').config(); // 讀取 .env 檔案
 
 const app = express();
@@ -58,8 +59,7 @@ process.on('uncaughtException', (err) => {
 const myNodeId = '!7931b961'; 
 
 // 靜態檔案路徑：優先服務前端編譯出的 dist 夾，若無則服務目前目錄（相容舊 index.html）
-app.use(express.static(path.join(__dirname, 'frontend/dist')));
-app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, 'frontend/dist'))); // 🚀 安全性：只服務前端編譯後的檔案
 
 // ==========================================
 // 1. 初始化 SQLite 資料庫
@@ -171,16 +171,16 @@ db.serialize(() => {
             channel_name TEXT
         )
     `);
-    // 🚀 新增：實體 RF 攔截專用位置表
+    // 🚀 核心升級：實體 RF 攔截專用表 (支援多來源標記)
     db.run(`
-        CREATE TABLE IF NOT EXISTS position_logs (
+        CREATE TABLE IF NOT EXISTS packets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             node_id TEXT,
-            latitude REAL,
-            longitude REAL,
+            lat REAL,
+            lon REAL,
             snr REAL,
             rssi REAL,
-            source TEXT DEFAULT 'direct_rf',
+            source TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
@@ -209,7 +209,8 @@ db.serialize(() => {
         { t: 'nodes', c: 'last_gateway', d: 'TEXT' },
         { t: 'packet_logs', c: 'latitude', d: 'REAL' },
         { t: 'packet_logs', c: 'longitude', d: 'REAL' },
-        { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' }
+        { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' },
+        { t: 'packet_logs', c: 'source', d: 'TEXT' } // 🚀 新增：標記封包來源 (MQTT 或 RF 隧道)
     ];
     cols.forEach(col => {
         db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => {});
@@ -307,6 +308,11 @@ const buildPacketQuery = (req, baseSql) => {
         conditions.push("snr >= ?");
         params.push(parseFloat(req.query.minSnr));
     }
+    // 🚀 新增：排除隧道封包的條件 (僅用於全域封包觀察)
+    if (req.excludeTunnelPackets) {
+        conditions.push("(source IS NULL OR source = 'mqtt')");
+    }
+
     if (req.query.minRssi) {
         conditions.push("rssi >= ?");
         params.push(parseFloat(req.query.minRssi));
@@ -375,7 +381,7 @@ app.get('/api/node/:nodeId', (req, res) => {
 
 // 取得全域最新封包紀錄 (提供給封包觀察分頁)
 app.get('/api/packets', (req, res) => {
-    const { sql, params } = buildPacketQuery(req, "SELECT * FROM packet_logs");
+    const { sql, params } = buildPacketQuery({ ...req, excludeTunnelPackets: true }, "SELECT * FROM packet_logs"); // 🚀 修正：全域觀察排除中繼封包
     const limit = parseInt(req.query.limit) || 20;
     const page = parseInt(req.query.page) || 1;
     const offset = (page - 1) * limit;
@@ -491,6 +497,7 @@ app.get('/api/coverage/griddata', (req, res) => {
             COUNT(*) as packet_count,
             AVG(snr) AS avg_snr,
             MIN(hops_away) AS min_hops,
+            MAX(timestamp) AS latest_time,
             (
                 SELECT p2.hops_away FROM packet_logs p2 
                 WHERE p2.latitude IS NOT NULL 
@@ -578,6 +585,105 @@ server.listen(PORT, () => {
     setupRFListener(io, db);
 });
 
+
+// ==========================================
+// 🛰️ 實體 RF 隧道攔截模組 (HiveMQ 雲端分流對接)
+// ==========================================
+async function setupRFListener(io, db) {
+    const relayConfigs = [
+        { name: 'hualien', label: '花蓮站', port: 4404 },
+        { name: 'taoyuan', label: '桃園站', port: 4405 },
+        { name: 'sanzhi',  label: '三芝站', port: 4406 }
+    ];
+
+    let meshtastic;
+    try {
+        meshtastic = await import('@meshtastic/meshtasticjs');
+    } catch (err) {
+        console.error('❌ [隧道模組] 無法載入套件:', err.message);
+        return;
+    }
+
+    const m = meshtastic.default || meshtastic;
+    const { FromRadio, Position } = m.Protobuf;
+
+    if (!FromRadio || !Position) {
+        console.error('❌ [隧道模組] 無法找到 Protobuf 解碼字典');
+        return;
+    }
+
+    relayConfigs.forEach(config => {
+        const connectToRelay = () => {
+            try {
+                console.log(`📡 [原生 TCP] 正在連線至 ${config.label} (127.0.0.1:${config.port})...`);
+                const socket = new net.Socket();
+
+                socket.connect(config.port, '127.0.0.1', () => {
+                    console.log(`✅ [原生 TCP] ${config.label} 已連線！`);
+                });
+
+                socket.on('data', (buffer) => {
+                    try {
+                        const fromRadio = FromRadio.fromBinary(buffer);
+                        if (fromRadio.packet && fromRadio.packet.decoded) {
+                            const packet = fromRadio.packet;
+                            const decoded = packet.decoded;
+                            if (decoded.portnum === 3 || decoded.portnum === 'POSITION_APP') {
+                                const pos = Position.fromBinary(decoded.payload);
+                                const lat = (pos.latitudeI !== undefined) ? pos.latitudeI / 1e7 : null;
+                                const lng = (pos.longitudeI !== undefined) ? pos.longitudeI / 1e7 : null;
+                                if (!lat || !lng) return;
+
+                                const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
+                                const hopsAway = (packet.hopStart || 0) - (packet.hopLimit || 0);
+
+                                const packetData = {
+                                    from: fromId,
+                                    portnum: 'POSITION',
+                                    topic: `tunnel/${config.name}/rx`,
+                                    gateway_id: `RELAY_${config.name.toUpperCase()}`,
+                                    timestamp: new Date().toISOString(),
+                                    time: new Date().toLocaleTimeString('zh-TW', { hour12: false }),
+                                    snr: packet.rxSnr ?? null,
+                                    rssi: packet.rxRssi ?? null,
+                                    latitude: lat,
+                                    longitude: lng,
+                                    source: config.name,
+                                    sourceLabel: config.label,
+                                    hops_away: hopsAway
+                                };
+
+                                io.emit('raw_packet', packetData);
+                                db.run(`INSERT INTO packets (node_id, lat, lon, snr, rssi, source) VALUES (?, ?, ?, ?, ?, ?)`,
+                                    [fromId, lat, lng, packet.rxSnr, packet.rxRssi, config.name]);
+                                db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                    [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
+                                // 🚀 修正：中繼封包僅供染色，不更新 nodes 表的座標，避免地圖出現 Marker
+                                db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
+                                    [`隧道:${config.label}`, fromId]);
+                            }
+                        }
+                    } catch (e) { /* 忽略碎片或錯誤封包 */ }
+                });
+
+                socket.on('close', () => {
+                    console.warn(`⚠️ [TCP 斷開] ${config.label}，10秒後重連...`);
+                    setTimeout(connectToRelay, 10000);
+                });
+
+                socket.on('error', (err) => {
+                    console.error(`❌ [TCP 錯誤] ${config.label}:`, err.message);
+                });
+
+            } catch (err) {
+                console.error(`❌ [隧道異常] ${config.label}:`, err.message);
+                setTimeout(connectToRelay, 15000);
+            }
+        };
+
+        connectToRelay();
+    });
+}
 // ==========================================
 // 2. 設定 Protobuf 解析器
 // ==========================================
