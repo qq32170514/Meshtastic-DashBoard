@@ -10,7 +10,7 @@ require('dotenv').config();
 // 1. 設定中繼站對應清單
 const TUNNEL_CONFIGS = [
     { name: 'hualien', port: 4404, label: '花蓮老家中繼站', txTopic: 'mesh_tunnel/hualien/tx', rxTopic: 'mesh_tunnel/hualien/rx' },
-    { name: 'taoyuan', port: 4405, label: '桃園沿海中繼站', txTopic: 'mesh_tunnel/taoyuan/tx', rxTopic: 'mesh_tunnel/taoyuan/rx' },
+    { name: 'taipei', port: 4405, label: '台北主機中繼站', txTopic: 'mesh_tunnel/taipei/tx', rxTopic: 'mesh_tunnel/taoyuan/rx' },
     { name: 'sanzhi',  port: 4406, label: '三芝北海岸中繼站', txTopic: 'mesh_tunnel/sanzhi/tx', rxTopic: 'mesh_tunnel/sanzhi/rx' }
 ];
 

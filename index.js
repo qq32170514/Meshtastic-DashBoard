@@ -30,6 +30,106 @@ const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
 let isMqttConnected = false; // 紀錄 MQTT 連線狀態
 
 // ==========================================
+// 🚀 WebSocket 批量推播緩衝（減少高峰期 re-render）
+// ==========================================
+const pendingBatch = { raw_packet: [], node_seen: [], telemetry_update: [] };
+let batchEmitTimer = null;
+
+function flushPendingBatch() {
+    if (pendingBatch.raw_packet.length) {
+        io.emit('raw_packet_batch', pendingBatch.raw_packet.splice(0));
+    }
+    if (pendingBatch.node_seen.length) {
+        io.emit('node_seen_batch', pendingBatch.node_seen.splice(0));
+    }
+    if (pendingBatch.telemetry_update.length) {
+        io.emit('telemetry_batch', pendingBatch.telemetry_update.splice(0));
+    }
+    batchEmitTimer = null;
+}
+
+/**
+ * 🚀 批次推播：100ms 內的事件會合併成一個陣列發送
+ * 大幅減少前端 React re-render 次數
+ */
+function batchEmit(type, data) {
+    pendingBatch[type].push(data);
+    if (!batchEmitTimer) {
+        batchEmitTimer = setTimeout(flushPendingBatch, 1000); // 🚀 優化: 將推播緩衝提高到 1000ms，大幅減輕前端負擔
+    }
+}
+
+// ==========================================
+// 🚀 In-Memory API 快取層 (10秒 TTL)
+// 大幅減少重複查詢對 SQLite 的壓力
+// ==========================================
+const CACHE_TTL_MS = 10 * 1000; // 10 秒
+const apiCache = new Map();
+
+/**
+ * Express 中間件：自動快取 GET 回應
+ * 快取命中時直接回傳，不碰 DB
+ */
+function withCache(ttlMs = CACHE_TTL_MS) {
+    return (req, res, next) => {
+        const key = req.originalUrl;
+        const cached = apiCache.get(key);
+        if (cached && Date.now() < cached.expiredAt) {
+            res.setHeader('X-Cache', 'HIT');
+            return res.json(cached.data);
+        }
+        // 攔截 res.json 以存入快取
+        const origJson = res.json.bind(res);
+        res.json = (data) => {
+            apiCache.set(key, { data, expiredAt: Date.now() + ttlMs });
+            res.setHeader('X-Cache', 'MISS');
+            origJson(data);
+        };
+        next();
+    };
+}
+
+/**
+ * 當有新封包寫入資料庫時，清除所有 packet 相關的快取
+ * 避免前端看到過時的分頁資料
+ */
+function invalidatePacketCache() {
+    for (const key of apiCache.keys()) {
+        if (key.startsWith('/api/packets') || key.startsWith('/api/node/') || key.startsWith('/api/coverage')) {
+            apiCache.delete(key);
+        }
+    }
+}
+
+// ==========================================
+// 🚀 資料庫批次寫入任務佇列 (DB Queue)
+// 解決高流量時頻繁觸發 SQLite 鎖的問題
+// ==========================================
+const dbQueue = [];
+let dbQueueTimer = null;
+
+function queueDbOp(sql, params, callback) {
+    dbQueue.push({ sql, params, callback });
+    if (!dbQueueTimer) {
+        dbQueueTimer = setTimeout(() => {
+            if (dbQueue.length === 0) return;
+            const batch = dbQueue.splice(0);
+            dbQueueTimer = null;
+
+            db.serialize(() => {
+                db.run('BEGIN');
+                batch.forEach(item => {
+                    db.run(item.sql, item.params, item.callback);
+                });
+                db.run('COMMIT');
+            });
+            // 🚀 批次寫入完成後，讓快取失效
+            invalidatePacketCache();
+        }, 1000); // 每秒批次寫入一次資料庫
+    }
+}
+
+// ==========================================
 // Socket.io 連線監聽 (新增)
 // ==========================================
 io.on('connection', (socket) => {
@@ -56,7 +156,7 @@ process.on('uncaughtException', (err) => {
 });
 
 // 你的專屬節點 ID
-const myNodeId = '!7931b961'; 
+const myNodeId = '!7931b961';
 
 // 靜態檔案路徑：優先服務前端編譯出的 dist 夾，若無則服務目前目錄（相容舊 index.html）
 app.use(express.static(path.join(__dirname, 'frontend/dist'))); // 🚀 安全性：只服務前端編譯後的檔案
@@ -89,6 +189,14 @@ if (process.env.TURSO_URL) {
 }
 
 db.serialize(() => {
+    // 🚀 效能優先：所有 DDL 前先設定最佳 PRAGMA
+    db.run(`PRAGMA journal_mode = WAL`);
+    db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 夠安全，比 FULL 快約 5x
+    db.run(`PRAGMA cache_size = -32000`);    // 32MB 頁面快取（負值代表 KB）
+    db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
+    db.run(`PRAGMA mmap_size = 268435456`);  // 256MB mmap 加速讀取
+    db.run(`PRAGMA busy_timeout = 5000`);    // 5秒等待鎖，避免 SQLITE_BUSY 錯誤
+
     db.run(`
         CREATE TABLE IF NOT EXISTS telemetry_data (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +212,8 @@ db.serialize(() => {
             rssi REAL,
             current REAL,
             hop_limit INTEGER,
-            hop_start INTEGER
+            hop_start INTEGER,
+            adc_voltage REAL
         )
     `);
     // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
@@ -151,7 +260,6 @@ db.serialize(() => {
         )
     `);
     // 新增 neighbors 資料表，紀錄節點間的鄰居關係 (拓撲核心)
-    db.run(`PRAGMA journal_mode = WAL;`);
     db.run(`
         CREATE TABLE IF NOT EXISTS neighbors (
             node_id TEXT,
@@ -185,6 +293,10 @@ db.serialize(() => {
         )
     `);
 
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gateway ON packet_logs(gateway_id)`);
+
     const cols = [
         { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
         { t: 'nodes', c: 'last_topic', d: 'TEXT' },
@@ -210,15 +322,24 @@ db.serialize(() => {
         { t: 'packet_logs', c: 'latitude', d: 'REAL' },
         { t: 'packet_logs', c: 'longitude', d: 'REAL' },
         { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'source', d: 'TEXT' } // 🚀 新增：標記封包來源 (MQTT 或 RF 隧道)
+        { t: 'packet_logs', c: 'source', d: 'TEXT' }, // 🚀 新增：標記封包來源 (MQTT 或 RF 隧道)
+        { t: 'telemetry_data', c: 'adc_voltage', d: 'REAL' } // 🚀 新增：保留 ADC 電壓
     ];
     cols.forEach(col => {
-        db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => {});
+        db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => { });
     });
-
-    // 建立索引以加速前端查詢歷史數據的效能
-    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)`);
+    
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
+    // 🚀 效能優化：為 packet_logs 的 timestamp 加上索引，加速 ORDER BY timestamp DESC 的查詢
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_source_timestamp ON packet_logs (source, timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
+    
+    // 聊天紀錄效能優化
+    db.run(`CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)`);
 });
 
 // 🛸 輔助映射：將前端名稱對應回 Protobuf ID，確保 API 查詢正確
@@ -248,7 +369,7 @@ function cleanupOldData() {
     // 新增：聊天紀錄保留 30 天，避免資料庫無限增長
     const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
 
-    db.run(sql, function(err) {
+    db.run(sql, function (err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
         else if (this.changes > 0) {
             console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 14 天的舊資料`);
@@ -336,7 +457,7 @@ app.get('/api/telemetry', (req, res) => {
         sql += ` WHERE node_id = ?`;
         params.push(nodeId);
     }
-    
+
     sql += ` ORDER BY timestamp DESC LIMIT ?`;
     params.push(limit);
 
@@ -380,13 +501,20 @@ app.get('/api/node/:nodeId', (req, res) => {
 });
 
 // 取得全域最新封包紀錄 (提供給封包觀察分頁)
-app.get('/api/packets', (req, res) => {
-    const { sql, params } = buildPacketQuery({ ...req, excludeTunnelPackets: true }, "SELECT * FROM packet_logs"); // 🚀 修正：全域觀察排除中繼封包
-    const limit = parseInt(req.query.limit) || 20;
+// 🚀 效能優化：只取列表需要的欄位，排除 payload_json 和 raw_hex 這兩個大字段
+const PACKET_LIST_COLS = `id, node_id, timestamp, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, hops_away, latitude, longitude, source`;
+
+app.get('/api/packets', withCache(), (req, res) => {
+    // 1. 強制設定安全上限，防止有人惡意或無意間請求過大資料量
+    const rawLimit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(rawLimit, 100);
+
     const page = parseInt(req.query.page) || 1;
     const offset = (page - 1) * limit;
 
+    const { sql, params } = buildPacketQuery({ ...req, excludeTunnelPackets: true }, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
     const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+
     db.all(finalSql, [...params, limit, offset], (err, rows) => {
         if (err) {
             console.error('❌ API /api/packets SQL Error:', err.message);
@@ -396,8 +524,21 @@ app.get('/api/packets', (req, res) => {
     });
 });
 
-// 🚀 新增：全域封包總數統計
-app.get('/api/packets/count', (req, res) => {
+// 🚀 新增：單一封包詳情（懶加載），包含 payload_json 和 raw_hex
+app.get('/api/packets/:id', (req, res) => {
+    db.get(`SELECT * FROM packet_logs WHERE id = ?`, [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: 'Not found' });
+        // 如果 payload_json 是字串先解析再回傳
+        if (row.payload_json && typeof row.payload_json === 'string') {
+            try { row.payload_json = JSON.parse(row.payload_json); } catch (_) {}
+        }
+        res.json(row);
+    });
+});
+
+// 🚀 全域封包總數統計（加快取）
+app.get('/api/packets/count', withCache(), (req, res) => {
     const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -422,7 +563,8 @@ app.get('/api/gateways/leaderboard', (req, res) => {
         FROM packet_logs 
         WHERE gateway_id IS NOT NULL AND gateway_id != '' AND gateway_id != 'Unknown'
         GROUP BY gateway_id 
-        ORDER BY total_packets DESC LIMIT 20`;
+        HAVING MAX(timestamp) >= datetime('now', '-3 days')
+        ORDER BY total_packets DESC`;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
@@ -460,6 +602,75 @@ app.get('/api/nodes/activity', (req, res) => {
     });
 });
 
+// 🚀 新增：取得節點過去 24 小時的移動軌跡 (Tracker History)
+app.get('/api/node-path/:id', (req, res) => {
+    const nodeId = req.params.id;
+    const sql = `
+        SELECT latitude, longitude, timestamp 
+        FROM packet_logs 
+        WHERE node_id = ? 
+          AND latitude IS NOT NULL 
+          AND longitude IS NOT NULL 
+          AND timestamp > datetime('now', '-1 day')
+        ORDER BY timestamp ASC`;
+    db.all(sql, [nodeId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 🚀 新增：取得頻道的數據分析 (Chat Analytics)
+app.get('/api/chat-analytics/:channel', (req, res) => {
+    const channel = req.params.channel;
+    // 統計前10大發言者
+    const talkersSql = `
+        SELECT from_id, COUNT(*) as message_count 
+        FROM chat_messages 
+        WHERE channel_name = ? AND timestamp > datetime('now', '-7 days')
+        GROUP BY from_id 
+        ORDER BY message_count DESC 
+        LIMIT 10`;
+    
+    // 取得文字內容準備進行文字雲拆解
+    const wordsSql = `
+        SELECT message 
+        FROM chat_messages 
+        WHERE channel_name = ? AND timestamp > datetime('now', '-7 days')
+        LIMIT 500`;
+
+    db.all(talkersSql, [channel], (err, talkers) => {
+        if (err) return res.status(500).json({ error: err.message });
+        
+        db.all(wordsSql, [channel], (err, messages) => {
+            if (err) return res.status(500).json({ error: err.message });
+            
+            // 簡單的空格拆詞法 (適合英數夾雜或有斷詞的中文)
+            const wordCounts = {};
+            messages.forEach(row => {
+                // 移除非英數字/中文字元，將逗號句號等替換為空白，然後用空白切割
+                const cleanMsg = row.message.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, ' ');
+                const tokens = cleanMsg.split(/\s+/);
+                tokens.forEach(token => {
+                    if (token.length > 1) { // 忽略單一字元
+                        wordCounts[token] = (wordCounts[token] || 0) + 1;
+                    }
+                });
+            });
+
+            // 轉換為陣列並排序取前 50 個
+            const wordCloud = Object.entries(wordCounts)
+                .map(([text, value]) => ({ text, value }))
+                .sort((a, b) => b.value - a.value)
+                .slice(0, 50);
+
+            res.json({
+                topTalkers: talkers,
+                wordCloud: wordCloud
+            });
+        });
+    });
+});
+
 // 🚀 新增：太陽能電壓預測 API
 // 🚀 新增：取得最新一筆 Traceroute 路徑 API
 app.get('/api/traceroute/latest', (req, res) => {
@@ -469,11 +680,11 @@ app.get('/api/traceroute/latest', (req, res) => {
         try {
             const payload = JSON.parse(row.payload_json);
             const route = payload.route || [];
-            
+
             // 將十進位 ID 轉為 !hex 格式 (例如 !f0b78d83)
             const hexIds = route.map(id => `!${(id >>> 0).toString(16).padStart(8, '0')}`);
             const placeholders = hexIds.map(() => '?').join(',');
-            
+
             db.all(`SELECT node_id, latitude, longitude, short_name FROM nodes WHERE node_id IN (${placeholders})`, hexIds, (err, nodes) => {
                 if (err) return res.status(500).json({ error: err.message });
                 // 依照原始 route 的順序排序返回，並過濾掉沒有座標的節點
@@ -486,31 +697,48 @@ app.get('/api/traceroute/latest', (req, res) => {
     });
 });
 
-// 🚀 新增：覆蓋率地圖資料 API
-// 🚀 核心升級：網格化覆蓋率聚合 API (Grid Binning)
 // 🚀 核心升級：網格化覆蓋率聚合 API
-app.get('/api/coverage/griddata', (req, res) => {
+// 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
+app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
+    // 🚀 CTE 實作方式：
+    // 1. 第一個 CTE 先對每個網格分組找出最新那筆的 hops_away
+    // 2. 第二個層做聚合統計
+    // 3. JOIN 合併起來，對每行只跟資料庫講一次
     const sql = `
+        WITH base AS (
+            SELECT 
+                CAST(ROUND(latitude  / 0.005) * 0.005 AS REAL) AS grid_lat,
+                CAST(ROUND(longitude / 0.005) * 0.005 AS REAL) AS grid_lng,
+                snr, hops_away, timestamp, node_id, gateway_id
+            FROM packet_logs
+            WHERE latitude IS NOT NULL
+              AND longitude IS NOT NULL
+              AND node_id != gateway_id
+              AND gateway_id != 'Unknown'
+        ),
+        latest_per_grid AS (
+            SELECT grid_lat, grid_lng, hops_away
+            FROM (
+                SELECT grid_lat, grid_lng, hops_away,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY grid_lat, grid_lng
+                           ORDER BY timestamp DESC
+                       ) AS rn
+                FROM base
+            ) t
+            WHERE rn = 1
+        )
         SELECT 
-            CAST(ROUND(latitude / 0.005) * 0.005 AS REAL) AS grid_lat, 
-            CAST(ROUND(longitude / 0.005) * 0.005 AS REAL) AS grid_lng,
-            COUNT(*) as packet_count,
-            AVG(snr) AS avg_snr,
-            MIN(hops_away) AS min_hops,
-            MAX(timestamp) AS latest_time,
-            (
-                SELECT p2.hops_away FROM packet_logs p2 
-                WHERE p2.latitude IS NOT NULL 
-                  AND CAST(ROUND(p2.latitude / 0.005) * 0.005 AS REAL) = CAST(ROUND(p1.latitude / 0.005) * 0.005 AS REAL)
-                  AND CAST(ROUND(p2.longitude / 0.005) * 0.005 AS REAL) = CAST(ROUND(p1.longitude / 0.005) * 0.005 AS REAL)
-                ORDER BY timestamp DESC LIMIT 1
-            ) AS latest_hops
-        FROM packet_logs p1
-        WHERE latitude IS NOT NULL 
-          AND longitude IS NOT NULL 
-          AND node_id != gateway_id
-          AND gateway_id != 'Unknown'
-        GROUP BY grid_lat, grid_lng
+            b.grid_lat,
+            b.grid_lng,
+            COUNT(*)        AS packet_count,
+            AVG(b.snr)      AS avg_snr,
+            MIN(b.hops_away) AS min_hops,
+            MAX(b.timestamp) AS latest_time,
+            l.hops_away     AS latest_hops
+        FROM base b
+        JOIN latest_per_grid l USING (grid_lat, grid_lng)
+        GROUP BY b.grid_lat, b.grid_lng
     `;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -527,8 +755,9 @@ app.get('/api/neighbors', (req, res) => {
 });
 
 // 取得單一節點的歷史封包紀錄
-app.get('/api/node/:nodeId/packets', (req, res) => {
-    const { sql, params } = buildPacketQuery(req, "SELECT * FROM packet_logs");
+// 🚀 效能優化：只取列表需要欄位，加快取
+app.get('/api/node/:nodeId/packets', withCache(), (req, res) => {
+    const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
     const limit = parseInt(req.query.limit) || 20;
     const page = parseInt(req.query.page) || 1;
     const offset = (page - 1) * limit;
@@ -540,8 +769,8 @@ app.get('/api/node/:nodeId/packets', (req, res) => {
     });
 });
 
-// 🚀 新增：單一節點封包總數統計
-app.get('/api/node/:nodeId/packets/count', (req, res) => {
+// 🚀 單一節點封包總數統計（加快取）
+app.get('/api/node/:nodeId/packets/count', withCache(), (req, res) => {
     const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -592,8 +821,8 @@ server.listen(PORT, () => {
 async function setupRFListener(io, db) {
     const relayConfigs = [
         { name: 'hualien', label: '花蓮站', port: 4404 },
-        { name: 'taoyuan', label: '桃園站', port: 4405 },
-        { name: 'sanzhi',  label: '三芝站', port: 4406 }
+        { name: 'taoyuan', label: '台北站', port: 4405 },
+        { name: 'sanzhi', label: '三芝站', port: 4406 }
     ];
 
     let meshtastic;
@@ -637,6 +866,8 @@ async function setupRFListener(io, db) {
                                 const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
                                 const hopsAway = (packet.hopStart || 0) - (packet.hopLimit || 0);
 
+                                console.log(`📍 [隧道位置] 來源: ${config.label} | 節點: ${fromId} -> ${lat.toFixed(6)}, ${lng.toFixed(6)} (Hops: ${hopsAway})`);
+
                                 const packetData = {
                                     from: fromId,
                                     portnum: 'POSITION',
@@ -653,14 +884,15 @@ async function setupRFListener(io, db) {
                                     hops_away: hopsAway
                                 };
 
-                                io.emit('raw_packet', packetData);
-                                db.run(`INSERT INTO packets (node_id, lat, lon, snr, rssi, source) VALUES (?, ?, ?, ?, ?, ?)`,
-                                    [fromId, lat, lng, packet.rxSnr, packet.rxRssi, config.name]);
-                                db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                                    [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
-                                // 🚀 修正：中繼封包僅供染色，不更新 nodes 表的座標，避免地圖出現 Marker
-                                db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
-                                    [`隧道:${config.label}`, fromId]);
+                                db.serialize(() => {
+                                    db.run('BEGIN');
+                                    db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                        [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
+                                    db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
+                                        [`隧道:${config.label}`, fromId]);
+                                    db.run('COMMIT');
+                                });
+                                batchEmit('raw_packet', packetData);
                             }
                         }
                     } catch (e) { /* 忽略碎片或錯誤封包 */ }
@@ -701,7 +933,7 @@ if (!fs.existsSync(checkPath)) {
 let ServiceEnvelope, Telemetry, User, Position, MapReport, Data, Routing, RouteDiscovery, NeighborInfo;
 
 root.load([
-    "meshtastic/mqtt.proto", 
+    "meshtastic/mqtt.proto",
     "meshtastic/telemetry.proto",
     "meshtastic/portnums.proto",
     "meshtastic/mesh.proto",
@@ -732,15 +964,15 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
     const client = mqtt.connect(process.env.MQTT_BROKER || 'mqtt://mqtt.meshtastic.org', {
         username: process.env.MQTT_USER || 'meshdev',
         password: process.env.MQTT_PASSWORD || 'large4cats',
-        clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10), 
-        connectTimeout: 5000 
+        clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10),
+        connectTimeout: 5000
     });
 
     client.on('connect', () => {
         console.log('✅ 已成功連線到 MQTT 伺服器！');
         isMqttConnected = true;
-        io.emit('mqtt_status', { connected: true });
-        
+        io.emit('mqtt_status', { connected: true }); // mqtt_status 需要立即發送，不能批次
+
         // 只訂閱台灣區域的 Topic (# 代表監聽 TW 路徑下的所有子頻道)
         const topics = (process.env.MQTT_TOPICS || 'msh/TW/#').split(',');
         client.subscribe(topics, (err) => {
@@ -762,17 +994,17 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
         try {
             const envelope = ServiceEnvelope.decode(message);
             if (!envelope.packet) return;
-            
+
             const packet = envelope.packet;
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             const gatewayId = envelope.gateway_id || 'Unknown';
 
             // 🛑 封包去重過濾器：檢查「發送者 + 封包ID」
             const packetKey = `${fromId}-${packet.id}`;
-            if (seenPackets.has(packetKey)) return; 
-            
+            if (seenPackets.has(packetKey)) return;
+
             seenPackets.add(packetKey);
-            
+
             // 自動清理快取：保留最近 1000 個封包 ID，避免記憶體洩漏
             if (seenPackets.size > 1000) {
                 const iter = seenPackets.values();
@@ -785,7 +1017,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             const jsonIndex = topicParts.indexOf('json');
             let resolvedChannel = (cIndex !== -1 && topicParts[cIndex + 1]) ? topicParts[cIndex + 1] : (jsonIndex !== -1 ? topicParts[jsonIndex + 1] : null);
             if (!resolvedChannel) {
-                resolvedChannel = topicParts.find(p => 
+                resolvedChannel = topicParts.find(p =>
                     !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat'].includes(p) && !p.startsWith('!') && p !== ''
                 ) || null;
             }
@@ -802,7 +1034,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     const iv = Buffer.alloc(16);
                     iv.writeUInt32LE(packet.id >>> 0, 0);
                     iv.writeUInt32LE(packet.from >>> 0, 8); // 👉 關鍵修正：From ID 必須在 Offset 8
-                    
+
                     for (const k of knownKeys) {
                         try {
                             if (k.key.length !== 16 && k.key.length !== 32) continue;
@@ -810,22 +1042,22 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                             const algo = k.key.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
                             const decipher = crypto.createDecipheriv(algo, k.key, iv);
                             const decrypted = Buffer.concat([decipher.update(packet.encrypted), decipher.final()]);
-                            
+
                             const attempt = Data.decode(decrypted);
                             const port = attempt.portnum;
-                            
+
                             // 🛑 破除「假成功」陷阱：過濾掉拿錯鑰匙產生的亂碼
                             if (port === 0 || port === 'UNKNOWN_APP' || port === undefined) {
-                                continue; 
+                                continue;
                             }
 
                             // 🎯 成功解密！
                             decodedData = attempt;
-                            
+
                             // 核心優化：優先使用解密後確認的頻道名稱
                             decodedData.channel_name = resolvedChannel || k.name;
-                            
-                            break; 
+
+                            break;
                         } catch (e) { /* 此金鑰失敗，繼續 */ }
                     }
                 } catch (e) { console.error('❌ 解密引擎結構錯誤', e); }
@@ -836,24 +1068,25 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 INSERT INTO nodes (node_id, last_seen, last_topic, channel, hop_limit, hop_start, last_gateway) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, channel=COALESCE(excluded.channel, nodes.channel), hop_limit=excluded.hop_limit, hop_start=excluded.hop_start, last_gateway=excluded.last_gateway
             `;
-            db.run(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0, gatewayId]);
-            io.emit('node_seen', { node_id: fromId, last_seen: new Date().toISOString(), last_topic: topic, channel: resolvedChannel });
+            // 🚀 批次寫入：改用佇列避免高流量時的鎖等待
+            queueDbOp(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0, gatewayId]);
+            batchEmit('node_seen', { node_id: fromId, last_seen: new Date().toISOString(), last_topic: topic, channel: resolvedChannel });
 
             // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED
             if (!decodedData) {
                 const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
-                db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
+                queueDbOp(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                     [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null, rawHex, hopsAway]);
-                io.emit('raw_packet', { 
-                    from: fromId, 
-                    portnum: 'ENCRYPTED', 
-                    topic: topic, 
-                    gateway_id: gatewayId, 
+                batchEmit('raw_packet', {
+                    from: fromId,
+                    portnum: 'ENCRYPTED',
+                    topic: topic,
+                    gateway_id: gatewayId,
                     timestamp: new Date().toISOString(),
-                    time: new Date().toLocaleTimeString(), 
-                    snr: packet.rx_snr, 
-                    rssi: packet.rx_rssi, 
-                    rawData: rawHex 
+                    time: new Date().toLocaleTimeString(),
+                    snr: packet.rx_snr,
+                    rssi: packet.rx_rssi,
+                    rawData: rawHex
                 });
                 return;
             }
@@ -866,7 +1099,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             // 🛡️ 初始化為 null，確保 SQL 寫入正確
             let packetLat = undefined;
             let packetLng = undefined;
-            
+
             const payloadBuffer = Buffer.isBuffer(decodedData.payload) ? decodedData.payload : Buffer.from(decodedData.payload || []);
 
             try {
@@ -874,16 +1107,16 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     const textMessage = payloadBuffer.toString('utf8');
                     const channelName = decodedData.channel_name || 'MediumFast';
                     payloadObj = { text: textMessage, channel_name: channelName };
-                    
+
                     console.log(`💬 [頻道: ${channelName}] ${fromId} 說: ${textMessage}`);
-                    
+
                     // 寫入聊天紀錄表
-                    db.run(`INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)`, [fromId, textMessage, channelName]);
+                    queueDbOp(`INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)`, [fromId, textMessage, channelName]);
                 } else if (port === 3 || port === 'POSITION_APP' || port === '3') {
                     // 確保我們正確解碼 Meshtastic 標準位置
                     const posMessage = Position.decode(payloadBuffer);
                     payloadObj = Position.toObject(posMessage, { enums: String, defaults: true });
-                    
+
                     // 🛸 強化座標讀取，避免數值為 0 被誤判
                     packetLat = (payloadObj.latitude_i !== undefined) ? payloadObj.latitude_i / 1e7 : payloadObj.latitude;
                     packetLng = (payloadObj.longitude_i !== undefined) ? payloadObj.longitude_i / 1e7 : payloadObj.longitude;
@@ -902,7 +1135,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     if (ni.neighbors && ni.neighbors.length > 0) {
                         ni.neighbors.forEach(n => {
                             const nId = `!${n.node_id.toString(16).padStart(8, '0')}`;
-                            db.run(`INSERT INTO neighbors (node_id, neighbor_id, snr) VALUES (?, ?, ?) ON CONFLICT(node_id, neighbor_id) DO UPDATE SET snr=excluded.snr, last_seen=CURRENT_TIMESTAMP`, [fromId, nId, n.snr]);
+                            queueDbOp(`INSERT INTO neighbors (node_id, neighbor_id, snr) VALUES (?, ?, ?) ON CONFLICT(node_id, neighbor_id) DO UPDATE SET snr=excluded.snr, last_seen=CURRENT_TIMESTAMP`, [fromId, nId, n.snr]);
                         });
                     }
                 } else if (port === 73 || port === 'MAP_REPORT_APP') {
@@ -912,7 +1145,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     packetLng = report.longitude_i ? report.longitude_i / 1e7 : report.longitude;
                 }
             } catch (e) { console.error('❌ Payload 解析失敗', e); }
-            
+
             if (payloadObj && decodedData.channel_name) {
                 payloadObj.channel_name = decodedData.channel_name;
             }
@@ -920,34 +1153,32 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             // 3. 寫入封包日誌並推播
             const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
             const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
-            
+
             // 🚀 同步更新 nodes 表中的座標，讓地圖 Marker 能即時移動
             if (packetLat && packetLng) {
-                db.run(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [packetLat, packetLng, fromId]);
+                queueDbOp(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [packetLat, packetLng, fromId]);
             }
 
-            db.run(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, latitude, longitude, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, 
-                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex, packetLat, packetLng, hopsAway], (err) => {
-                    if (err) console.error('❌ 封包寫入失敗:', err.message);
-                });
+            queueDbOp(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, latitude, longitude, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex, packetLat, packetLng, hopsAway]);
 
-            io.emit('raw_packet', { 
-                from: fromId, 
-                portnum: port, 
-                topic: topic, 
-                gateway_id: gatewayId, 
+            batchEmit('raw_packet', {
+                from: fromId,
+                portnum: port,
+                topic: topic,
+                gateway_id: gatewayId,
                 timestamp: new Date().toISOString(),
-                time: new Date().toLocaleTimeString(), 
-                snr: packet.rx_snr, 
+                time: new Date().toLocaleTimeString(),
+                snr: packet.rx_snr,
                 rssi: packet.rx_rssi,
-                latitude: packetLat,   // 💡 新增推播欄位
-                longitude: packetLng,  // 💡 新增推播欄位
-                hops_away: hopsAway,   // 💡 新增推播欄位
-                payload_json: payloadObj, 
-                rawData: rawHex 
+                latitude: packetLat,
+                longitude: packetLng,
+                hops_away: hopsAway,
+                payload_json: payloadObj,
+                rawData: rawHex
             });
 
-            // 解析節點資訊 (名稱)
+            // 解析節點資訊 (名稱) - NODEINFO 外層更新
             if (port === 4 || port === 'NODEINFO_APP') {
                 try {
                     const user = User.toObject(User.decode(payloadBuffer), { enums: String });
@@ -955,41 +1186,39 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     const hwModel = user.hw_model || user.hwModel || null;
                     const firmwareVersion = user.firmware_version || user.firmwareVersion || null;
                     const firmwareBuildNum = user.firmware_build_num || user.firmwareBuildNum || null;
-                    db.run(`
-                        UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ?, firmware_version = ?, firmware_build_num = ? WHERE node_id = ?
-                    `, [user.long_name, user.short_name, finalRole, hwModel, firmwareVersion, firmwareBuildNum, fromId], (err) => {
-                        if (!err) {
-                            console.log(`👤 [節點資訊] 更新: ${user.short_name} 角色: ${finalRole}`);
-                            io.emit('node_seen', { 
-                                node_id: fromId, 
-                                long_name: user.long_name, 
-                                short_name: user.short_name,
-                                role: finalRole,
-                                hw_model: hwModel,
-                                firmware_version: firmwareVersion,
-                                firmware_build_num: firmwareBuildNum,
-                                last_seen: new Date().toISOString(),
-                                last_topic: topic
-                            });
-                        }
-                    });
+                    queueDbOp(`UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ?, firmware_version = ?, firmware_build_num = ? WHERE node_id = ?`,
+                        [user.long_name, user.short_name, finalRole, hwModel, firmwareVersion, firmwareBuildNum, fromId], function (err) {
+                            if (!err) {
+                                console.log(`👤 [節點資訊] 更新: ${user.short_name} 角色: ${finalRole}`);
+                                batchEmit('node_seen', {
+                                    node_id: fromId,
+                                    long_name: user.long_name,
+                                    short_name: user.short_name,
+                                    role: finalRole,
+                                    hw_model: hwModel,
+                                    firmware_version: firmwareVersion,
+                                    firmware_build_num: firmwareBuildNum,
+                                    last_seen: new Date().toISOString(),
+                                    last_topic: topic
+                                });
+                            }
+                        });
                 } catch (e) { console.error('❌ 解析 NodeInfo 失敗', e); }
             }
 
-            // 解析位置資訊 (經緯度)
+            // 解析位置資訊 - POSITION 外層更新
             if (port === 3 || port === 'POSITION_APP') {
                 try {
                     const pos = Position.decode(decodedData.payload);
                     if (pos.latitude_i && pos.longitude_i) {
                         const lat = pos.latitude_i / 1e7;
                         const lng = pos.longitude_i / 1e7;
-                        db.run(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [lat, lng, fromId], (err) => {
+                        queueDbOp(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [lat, lng, fromId], function (err) {
                             if (!err) {
-                                console.log(`📍 [位置更新] 節點: ${fromId} -> ${lat}, ${lng}`);
-                                io.emit('node_seen', { 
-                                    node_id: fromId, 
-                                    latitude: lat, 
-                                    longitude: lng, 
+                                batchEmit('node_seen', {
+                                    node_id: fromId,
+                                    latitude: lat,
+                                    longitude: lng,
                                     last_seen: new Date().toISOString(),
                                     last_topic: topic
                                 });
@@ -999,20 +1228,19 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 } catch (e) { console.error('❌ 解析 Position 失敗', e); }
             }
 
-            // 解析 MapReport (包含名稱與位置)
             if (port === 73 || port === 'MAP_REPORT_APP') {
                 try {
                     const report = MapReport.decode(decodedData.payload);
                     const lat = report.latitude_i / 1e7;
                     const lng = report.longitude_i / 1e7;
-                    db.run(`
+                    queueDbOp(`
                         UPDATE nodes SET long_name = ?, short_name = ?, latitude = ?, longitude = ? WHERE node_id = ?
-                    `, [report.long_name, report.short_name, lat, lng, fromId], (err) => {
+                    `, [report.long_name, report.short_name, lat, lng, fromId], function (err) {
                         if (!err) {
                             console.log(`🗺️ [地圖報告] 節點: ${report.short_name} -> ${lat}, ${lng}`);
-                            io.emit('node_seen', { 
-                                node_id: fromId, 
-                                long_name: report.long_name, 
+                            batchEmit('node_seen', {
+                                node_id: fromId,
+                                long_name: report.long_name,
                                 short_name: report.short_name,
                                 latitude: lat,
                                 longitude: lng,
@@ -1027,7 +1255,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             if (port === 67 || port === 'TELEMETRY_APP') {
                 const telemetry = Telemetry.decode(decodedData.payload);
                 const cleanJSON = Telemetry.toObject(telemetry, { enums: String, defaults: true });
-                
+
                 const device = cleanJSON.device_metrics || cleanJSON.deviceMetrics || {};
                 const env = cleanJSON.environment_metrics || cleanJSON.environmentMetrics || {};
                 const power = cleanJSON.power_metrics || cleanJSON.powerMetrics || {};
@@ -1038,53 +1266,57 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                 const finalVoltage = power.ch1_voltage ?? power.ch1Voltage ?? null;
                 const finalCurrent = power.ch1_current ?? power.ch1Current ?? null;
 
+                const adcVoltage = device.voltage ?? null;
+
                 const sql = `
                     INSERT INTO telemetry_data 
-                    (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, current, hop_limit, hop_start) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, current, hop_limit, hop_start, adc_voltage) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 `;
-                    const params = [
-                        fromId, 
-                        device.battery_level ?? device.batteryLevel ?? null, 
-                        finalVoltage, 
-                        env.temperature ?? null, 
-                        env.relative_humidity ?? env.relativeHumidity ?? null, 
-                        cu, 
-                        air,
-                        packet.rx_snr ?? null,
-                        packet.rx_rssi ?? null,
-                        finalCurrent,
-                        packet.hop_limit || 0,
-                        packet.hop_start || 0
-                    ];
-                    
-                    // 同步更新 nodes 表，確保 Dashboard 數據能正確載入
-                    db.run(`
+                const params = [
+                    fromId,
+                    device.battery_level ?? device.batteryLevel ?? null,
+                    finalVoltage,
+                    env.temperature ?? null,
+                    env.relative_humidity ?? env.relativeHumidity ?? null,
+                    cu,
+                    air,
+                    packet.rx_snr ?? null,
+                    packet.rx_rssi ?? null,
+                    finalCurrent,
+                    packet.hop_limit || 0,
+                    packet.hop_start || 0,
+                    adcVoltage
+                ];
+
+                // 同步更新 nodes 表，確保 Dashboard 數據能正確載入
+                queueDbOp(`
                         UPDATE nodes SET battery_level = ?, voltage = ?, current = ?, temperature = ?, humidity = ? WHERE node_id = ?
                     `, [params[1], finalVoltage, finalCurrent, params[3], params[4], fromId]);
-    
-                    db.run(sql, params, function(err) {
-                        if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
-    
-                        console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
-                        // 透過 WebSocket 即時推播新資料到前端
-                        io.emit('telemetry_update', {
-                            node_id: fromId,
-                            battery_level: params[1],
-                            voltage: finalVoltage,
-                            current: finalCurrent,
-                            temperature: params[3],
-                            humidity: params[4],
-                            channel_utilization: cu,
-                            air_util_tx: air,
-                            timestamp: new Date().toISOString(),
-                            snr: params[7],
-                            rssi: params[8],
-                            hop_limit: params[9],
-                            hop_start: params[10]
-                        });
+
+                queueDbOp(sql, params, function (err) {
+                    if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
+
+                    console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
+                    // 🚀 透過批次推播即時將新資料推播到前端
+                    batchEmit('telemetry_update', {
+                        node_id: fromId,
+                        battery_level: params[1],
+                        voltage: finalVoltage,
+                        current: finalCurrent,
+                        temperature: params[3],
+                        humidity: params[4],
+                        channel_utilization: cu,
+                        air_util_tx: air,
+                        timestamp: new Date().toISOString(),
+                        snr: params[7],
+                        rssi: params[8],
+                        hop_limit: params[10],
+                        hop_start: params[11],
+                        adc_voltage: adcVoltage
                     });
-            } 
+                });
+            }
         } catch (err) {
             // 忽略無法解碼的雜訊封包
         }
@@ -1097,19 +1329,19 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 cron.schedule('0 */12 * * *', () => {
     // 原始資料庫路徑
     const sourceDbPath = path.join(__dirname, 'meshtastic.db');
-    
+
     // 雲端環境適應：從環境變數讀取備份路徑，若無則不執行備份
-    const googleDrivePath = process.env.BACKUP_PATH; 
-    
+    const googleDrivePath = process.env.BACKUP_PATH;
+
     if (!googleDrivePath) return;
 
     // 如果資料夾不存在，就自動建立
-    if (!fs.existsSync(googleDrivePath)){
+    if (!fs.existsSync(googleDrivePath)) {
         fs.mkdirSync(googleDrivePath, { recursive: true });
     }
 
     // 取得今天的日期作為檔名後綴
-    const dateStr = new Date().toISOString().slice(0, 10); 
+    const dateStr = new Date().toISOString().slice(0, 10);
     const backupFileName = `meshtastic_backup_${dateStr}.db`;
     const targetBackupPath = path.join(googleDrivePath, backupFileName);
 

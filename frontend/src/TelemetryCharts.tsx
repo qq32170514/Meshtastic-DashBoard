@@ -25,6 +25,7 @@ interface Telemetry {
   channel_utilization?: number;
   air_util_tx?: number;
   current?: number;
+  adc_voltage?: number;
 }
 
 export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { nodeId: string, socket: any, node?: any, darkMode?: boolean }) {
@@ -44,7 +45,8 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
           voltage: data.voltage || 0,
           current: data.current || 0,
           air_util_tx: data.air_util_tx || 0,
-          channel_utilization: data.channel_utilization || 0
+          channel_utilization: data.channel_utilization || 0,
+          adc_voltage: data.adc_voltage || 0
         }].slice(-30));
       }
     };
@@ -84,9 +86,10 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
   const batteryChartData = {
     labels,
     datasets: [
-      { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4, yAxisID: 'y' }, // Added units to label
+      { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4, yAxisID: 'y' },
+      { label: 'ADC電壓 (V)', data: history.map(h => h.adc_voltage), borderColor: '#8b5cf6', backgroundColor: '#8b5cf620', fill: false, tension: 0.4, yAxisID: 'y' },
       { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4, yAxisID: 'y1' }, // Added units to label
-      { label: 'CU (%)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4 },
+      { label: 'CU (%)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4, yAxisID: 'y1' },
     ]
   };
 
