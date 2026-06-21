@@ -69,13 +69,13 @@ const createColoredIcon = (role?: string, lastSeen?: string) => {
 
 // 顏色映射函數：活躍時間越近，顏色越深
 const getRecencyColor = (lastSeen?: string) => {
-  if (!lastSeen) return '#94a3b8'; // gray
+  if (!lastSeen) return '#cbd5e1';
   const diffHours = (Date.now() - new Date(lastSeen).getTime()) / 3600000;
-  if (diffHours < 2) return '#22c55e';   // 2小時內 - 綠色 (最新)
-  if (diffHours < 6) return '#84cc16';   // 2~6小時 - 萊姆綠
-  if (diffHours < 12) return '#eab308';  // 6~12小時 - 黃色
-  if (diffHours < 24) return '#f97316';  // 12~24小時 - 橘色
-  return '#ef4444';                      // 24小時以上 - 紅色 (最舊)
+  if (diffHours < 2) return '#1e3a8a';   // 2小時內 - 深藍
+  if (diffHours < 6) return '#3b82f6';   // 2~6小時 - 鮮藍
+  if (diffHours < 12) return '#60a5fa';  // 6~12小時 - 天藍
+  if (diffHours < 24) return '#93c5fd';  // 12~24小時 - 淺藍
+  return '#cbd5e1';                      // 24小時以上 - 灰色
 };
 
 interface NodeMapProps {
@@ -411,8 +411,8 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
               <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">閘道標記 Gateway Info</div>
               <div className="space-y-3 text-[10px] font-bold text-slate-600">
                 <div className="flex items-center gap-2">
-                  <div className="w-3 h-3 rounded-full border-2 border-white bg-emerald-500"></div>
-                  顏色：最後活躍時間 (越綠越新，越紅越舊)
+                  <div className="w-3 h-3 rounded-full border-2 border-white bg-blue-500"></div>
+                  顏色：最後活躍時間 (越深藍越新，越淺藍越舊)
                 </div>
                 <div className="flex items-center gap-2">
                   <div className="w-5 h-5 rounded-full border-2 border-white bg-blue-500 flex items-center justify-center"></div>
