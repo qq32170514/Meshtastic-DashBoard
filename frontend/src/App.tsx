@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import NodeMap from './NodeMap';
@@ -82,14 +82,14 @@ interface FavoritesConfig {
 
 // 群組可用顏色選項
 const GROUP_COLORS = [
-  { key: 'cyan',   label: '青',   bg: 'bg-cyan-500',   text: 'text-cyan-400',   border: 'border-cyan-500' },
-  { key: 'yellow', label: '黃',   bg: 'bg-yellow-500', text: 'text-yellow-400', border: 'border-yellow-500' },
-  { key: 'green',  label: '綠',   bg: 'bg-green-500',  text: 'text-green-400',  border: 'border-green-500' },
-  { key: 'orange', label: '橙',   bg: 'bg-orange-500', text: 'text-orange-400', border: 'border-orange-500' },
-  { key: 'pink',   label: '粉',   bg: 'bg-pink-500',   text: 'text-pink-400',   border: 'border-pink-500' },
-  { key: 'purple', label: '紫',   bg: 'bg-purple-500', text: 'text-purple-400', border: 'border-purple-500' },
-  { key: 'red',    label: '紅',   bg: 'bg-red-500',    text: 'text-red-400',    border: 'border-red-500' },
-  { key: 'blue',   label: '藍',   bg: 'bg-blue-500',   text: 'text-blue-400',   border: 'border-blue-500' },
+  { key: 'cyan', label: '青', bg: 'bg-cyan-500', text: 'text-cyan-400', border: 'border-cyan-500' },
+  { key: 'yellow', label: '黃', bg: 'bg-yellow-500', text: 'text-yellow-400', border: 'border-yellow-500' },
+  { key: 'green', label: '綠', bg: 'bg-green-500', text: 'text-green-400', border: 'border-green-500' },
+  { key: 'orange', label: '橙', bg: 'bg-orange-500', text: 'text-orange-400', border: 'border-orange-500' },
+  { key: 'pink', label: '粉', bg: 'bg-pink-500', text: 'text-pink-400', border: 'border-pink-500' },
+  { key: 'purple', label: '紫', bg: 'bg-purple-500', text: 'text-purple-400', border: 'border-purple-500' },
+  { key: 'red', label: '紅', bg: 'bg-red-500', text: 'text-red-400', border: 'border-red-500' },
+  { key: 'blue', label: '藍', bg: 'bg-blue-500', text: 'text-blue-400', border: 'border-blue-500' },
 ];
 
 function getColorMeta(key: string) {
@@ -101,7 +101,7 @@ function loadFavoritesConfig(): FavoritesConfig {
   // 嘗試讀新格式
   const v2 = localStorage.getItem('meshtastic_favorites_v2');
   if (v2) {
-    try { return JSON.parse(v2); } catch (_) {}
+    try { return JSON.parse(v2); } catch (_) { }
   }
   // 迅移舊格式
   const v1 = localStorage.getItem('meshtastic_favorites');
@@ -128,6 +128,17 @@ const PORTNUM_NAMES: Record<string | number, string> = {
   71: 'NEIGHBORINFO', '71': 'NEIGHBORINFO', 'NEIGHBORINFO_APP': 'NEIGHBORINFO',
   73: 'MAP_REPORT', '73': 'MAP_REPORT', 'MAP_REPORT_APP': 'MAP_REPORT',
 };
+const ITEMS_PER_PAGE = 20;
+
+const ANNOUNCEMENT_TITLE = "📢 v2.1 版本更新公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard 最新版本！
+
+本次更新包含：
+1. 修復了節點清單最下方「加入最愛」選單會被裁切的問題。
+2. 系統進版至 v2.1，並加入此自訂公告系統。
+
+聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
+`;
 const socket = io();
 
 function App() {
@@ -391,6 +402,10 @@ function App() {
   // 封包過濾狀態
   const [nodeListSearchQuery, setNodeListSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState('base');
+  const [showAnnouncement, setShowAnnouncement] = useState(() => {
+    return localStorage.getItem('hideAnnouncement_v2_1') !== 'true';
+  });
+  const [hideAnnouncementNextTime, setHideAnnouncementNextTime] = useState(false);
 
   const [globalFilter, setGlobalFilter] = useState({
     port: 'ALL',
@@ -1212,6 +1227,13 @@ function App() {
         </div>
         <div className="flex items-center gap-6 text-sm">
           <button
+            onClick={() => setShowAnnouncement(true)}
+            className={`p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-cyan-400' : 'hover:bg-slate-700 text-cyan-300'}`}
+            title="查看系統公告"
+          >
+            <Megaphone size={20} />
+          </button>
+          <button
             onClick={() => setDarkMode(!darkMode)}
             className={`p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-yellow-400' : 'hover:bg-slate-700 text-slate-300'}`}
             title={darkMode ? "切換亮色模式" : "切換暗色模式"}
@@ -1352,7 +1374,7 @@ function App() {
                       </tr>
                     </thead>
                     <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                      {filteredNodes.map(node => (
+                      {filteredNodes.map((node, idx) => (
                         <tr
                           key={node.node_id}
                           onClick={() => { setSelectedNodeId(node.node_id); setActiveTab('details'); }}
@@ -1366,7 +1388,7 @@ function App() {
                               <Star fill={node.is_favorite ? "currentColor" : "none"} size={18} />
                             </button>
                             {groupDropdownNodeId === node.node_id && (
-                              <div className={`absolute top-full left-4 mt-1 w-32 rounded-lg shadow-xl border z-50 overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                              <div className={`absolute ${idx >= filteredNodes.length - 3 ? 'bottom-full mb-1' : 'top-full mt-1'} left-4 w-32 rounded-lg shadow-xl border z-50 overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
                                 <div className="max-h-48 overflow-y-auto">
                                   {favConfig.groups.map(g => (
                                     <div key={g.id} onClick={(e) => { e.stopPropagation(); assignNodeToGroup(node.node_id, g.id); setGroupDropdownNodeId(null); }} className={`px-3 py-2 text-xs cursor-pointer flex items-center gap-2 transition-colors ${darkMode ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-50 text-slate-700'}`}>
@@ -1539,7 +1561,7 @@ function App() {
                   <div className={`p-4 border-b shrink-0 flex gap-4 overflow-x-auto ${darkMode ? 'bg-slate-800/80 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
                     {/* Top Talkers */}
                     <div className={`flex-1 min-w-[300px] p-4 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
-                      <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Activity size={14}/> Top Talkers (7 days)</h4>
+                      <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><Activity size={14} /> Top Talkers (7 days)</h4>
                       <div className="space-y-2">
                         {chatAnalyticsData.topTalkers.map((t: any, idx: number) => {
                           const n = nodeMap.get(t.from_id);
@@ -1562,7 +1584,7 @@ function App() {
                     </div>
                     {/* Word Cloud */}
                     <div className={`flex-1 min-w-[300px] p-4 rounded-xl border flex flex-col ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
-                      <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><MessageCircle size={14}/> Hot Words (7 days)</h4>
+                      <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-3 flex items-center gap-2"><MessageCircle size={14} /> Hot Words (7 days)</h4>
                       <div className="flex-1 flex flex-wrap content-start gap-2 overflow-y-auto pr-2 custom-scrollbar max-h-[160px]">
                         {chatAnalyticsData.wordCloud.map((w: any, idx: number) => {
                           const maxVal = chatAnalyticsData.wordCloud[0]?.value || 1;
@@ -1887,8 +1909,8 @@ function App() {
                       onSelectNode={handleShowModal}
                       activeTab={activeTab}
                       coverageData={coverageData}
-                    selectedNodePath={selectedNodePath}
-                    showTrackerHistory={showTrackerHistory}
+                      selectedNodePath={selectedNodePath}
+                      showTrackerHistory={showTrackerHistory}
                       showTraceroute={showTraceroute}
                       showHopGrid={showHopGrid}
                     />
@@ -2124,8 +2146,8 @@ function App() {
                               isDetailView={true}
                               onSelectNode={() => { }}
                               coverageData={coverageData}
-                    selectedNodePath={selectedNodePath}
-                    showTrackerHistory={showTrackerHistory}
+                              selectedNodePath={selectedNodePath}
+                              showTrackerHistory={showTrackerHistory}
                               showTraceroute={showTraceroute}
                               showHopGrid={showHopGrid}
                             />
@@ -2447,8 +2469,8 @@ function App() {
                             isDetailView={true}
                             onSelectNode={() => { }}
                             coverageData={coverageData}
-                    selectedNodePath={selectedNodePath}
-                    showTrackerHistory={showTrackerHistory}
+                            selectedNodePath={selectedNodePath}
+                            showTrackerHistory={showTrackerHistory}
                             showTraceroute={showTraceroute}
                             showHopGrid={showHopGrid}
                           />
@@ -2880,10 +2902,55 @@ function App() {
                   <Activity size={12} className="text-orange-500" />
                   連續運行時間: {sysStatus?.uptime ? `${Math.floor(sysStatus.uptime / 3600)}h ${Math.floor((sysStatus.uptime % 3600) / 60)}m` : '--'}
                 </div>
-                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.0</div>
+                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.1</div>
               </div>
             </div>
           </footer>
+        </div>
+      )}
+      {showAnnouncement && (
+        <div className="fixed inset-0 z-[3000] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setShowAnnouncement(false)}></div>
+          <div className={`relative w-full max-w-lg rounded-2xl shadow-2xl border p-6 flex flex-col gap-4 ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
+            <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
+              <h2 className="text-lg font-black text-cyan-500 flex items-center gap-2">
+                <Megaphone size={24} /> {ANNOUNCEMENT_TITLE}
+              </h2>
+              <button onClick={() => setShowAnnouncement(false)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors">
+                <X size={24} />
+              </button>
+            </div>
+
+            <div className={`whitespace-pre-wrap text-sm leading-relaxed max-h-[60vh] overflow-y-auto pr-2 scrollbar-thin ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+              {ANNOUNCEMENT_TEXT}
+            </div>
+
+            <div className="flex justify-between items-center pt-4 border-t border-slate-200 dark:border-slate-800 mt-2">
+              <label className="flex items-center gap-2 cursor-pointer group">
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 rounded border-slate-400 text-cyan-500 focus:ring-cyan-500"
+                  checked={hideAnnouncementNextTime}
+                  onChange={(e) => {
+                    setHideAnnouncementNextTime(e.target.checked);
+                    if (e.target.checked) {
+                      localStorage.setItem('hideAnnouncement_v2_1', 'true');
+                    } else {
+                      localStorage.removeItem('hideAnnouncement_v2_1');
+                    }
+                  }}
+                />
+                <span className={`text-xs font-bold transition-colors ${darkMode ? 'text-slate-400 group-hover:text-slate-200' : 'text-slate-500 group-hover:text-slate-700'}`}>不再顯示此公告</span>
+              </label>
+
+              <button
+                onClick={() => setShowAnnouncement(false)}
+                className={`px-5 py-2 rounded-lg font-bold text-sm transition-colors ${darkMode ? 'bg-slate-800 hover:bg-slate-700 text-slate-200' : 'bg-slate-100 hover:bg-slate-200 text-slate-700'}`}
+              >
+                關閉
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
