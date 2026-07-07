@@ -144,8 +144,7 @@ const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.2！
 7. 封包詳情與節點封包列表新增接收閘道器地圖標示與完整日期時間戳記。
 8. 地圖節點改為滑鼠懸停即顯示簡易資訊卡（含角色、ID、最後活躍、SNR），點擊則進入節點詳情。
 9. 地圖過於靠近的節點自動群組化（Cluster），點擊可展開選擇個別節點，解決重疊點不到的問題。
-10. 邏輯拓樸圖層改為預設關閉，地圖更簡潔；需要時可手動開啟。
-11. 設備綜合電力監測圖表的電壓縱軸，改為依實際數據動態調整並加上緩衝範圍，避免毫伏微小波動讓圖表上下劇烈震盪。
+10. 設備綜合電力監測圖表的電壓縱軸，改為依實際數據動態調整並加上緩衝範圍，避免毫伏微小波動讓圖表上下劇烈震盪。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
@@ -1119,7 +1118,9 @@ function App() {
 
       const now = new Date();
       const nowIso = now.toISOString();
-      const nowTime = now.toLocaleTimeString('zh-TW', { hour12: false });
+      const datePart = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
+      const timePart = now.toLocaleTimeString('zh-TW', { hour12: false });
+      const nowTime = `${datePart} ${timePart}`;
 
       // 1. 一次性更新地圖座標
       setNodes(prev => {
@@ -2553,12 +2554,14 @@ function App() {
                       >
                         <MapPin size={12} /> 節點地圖
                       </button>
+                      {/* 暫時隱藏邏輯拓撲圖層開關
                       <button
                         onClick={() => setShowLogicGraph(!showLogicGraph)}
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showLogicGraph ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
                       >
                         <Share2 size={12} /> 邏輯拓撲
                       </button>
+                      */}
                       <button
                         onClick={() => setShowTraceroute(!showTraceroute)}
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showTraceroute ? 'bg-amber-500 border-amber-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
