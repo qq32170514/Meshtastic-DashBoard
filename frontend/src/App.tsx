@@ -651,8 +651,15 @@ function App() {
     try {
       const res = await fetch('/api/node-status');
       const data = await res.json();
-      setNodes(data);
-      return data;
+      // Ensure SQLite UTC timestamps are parsed correctly in local timezone by appending 'Z'
+      const formattedNodes = data.map((n: any) => ({
+        ...n,
+        last_seen: n.last_seen && n.last_seen.includes(' ') && !n.last_seen.endsWith('Z') 
+          ? n.last_seen.replace(' ', 'T') + 'Z' 
+          : n.last_seen
+      }));
+      setNodes(formattedNodes);
+      return formattedNodes;
     } catch (e) {
       console.error("Failed to fetch node status", e);
       setAppLoading(false);
