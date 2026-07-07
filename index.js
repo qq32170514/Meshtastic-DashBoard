@@ -754,6 +754,18 @@ app.get('/api/neighbors', (req, res) => {
     });
 });
 
+// 提供給前端邏輯拓樸圖層的連線資料
+app.get('/api/topology/fusion-edges', (req, res) => {
+    const query = `
+        SELECT node_id as source_id, neighbor_id as target_id, 80 as confidence, 'NEIGHBOR_INFO' as method, snr
+        FROM neighbors WHERE last_seen > datetime('now', '-2 days')
+    `;
+    db.all(query, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
 // 取得單一節點的歷史封包紀錄
 // 🚀 效能優化：只取列表需要欄位，加快取
 app.get('/api/node/:nodeId/packets', withCache(), (req, res) => {
@@ -1289,9 +1301,15 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     adcVoltage
                 ];
 
-                // 同步更新 nodes 表，確保 Dashboard 數據能正確載入
+                // 同步更新 nodes 表，確保 Dashboard 數據能正確載入 (使用 COALESCE 避免不同 telemetry 互相覆寫)
                 queueDbOp(`
-                        UPDATE nodes SET battery_level = ?, voltage = ?, current = ?, temperature = ?, humidity = ? WHERE node_id = ?
+                        UPDATE nodes SET 
+                            battery_level = COALESCE(?, nodes.battery_level), 
+                            voltage = COALESCE(?, nodes.voltage), 
+                            current = COALESCE(?, nodes.current), 
+                            temperature = COALESCE(?, nodes.temperature), 
+                            humidity = COALESCE(?, nodes.humidity) 
+                        WHERE node_id = ?
                     `, [params[1], finalVoltage, finalCurrent, params[3], params[4], fromId]);
 
                 queueDbOp(sql, params, function (err) {
