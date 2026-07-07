@@ -1,11 +1,12 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import NodeMap from './NodeMap';
 import TelemetryCharts from './TelemetryCharts';
 import PacketTypePieChart from './PacketTypePieChart';
+import TopologyGraph from './TopologyGraph';
 import { throttle } from 'lodash';
 
 export interface Node {
@@ -130,15 +131,25 @@ const PORTNUM_NAMES: Record<string | number, string> = {
 };
 const ITEMS_PER_PAGE = 20;
 
-const ANNOUNCEMENT_TITLE = "📢 v2.1 版本更新公告";
-const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard 最新版本！
+const ANNOUNCEMENT_TITLE = "📢 v2.2 版本更新公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.2！
 
-本次更新包含：
-1. 修復了節點清單最下方「加入最愛」選單會被裁切的問題。
-2. 系統進版至 v2.1，並加入此自訂公告系統。
+本次重大更新包含：
+1. 節點詳情圖表時間跨度選擇（可切換 1天、7天、30天）。
+2. 地圖監控新增最愛節點群組下拉選單與快速篩選。
+3. 修復網頁重新整理（F5）後最愛節點及溫濕度卡片未更新至最新封包資訊的問題。
+4. 地圖新增自定義高度與全螢幕模式，並支援搜尋地圖節點。
+5. 訊號覆蓋範圍及跳轉分析新增日期時間範圍篩選功能。
+6. 節點詳情地圖新增歷史軌跡，並動態繪製與 gateway 的連線。
+7. 封包詳情與節點封包列表新增接收閘道器地圖標示與完整日期時間戳記。
+8. 地圖節點改為滑鼠懸停即顯示簡易資訊卡（含角色、ID、最後活躍、SNR），點擊則進入節點詳情。
+9. 地圖過於靠近的節點自動群組化（Cluster），點擊可展開選擇個別節點，解決重疊點不到的問題。
+10. 邏輯拓樸圖層改為預設關閉，地圖更簡潔；需要時可手動開啟。
+11. 設備綜合電力監測圖表的電壓縱軸，改為依實際數據動態調整並加上緩衝範圍，避免毫伏微小波動讓圖表上下劇烈震盪。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
+
 const socket = io();
 
 function App() {
@@ -173,8 +184,14 @@ function App() {
   const [traceroutePath, setTraceroutePath] = useState<any[]>([]);
   const [selectedNodePath, setSelectedNodePath] = useState<any[]>([]);
   const [showTrackerHistory, setShowTrackerHistory] = useState(false);
-
-
+  const [showSimulator, setShowSimulator] = useState(false);
+  const [fusionEdges, setFusionEdges] = useState<any[]>([]);
+  const [mapFavoriteGroup, setMapFavoriteGroup] = useState<string>('all');
+  const [isMapFullScreen, setIsMapFullScreen] = useState(false);
+  const [mapSearchText, setMapSearchText] = useState('');
+  const [mapCenterCoords, setMapCenterCoords] = useState<[number, number] | undefined>(undefined);
+  const [coverageStartTime, setCoverageStartTime] = useState('');
+  const [coverageEndTime, setCoverageEndTime] = useState('');
   // Pagination states
   const packetsPerPage = 20;
   const [globalPacketsCurrentPage, setGlobalPacketsCurrentPage] = useState(1);
@@ -393,7 +410,7 @@ function App() {
 
 
   // 地圖圖層開關與資料
-  const [showTopology, setShowTopology] = useState(false);
+  const [showLogicGraph, setShowLogicGraph] = useState(false);
   const [showNodes, setShowNodes] = useState(true);
   const [showUtilization, setShowUtilization] = useState(false);
   const [neighbors, setNeighbors] = useState<any[]>([]);
@@ -403,9 +420,15 @@ function App() {
   const [nodeListSearchQuery, setNodeListSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState('base');
   const [showAnnouncement, setShowAnnouncement] = useState(() => {
-    return localStorage.getItem('hideAnnouncement_v2_1') !== 'true';
+    return localStorage.getItem('hideAnnouncement_v2_2') !== 'true';
   });
   const [hideAnnouncementNextTime, setHideAnnouncementNextTime] = useState(false);
+
+  // --- SNR 加權動態 Hop 覆蓋範圍模擬器狀態 ---
+  const [simState, setSimState] = useState({ sourceNodeId: '', maxHops: 3, minSnr: -20 });
+  const [simResultMap, setSimResultMap] = useState<Map<string, { hop: number, pathSnr: number }>>(new Map());
+  const [simSearchText, setSimSearchText] = useState('');
+
 
   const [globalFilter, setGlobalFilter] = useState({
     port: 'ALL',
@@ -574,6 +597,22 @@ function App() {
       .map(n => ({ ...n, is_favorite: 1 }));
   }, [nodes, currentGroupNodeIds]);
 
+  const mapNodes = useMemo(() => {
+    if (!mapShowFavoritesOnly) return nodes;
+    let allowedIds = new Set<string>();
+    if (mapFavoriteGroup === 'all') {
+      allowedIds = favoriteIdSet;
+    } else if (mapFavoriteGroup === 'ungrouped') {
+      allowedIds = new Set(favConfig.ungrouped);
+    } else {
+      const g = favConfig.groups.find(group => group.id === mapFavoriteGroup);
+      allowedIds = new Set(g?.nodeIds || []);
+    }
+    return nodes
+      .filter(n => allowedIds.has(n.node_id))
+      .map(n => ({ ...n, is_favorite: 1 }));
+  }, [nodes, mapShowFavoritesOnly, mapFavoriteGroup, favoriteIdSet, favConfig]);
+
   const chatMessages = useMemo(() => {
     const liveMsgs = packets
       .filter(p => (PORTNUM_NAMES[p.portnum] === 'TEXT_MESSAGE' || p.portnum === '1' || p.portnum === 1) && p.payload_json?.text && p.payload_json?.channel_name === currentChatChannel)
@@ -683,7 +722,10 @@ function App() {
         topic: p.topic,
         time: (() => {
           const dateStr = p.timestamp.includes(' ') ? p.timestamp.replace(' ', 'T') + 'Z' : p.timestamp;
-          return new Date(dateStr).toLocaleTimeString('zh-TW', { hour12: false });
+          const d = new Date(dateStr);
+          const datePart = `${d.getFullYear()}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getDate().toString().padStart(2, '0')}`;
+          const timePart = d.toLocaleTimeString('zh-TW', { hour12: false });
+          return `${datePart} ${timePart}`;
         })(),
         timestamp: p.timestamp,
         snr: p.snr,
@@ -965,9 +1007,9 @@ function App() {
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
   useEffect(() => { currentChatChannelRef.current = currentChatChannel; }, [currentChatChannel]);
 
-  // 🚀 Fetch Tracker History
+  // 🚀 Fetch Tracker History (Always load path for the selected node when selected)
   useEffect(() => {
-    if (showTrackerHistory && selectedNodeId) {
+    if (selectedNodeId) {
       fetch(`/api/node-path/${encodeURIComponent(selectedNodeId)}`)
         .then(res => res.json())
         .then(data => {
@@ -977,7 +1019,24 @@ function App() {
     } else {
       setSelectedNodePath([]);
     }
-  }, [selectedNodeId, showTrackerHistory]);
+  }, [selectedNodeId]);
+
+  const fetchCoverageGridData = useCallback(async (start?: string, end?: string) => {
+    let url = '/api/coverage/griddata';
+    const params = [];
+    if (start) params.push(`timeStart=${encodeURIComponent(start.replace('T', ' '))}`);
+    if (end) params.push(`timeEnd=${encodeURIComponent(end.replace('T', ' '))}`);
+    if (params.length > 0) {
+      url += '?' + params.join('&');
+    }
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      setCoverageData(data);
+    } catch (e) {
+      console.error("Failed to fetch coverage grid data", e);
+    }
+  }, []);
 
   // 🚀 Fetch Chat Analytics
   useEffect(() => {
@@ -1126,15 +1185,15 @@ function App() {
     socket.on('telemetry_update', (data) => {
       setNodes(prev => prev.map(n => n.node_id === data.node_id ? {
         ...n,
-        battery_level: data.battery_level,
-        voltage: data.voltage,
-        current: data.current,
-        snr: data.snr,
-        rssi: data.rssi,
-        air_util_tx: data.air_util_tx,
-        channel_utilization: data.channel_utilization,
-        temperature: data.temperature,
-        humidity: data.humidity
+        battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : n.battery_level,
+        voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : n.voltage,
+        current: data.current !== undefined && data.current !== null ? data.current : n.current,
+        snr: data.snr !== undefined && data.snr !== null ? data.snr : n.snr,
+        rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : n.rssi,
+        air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : n.air_util_tx,
+        channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : n.channel_utilization,
+        temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : n.temperature,
+        humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : n.humidity
       } : n));
     });
 
@@ -1148,15 +1207,15 @@ function App() {
           if (idx !== -1) {
             next[idx] = {
               ...next[idx],
-              battery_level: data.battery_level,
-              voltage: data.voltage,
-              current: data.current,
-              snr: data.snr,
-              rssi: data.rssi,
-              air_util_tx: data.air_util_tx,
-              channel_utilization: data.channel_utilization,
-              temperature: data.temperature,
-              humidity: data.humidity
+              battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : next[idx].battery_level,
+              voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : next[idx].voltage,
+              current: data.current !== undefined && data.current !== null ? data.current : next[idx].current,
+              snr: data.snr !== undefined && data.snr !== null ? data.snr : next[idx].snr,
+              rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : next[idx].rssi,
+              air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : next[idx].air_util_tx,
+              channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : next[idx].channel_utilization,
+              temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : next[idx].temperature,
+              humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : next[idx].humidity
             };
             changed = true;
           }
@@ -1166,7 +1225,7 @@ function App() {
     });
 
     // 抓取網格化聚合數據
-    fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData);
+    fetchCoverageGridData(coverageStartTime, coverageEndTime);
 
     // 抓取 Traceroute 數據
     const fetchTraceroute = () => fetch('/api/traceroute/latest').then(res => res.json()).then(setTraceroutePath);
@@ -1174,7 +1233,7 @@ function App() {
 
     const sysInterval = setInterval(refreshDashboardData, 30000);
     const coverageInterval = setInterval(() => {
-      fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData);
+      fetchCoverageGridData(coverageStartTime, coverageEndTime);
     }, 120000); // 每 2 分鐘更新一次地圖背景點位
     const tracerouteInterval = setInterval(fetchTraceroute, 60000); // 每分鐘更新最新路徑
 
@@ -1205,6 +1264,75 @@ function App() {
     const favInterval = setInterval(() => fetchFavoritePackets(favPacketsCurrentPage, favLogFilter, nodes), 60000);
     return () => clearInterval(favInterval);
   }, [fetchFavoritePackets, favPacketsCurrentPage, favLogFilter, nodes]);
+
+  const fetchFusionEdges = useCallback(async () => {
+    try {
+      const res = await fetch('/api/topology/fusion-edges');
+      const data = await res.json();
+      setFusionEdges(data);
+    } catch (e) { console.error("Fusion edges load failed", e); }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'map' || activeTab === 'topology') {
+      fetchFusionEdges();
+      const interval = setInterval(fetchFusionEdges, 2 * 60 * 1000); // 2 minutes
+      return () => clearInterval(interval);
+    }
+  }, [activeTab, fetchFusionEdges]);
+
+  // --- SNR 加權動態 Hop 覆蓋範圍模擬演算法 (Multi-Source Topology Fusion) ---
+  const calculateWeightedReachability = useCallback(() => {
+    if (!simState.sourceNodeId || activeTab !== 'map') {
+      setSimResultMap(new Map());
+      return;
+    }
+
+    const adj = new Map<string, { id: string, snr: number }[]>();
+
+    // 將 fusionEdges 轉換為雙向圖以利涵蓋率模擬
+    fusionEdges.forEach(edge => {
+      if (!adj.has(edge.source_id)) adj.set(edge.source_id, []);
+      adj.get(edge.source_id)!.push({ id: edge.target_id, snr: edge.snr });
+
+      if (!adj.has(edge.target_id)) adj.set(edge.target_id, []);
+      adj.get(edge.target_id)!.push({ id: edge.source_id, snr: edge.snr });
+    });
+
+    const result = new Map<string, { hop: number, pathSnr: number }>();
+    const queue = [{ id: simState.sourceNodeId, hop: 0, pathSnr: Infinity }];
+    result.set(simState.sourceNodeId, { hop: 0, pathSnr: Infinity });
+
+    while (queue.length > 0) {
+      const { id, hop, pathSnr } = queue.shift()!;
+
+      const recorded = result.get(id);
+      if (recorded && (recorded.hop < hop || (recorded.hop === hop && recorded.pathSnr > pathSnr))) {
+        continue;
+      }
+
+      if (hop >= simState.maxHops) continue;
+
+      const nextNodes = adj.get(id) || [];
+      for (const next of nextNodes) {
+        if (next.snr < simState.minSnr) continue;
+
+        const nextHop = hop + 1;
+        const nextPathSnr = Math.min(pathSnr, next.snr);
+
+        const existing = result.get(next.id);
+        if (!existing || nextHop < existing.hop || (nextHop === existing.hop && nextPathSnr > existing.pathSnr)) {
+          result.set(next.id, { hop: nextHop, pathSnr: nextPathSnr });
+          queue.push({ id: next.id, hop: nextHop, pathSnr: nextPathSnr });
+        }
+      }
+    }
+    setSimResultMap(result);
+  }, [simState, fusionEdges, activeTab]);
+
+  useEffect(() => {
+    calculateWeightedReachability();
+  }, [calculateWeightedReachability]);
 
   useEffect(() => {
     if (activeTab === 'chat' && unreadChannels[currentChatChannel]) {
@@ -1631,7 +1759,7 @@ function App() {
                               <span className="text-[9px] text-slate-500 font-mono">
                                 {(() => {
                                   const dateStr = msg.timestamp.includes(' ') ? msg.timestamp.replace(' ', 'T') + 'Z' : msg.timestamp;
-                                  return new Date(dateStr).toLocaleTimeString('zh-TW', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                                  return new Date(dateStr).toLocaleString('zh-TW', { hour12: false });
                                 })()}
                               </span>
                               {isFavorite && <span className="text-[10px] font-bold text-yellow-500">YOU (FAV)</span>}
@@ -1913,6 +2041,8 @@ function App() {
                       showTrackerHistory={showTrackerHistory}
                       showTraceroute={showTraceroute}
                       showHopGrid={showHopGrid}
+                      simResultMap={simResultMap}
+                      simState={simState}
                     />
                   </div>
                 </div>
@@ -2147,7 +2277,7 @@ function App() {
                               onSelectNode={() => { }}
                               coverageData={coverageData}
                               selectedNodePath={selectedNodePath}
-                              showTrackerHistory={showTrackerHistory}
+                              showTrackerHistory={true}
                               showTraceroute={showTraceroute}
                               showHopGrid={showHopGrid}
                             />
@@ -2332,8 +2462,81 @@ function App() {
               </div>
             )}
 
+            {activeTab === 'topology' && (
+              <div className="w-full h-[75vh]">
+                <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+              </div>
+            )}
+
             {activeTab === 'map' && (
               <div className="space-y-6">
+                {showSimulator && (
+                  <div className={`rounded-xl border shadow-sm p-4 ${darkMode ? 'bg-slate-900 border-slate-800 text-slate-300' : 'bg-white border-slate-200'}`}>
+                    <div className="flex flex-wrap items-center gap-6">
+                      <div className="flex items-center gap-2">
+                        <Signal size={16} className="text-cyan-500" />
+                        <span className="text-sm font-black uppercase tracking-widest text-cyan-500">動態覆蓋模擬器</span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs font-bold text-slate-500">發射源:</label>
+                        <input
+                          list="sim-nodes-list"
+                          placeholder="搜尋或選擇節點"
+                          value={simSearchText}
+                          onChange={e => {
+                            const val = e.target.value;
+                            setSimSearchText(val);
+                            const match = val.match(/\((![a-fA-F0-9]+)\)/);
+                            if (match) {
+                              setSimState(s => ({ ...s, sourceNodeId: match[1] }));
+                            } else {
+                              if (val.startsWith('!') && val.length > 5) {
+                                setSimState(s => ({ ...s, sourceNodeId: val }));
+                              } else {
+                                setSimState(s => ({ ...s, sourceNodeId: '' }));
+                              }
+                            }
+                          }}
+                          className={`text-xs p-1.5 rounded border outline-none w-[180px] ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-slate-50 border-slate-200 text-slate-700'}`}
+                        />
+                        <datalist id="sim-nodes-list">
+                          {nodes.filter(n => n.latitude && n.longitude).map(n => (
+                            <option key={n.node_id} value={`${n.long_name || n.node_id} (${n.node_id})`} />
+                          ))}
+                        </datalist>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs font-bold text-slate-500">最大跳數 (Hops): {simState.maxHops}</label>
+                        <input
+                          type="range" min="1" max="7"
+                          value={simState.maxHops}
+                          onChange={e => setSimState(s => ({ ...s, maxHops: parseInt(e.target.value) }))}
+                          className="w-24 accent-cyan-500"
+                        />
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs font-bold text-slate-500">SNR 門檻: {simState.minSnr}</label>
+                        <input
+                          type="range" min="-25" max="10"
+                          value={simState.minSnr}
+                          onChange={e => setSimState(s => ({ ...s, minSnr: parseInt(e.target.value) }))}
+                          className="w-24 accent-cyan-500"
+                        />
+                      </div>
+
+                      <button
+                        onClick={() => { setSimState({ sourceNodeId: '', maxHops: 3, minSnr: -20 }); setSimSearchText(''); }}
+                        className={`ml-auto px-3 py-1.5 rounded text-[10px] font-black uppercase tracking-widest transition-colors ${darkMode ? 'bg-slate-800 hover:bg-slate-700 text-slate-400' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`}
+                      >
+                        清除模擬
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className={`rounded-xl border shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800 text-slate-300' : 'bg-white border-slate-200'}`}>
                   <div className="p-4 flex flex-wrap justify-between items-center gap-4">
                     <div className="flex gap-4 items-center">
@@ -2342,6 +2545,12 @@ function App() {
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showNodes ? 'bg-blue-500 border-blue-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
                       >
                         <MapPin size={12} /> 節點地圖
+                      </button>
+                      <button
+                        onClick={() => setShowLogicGraph(!showLogicGraph)}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showLogicGraph ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                      >
+                        <Share2 size={12} /> 邏輯拓撲
                       </button>
                       <button
                         onClick={() => setShowTraceroute(!showTraceroute)}
@@ -2361,37 +2570,206 @@ function App() {
                       >
                         <Activity size={12} /> 歷史軌跡
                       </button>
+                      {/* 暫時隱藏 2.2 版不成熟的覆蓋模擬功能
+                      <button
+                        onClick={() => setShowSimulator(!showSimulator)}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showSimulator ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                      >
+                        <Signal size={12} /> 覆蓋模擬
+                      </button>
+                      */}
                     </div>
-                    <div className={`flex rounded-lg p-1 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
-                      <button
-                        onClick={() => setMapShowFavoritesOnly(false)}
-                        className={`px-6 py-1.5 text-xs font-black uppercase tracking-widest rounded-md transition-all ${!mapShowFavoritesOnly ? 'bg-cyan-500 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}
-                      >
-                        顯示全部
-                      </button>
-                      <button
-                        onClick={() => setMapShowFavoritesOnly(true)}
-                        className={`px-6 py-1.5 text-xs font-black uppercase tracking-widest rounded-md transition-all ${mapShowFavoritesOnly ? 'bg-cyan-500 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}
-                      >
-                        最愛節點
-                      </button>
+                    <div className="flex items-center gap-3">
+                      {/* 搜尋節點 */}
+                      <div className="relative flex items-center">
+                        <Search className="absolute left-2.5 text-slate-500 pointer-events-none" size={12} />
+                        <input
+                          type="text"
+                          placeholder="搜尋地圖上的節點..."
+                          value={mapSearchText}
+                          onChange={(e) => {
+                            setMapSearchText(e.target.value);
+                            if (!e.target.value) {
+                              setMapCenterCoords(undefined);
+                            }
+                          }}
+                          className={`pl-8 pr-6 py-1.5 rounded-lg border text-[10px] outline-none w-44 transition-all focus:ring-1 focus:ring-cyan-500 ${
+                            darkMode 
+                              ? 'bg-slate-800 border-slate-700 text-slate-200 placeholder-slate-600' 
+                              : 'bg-white border-slate-200 text-slate-700 placeholder-slate-400'
+                          }`}
+                        />
+                        {mapSearchText && (
+                          <button 
+                            onClick={() => { setMapSearchText(''); setMapCenterCoords(undefined); }}
+                            className="absolute right-2 text-slate-400 hover:text-slate-200 text-[10px]"
+                          >
+                            ✕
+                          </button>
+                        )}
+                        
+                        {/* 搜尋結果選單 */}
+                        {mapSearchText && (() => {
+                          const searchLower = mapSearchText.toLowerCase();
+                          const matched = nodes
+                            .filter(n => n.latitude && n.longitude)
+                            .filter(n => 
+                              n.node_id.toLowerCase().includes(searchLower) ||
+                              (n.long_name || '').toLowerCase().includes(searchLower) ||
+                              (n.short_name || '').toLowerCase().includes(searchLower)
+                            )
+                            .slice(0, 5);
+                          
+                          if (matched.length === 0) return null;
+                          return (
+                            <div className={`absolute top-full left-0 right-0 mt-1 rounded-lg border shadow-xl z-[3000] overflow-hidden max-h-48 overflow-y-auto ${
+                              darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'
+                            }`}>
+                              {matched.map(n => (
+                                <button
+                                  key={n.node_id}
+                                  onClick={() => {
+                                    setMapCenterCoords([n.latitude!, n.longitude!]);
+                                    setMapSearchText(`${n.long_name || n.short_name || n.node_id} (${n.node_id})`);
+                                  }}
+                                  className={`w-full text-left px-3 py-2 text-[10px] font-bold transition-colors border-b last:border-0 ${
+                                    darkMode 
+                                      ? 'hover:bg-slate-700 text-slate-200 border-slate-700/50' 
+                                      : 'hover:bg-slate-100 text-slate-700 border-slate-100'
+                                  }`}
+                                >
+                                  <div className="truncate font-black">{n.long_name || 'Unknown'} ({n.short_name || '??'})</div>
+                                  <div className="text-[8px] text-slate-500 font-mono">{n.node_id} | {n.role || 'CLIENT'}</div>
+                                </button>
+                              ))}
+                            </div>
+                          );
+                        })()}
+                      </div>
+
+                      <div className={`flex items-center rounded-lg p-1 gap-2 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+                        <button
+                          onClick={() => setMapShowFavoritesOnly(false)}
+                          className={`px-4 py-1.5 text-xs font-black uppercase tracking-widest rounded-md transition-all ${!mapShowFavoritesOnly ? 'bg-cyan-500 text-white shadow-md' : 'text-slate-400 hover:text-slate-600'}`}
+                        >
+                          顯示全部
+                        </button>
+                        <div className="relative flex items-center">
+                          <select
+                            value={mapShowFavoritesOnly ? mapFavoriteGroup : 'none'}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              if (val === 'none') {
+                                setMapShowFavoritesOnly(false);
+                              } else {
+                                setMapShowFavoritesOnly(true);
+                                setMapFavoriteGroup(val);
+                              }
+                            }}
+                            className={`px-3 py-1.5 text-xs font-black uppercase tracking-widest rounded-md border-none outline-none cursor-pointer transition-all ${
+                              mapShowFavoritesOnly 
+                                ? 'bg-cyan-500 text-white shadow-md' 
+                                : darkMode ? 'bg-slate-800 text-slate-400 hover:text-slate-200' : 'bg-slate-100 text-slate-500 hover:text-slate-700'
+                            }`}
+                          >
+                            <option value="none" className={darkMode ? 'bg-slate-900 text-slate-300' : 'bg-white text-slate-700'}>
+                              最愛節點 (關閉)
+                            </option>
+                            <option value="all" className={darkMode ? 'bg-slate-900 text-slate-300' : 'bg-white text-slate-700'}>
+                              ⭐ 顯示所有最愛
+                            </option>
+                            {favConfig.groups.map(g => (
+                              <option key={g.id} value={g.id} className={darkMode ? 'bg-slate-900 text-slate-300' : 'bg-white text-slate-700'}>
+                                🏷️ 最愛: {g.name}
+                              </option>
+                            ))}
+                            {favConfig.ungrouped.length > 0 && (
+                              <option value="ungrouped" className={darkMode ? 'bg-slate-900 text-slate-300' : 'bg-white text-slate-700'}>
+                                📁 最愛: 未分組
+                              </option>
+                            )}
+                          </select>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
 
+                {/* 覆蓋圖日期篩選 */}
+                {(showTraceroute || showHopGrid) && (
+                  <div className={`p-3 rounded-xl border flex flex-wrap items-center gap-3 text-xs mb-3 ${darkMode ? 'bg-slate-900/50 border-slate-800 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+                    <span className="font-black text-[10px] uppercase tracking-wider text-cyan-500 flex items-center gap-1">
+                      📅 訊號覆蓋日期範圍篩選:
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="datetime-local"
+                        value={coverageStartTime}
+                        onChange={(e) => setCoverageStartTime(e.target.value)}
+                        className={`px-2 py-1 rounded text-[10px] outline-none border ${
+                          darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-200 text-slate-700'
+                        }`}
+                      />
+                      <span>~</span>
+                      <input
+                        type="datetime-local"
+                        value={coverageEndTime}
+                        onChange={(e) => setCoverageEndTime(e.target.value)}
+                        className={`px-2 py-1 rounded text-[10px] outline-none border ${
+                          darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-200 text-slate-700'
+                        }`}
+                      />
+                      <button
+                        onClick={() => fetchCoverageGridData(coverageStartTime, coverageEndTime)}
+                        className="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-black rounded transition-colors"
+                      >
+                        應用篩選
+                      </button>
+                      <button
+                        onClick={() => {
+                          setCoverageStartTime('');
+                          setCoverageEndTime('');
+                          fetchCoverageGridData('', '');
+                        }}
+                        className={`px-2 py-1 text-[10px] font-black rounded transition-colors ${
+                          darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
+                        }`}
+                      >
+                        重置
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
-                  Map Visualization: {mapShowFavoritesOnly ? favoriteNodes.length : nodes.length} Nodes
+                  Map Visualization: {mapNodes.length} Nodes
                 </div>
 
-                <div className={`w-full h-[70vh] rounded-2xl overflow-hidden border shadow-sm relative transition-colors ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
+                <div className={`w-full rounded-2xl overflow-hidden border shadow-sm relative transition-all duration-300 ${
+                  isMapFullScreen 
+                    ? 'fixed inset-0 z-[2000] h-screen w-screen rounded-none' 
+                    : 'h-[70vh]'
+                } ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
+                  {/* Floating Fullscreen / Minimize Button */}
+                  <button
+                    onClick={() => setIsMapFullScreen(!isMapFullScreen)}
+                    className={`absolute top-4 right-4 z-[1000] p-2.5 rounded-xl shadow-lg border transition-all duration-200 hover:scale-105 ${
+                      darkMode 
+                        ? 'bg-slate-900/90 border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800' 
+                        : 'bg-white/90 border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                    }`}
+                    title={isMapFullScreen ? "退出全螢幕" : "全螢幕模式"}
+                  >
+                    {isMapFullScreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                  </button>
+
                   <NodeMap
-                    nodes={mapShowFavoritesOnly ? favoriteNodes : nodes}
+                    nodes={mapNodes}
                     allNodes={nodes}
                     onSelectNode={handleShowModal}
                     activeTab={activeTab}
                     onShowDetail={handleShowModal}
                     showNodes={showNodes}
-                    showTopology={showTopology}
                     showUtilization={showUtilization}
                     showTraceroute={showTraceroute}
                     showHopGrid={showHopGrid}
@@ -2400,8 +2778,22 @@ function App() {
                     coverageData={coverageData}
                     selectedNodePath={selectedNodePath}
                     showTrackerHistory={showTrackerHistory}
+                    showSimulator={showSimulator}
+                    simResultMap={simResultMap}
+                    simState={simState}
+                    showLogicGraph={showLogicGraph}
+                    fusionEdges={fusionEdges}
+                    isMapFullScreen={isMapFullScreen}
+                    mapCenter={mapCenterCoords}
                   />
                 </div>
+
+                {/* 邏輯拓撲圖層 */}
+                {showLogicGraph && (
+                  <div className={`mt-6 w-full h-[75vh] rounded-2xl overflow-hidden border shadow-sm relative transition-colors ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
+                    <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+                  </div>
+                )}
               </div>
             )}
 
@@ -2470,7 +2862,7 @@ function App() {
                             onSelectNode={() => { }}
                             coverageData={coverageData}
                             selectedNodePath={selectedNodePath}
-                            showTrackerHistory={showTrackerHistory}
+                            showTrackerHistory={true}
                             showTraceroute={showTraceroute}
                             showHopGrid={showHopGrid}
                           />
@@ -2606,9 +2998,7 @@ function App() {
                   </div>
                 </div>
               </div>
-            )}
-
-            {activeTab === 'logs' && (
+            )}            {activeTab === 'logs' && (
               <div className="space-y-6 text-sm">
                 <div className={`rounded-xl shadow-sm border overflow-hidden ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
                   <div className={`p-4 border-b flex justify-between items-center ${darkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
@@ -2764,7 +3154,7 @@ function App() {
                     </div>
                   </div>
 
-                  <div className={`w-full h-80 border-b relative ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <div className={`mt-6 w-full h-80 border-b relative ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
                     <NodeMap
                       nodes={[]}
                       allNodes={nodes}
@@ -2852,6 +3242,75 @@ function App() {
                       </div>
                     </div>
 
+                    {/* 📡 收到該封包的 Gateway 地圖視覺化 */}
+                    {(() => {
+                      const gwNode = nodes.find(n => n.node_id === selectedPacket.gateway_id);
+                      const senderNode = nodes.find(n => n.node_id === selectedPacket.from);
+                      const gwLat = gwNode?.latitude;
+                      const gwLng = gwNode?.longitude;
+                      const senderLat = senderNode?.latitude;
+                      const senderLng = senderNode?.longitude;
+
+                      const hasGwGps = gwLat && gwLng;
+                      const hasSenderGps = senderLat && senderLng;
+
+                      if (!hasGwGps && !hasSenderGps) return null;
+
+                      const mapCenter: [number, number] = hasGwGps ? [gwLat, gwLng] : [senderLat!, senderLng!];
+                      return (
+                        <div className="space-y-2">
+                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
+                            收發地理路徑 Map (Gateway: {selectedPacket.gateway_id || 'Unknown'})
+                          </span>
+                          <div className="h-44 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
+                            <MapContainer 
+                              key={`pkt-map-${selectedPacket.id || selectedPacket.timestamp}`}
+                              center={mapCenter} 
+                              zoom={11} 
+                              style={{ height: '100%', width: '100%' }} 
+                              zoomControl={false}
+                            >
+                              <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                              {hasGwGps && (
+                                <CircleMarker 
+                                  center={[gwLat, gwLng]} 
+                                  radius={6} 
+                                  pathOptions={{ fillColor: '#ef4444', color: 'white', weight: 1.5, fillOpacity: 0.9 }}
+                                >
+                                  <Popup>
+                                    <div className="text-[10px] font-sans">
+                                      接收閘道器 Gateway: <strong>{gwNode.short_name || gwNode.node_id}</strong>
+                                    </div>
+                                  </Popup>
+                                </CircleMarker>
+                              )}
+                              {hasSenderGps && (
+                                <CircleMarker 
+                                  center={[senderLat, senderLng]} 
+                                  radius={6} 
+                                  pathOptions={{ fillColor: '#3b82f6', color: 'white', weight: 1.5, fillOpacity: 0.9 }}
+                                >
+                                  <Popup>
+                                    <div className="text-[10px] font-sans">
+                                      發送節點 Sender: <strong>{senderNode.short_name || senderNode.node_id}</strong>
+                                    </div>
+                                  </Popup>
+                                </CircleMarker>
+                              )}
+                              {hasGwGps && hasSenderGps && (
+                                <Polyline 
+                                  positions={[[senderLat, senderLng], [gwLat, gwLng]]} 
+                                  color="#10b981" 
+                                  weight={2} 
+                                  dashArray="4, 4"
+                                />
+                              )}
+                            </MapContainer>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
                     {/* 🚀 使用懶加載的 detail 資料渲染視覺化 */}
                     {selectedPacketDetail && renderPacketVisualizer({ ...selectedPacket, payload_json: selectedPacketDetail.payload_json, rawData: selectedPacketDetail.rawData })}
 
@@ -2902,7 +3361,7 @@ function App() {
                   <Activity size={12} className="text-orange-500" />
                   連續運行時間: {sysStatus?.uptime ? `${Math.floor(sysStatus.uptime / 3600)}h ${Math.floor((sysStatus.uptime % 3600) / 60)}m` : '--'}
                 </div>
-                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.1</div>
+                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.2</div>
               </div>
             </div>
           </footer>
@@ -2934,9 +3393,9 @@ function App() {
                   onChange={(e) => {
                     setHideAnnouncementNextTime(e.target.checked);
                     if (e.target.checked) {
-                      localStorage.setItem('hideAnnouncement_v2_1', 'true');
+                      localStorage.setItem('hideAnnouncement_v2_2', 'true');
                     } else {
-                      localStorage.removeItem('hideAnnouncement_v2_1');
+                      localStorage.removeItem('hideAnnouncement_v2_2');
                     }
                   }}
                 />
