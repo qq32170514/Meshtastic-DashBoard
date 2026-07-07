@@ -30,30 +30,40 @@ interface Telemetry {
 
 export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { nodeId: string, socket: any, node?: any, darkMode?: boolean }) {
   const [history, setHistory] = useState<Telemetry[]>([]);
+  const [days, setDays] = useState<number>(1); // 1, 7, or 30 days
 
   useEffect(() => {
+    // 根據天數設定限制，避免數據過多
+    let limit = 150;
+    if (days === 7) limit = 500;
+    if (days === 30) limit = 1500;
+
     // 抓取歷史數據
-    fetch(`/api/telemetry?node_id=${encodeURIComponent(nodeId)}&limit=20`)
+    fetch(`/api/telemetry?node_id=${encodeURIComponent(nodeId)}&days=${days}&limit=${limit}`)
       .then(res => res.json())
       .then(data => setHistory(data.reverse()));
 
     // 監聽即時更新
     const handleUpdate = (data: any) => {
       if (data.node_id === nodeId) {
-        setHistory(prev => [...prev, { 
-          ...data, 
-          voltage: data.voltage || 0,
-          current: data.current || 0,
-          air_util_tx: data.air_util_tx || 0,
-          channel_utilization: data.channel_utilization || 0,
-          adc_voltage: data.adc_voltage || 0
-        }].slice(-30));
+        setHistory(prev => {
+          const newHistory = [...prev, { 
+            ...data, 
+            voltage: data.voltage || 0,
+            current: data.current || 0,
+            air_util_tx: data.air_util_tx || 0,
+            channel_utilization: data.channel_utilization || 0,
+            adc_voltage: data.adc_voltage || 0
+          }];
+          // 根據不同時間跨度保留歷史數量
+          return newHistory.slice(-limit);
+        });
       }
     };
 
     socket.on('telemetry_update', handleUpdate);
     return () => socket.off('telemetry_update', handleUpdate);
-  }, [nodeId, socket]);
+  }, [nodeId, socket, days]);
 
   const commonOptions = {
     responsive: true,
@@ -68,7 +78,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
       x: { 
         display: true,
         grid: { color: 'rgba(148, 163, 184, 0.1)' }, 
-        ticks: { color: '#64748b', font: { size: 9, weight: 'bold' }, maxRotation: 0, autoSkip: true, maxTicksLimit: 5 } 
+        ticks: { color: '#64748b', font: { size: 9, weight: 'bold' }, maxRotation: 0, autoSkip: true, maxTicksLimit: 6 } 
       },
       y: { 
         grid: { color: 'rgba(148, 163, 184, 0.1)' },
@@ -79,7 +89,11 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
 
   const labels = history.map(h => {
     const dateStr = h.timestamp.includes(' ') ? h.timestamp.replace(' ', 'T') + 'Z' : h.timestamp;
-    return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const d = new Date(dateStr);
+    if (days > 1) {
+      return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`;
+    }
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
   });
 
   // 圖表 1: 電池與通道佔用率
@@ -88,21 +102,30 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     datasets: [
       { label: '電池 (%)', data: history.map(h => h.battery_level), borderColor: '#22c55e', backgroundColor: '#22c55e20', fill: true, tension: 0.4, yAxisID: 'y' },
       { label: 'ADC電壓 (V)', data: history.map(h => h.adc_voltage), borderColor: '#8b5cf6', backgroundColor: '#8b5cf620', fill: false, tension: 0.4, yAxisID: 'y' },
-      { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4, yAxisID: 'y1' }, // Added units to label
+      { label: 'AU (%)', data: history.map(h => h.air_util_tx), borderColor: '#3b82f6', tension: 0.4, yAxisID: 'y1' },
       { label: 'CU (%)', data: history.map(h => h.channel_utilization), borderColor: '#a855f7', tension: 0.4, yAxisID: 'y1' },
     ]
   };
 
-  // 圖表 2: 綜合電力監測 (電壓 + 電流) - 整合至 Q3
+  // 圖表 2: 綜合電力監測 (電壓 + 電流)
   const powerChartData = {
     labels,
-    datasets: [ // Ensure only I2C voltage/current is displayed, added units to label
+    datasets: [
       { label: '電壓 (V)', data: history.map(h => h.voltage), borderColor: '#f59e0b', backgroundColor: '#f59e0b20', fill: true, tension: 0.4, yAxisID: 'y' },
       { label: '電流 (mA)', data: history.map(h => h.current), borderColor: '#10b981', backgroundColor: '#10b98110', fill: false, tension: 0.4, yAxisID: 'y1' },
     ]
   };
 
-  // 針對電力圖表的特殊配置 (雙 Y 軸)
+  // 针對電力圖表的特殊配置 (雙 Y 軸)
+  // 電壓 Y 軸：動態計算實際數據範圍 + ±0.5V padding，避免幾 mV 波動就占滿整張圖
+  const voltageValues = history.map(h => h.voltage).filter(v => v != null && v > 0);
+  const voltageMin = voltageValues.length > 0
+    ? Math.max(0, Math.floor((Math.min(...voltageValues) - 0.5) * 10) / 10)
+    : undefined;
+  const voltageMax = voltageValues.length > 0
+    ? Math.ceil((Math.max(...voltageValues) + 0.5) * 10) / 10
+    : undefined;
+
   const powerOptions = {
     ...commonOptions,
     plugins: {
@@ -114,8 +137,13 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     },
     scales: {
       ...commonOptions.scales,
-      // Battery chart has two Y-axes
-      y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } },
+      y: {
+        ...commonOptions.scales.y,
+        position: 'left' as const,
+        title: { display: false },
+        ...(voltageMin !== undefined ? { suggestedMin: voltageMin } : {}),
+        ...(voltageMax !== undefined ? { suggestedMax: voltageMax } : {}),
+      },
       y1: { 
         position: 'right' as const, 
         grid: { drawOnChartArea: false }, 
@@ -137,81 +165,105 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     },
     scales: {
       ...commonOptions.scales,
-      y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } }, // Battery level
-      y1: { position: 'right' as const, grid: { drawOnChartArea: false }, ticks: { color: '#3b82f6', font: { size: 9 } }, suggestedMin: 0, max: 100 } // AU/CU
+      y: { ...commonOptions.scales.y, position: 'left' as const, title: { display: false } },
+      y1: { position: 'right' as const, grid: { drawOnChartArea: false }, ticks: { color: '#3b82f6', font: { size: 9 } }, suggestedMin: 0, max: 100 }
     }
   };
 
   // 圖表 3: 環境監測
   const envChartData = {
     labels,
-    datasets: [ // Added units to labels
+    datasets: [
       { label: '溫度 (°C)', data: history.map(h => h.temperature), borderColor: '#ef4444', tension: 0.4 },
       { label: '濕度 (%)', data: history.map(h => h.humidity), borderColor: '#06b6d4', tension: 0.4 },
     ]
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-10">
-      {/* 象限 1: 左上 - 電池與通道 */}
-      <div className="h-56 col-start-1 row-start-1">
-        <div className="flex justify-between items-center mb-2"> {/* Added units to labels */}
-          <span className="text-[10px] font-black text-blue-500 uppercase tracking-widest">Q1. 電池與通道佔用率</span>
-        </div> {/* Added units to labels */}
-        <Line data={batteryChartData} options={batteryOptions} />
+    <div className="flex flex-col space-y-4">
+      {/* 時間跨度選擇按鈕 */}
+      <div className="flex justify-end items-center gap-2">
+        <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider">歷史時間跨度:</span>
+        <div className={`flex rounded-lg p-0.5 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+          {[1, 7, 30].map(d => (
+            <button
+              key={d}
+              onClick={() => setDays(d)}
+              className={`px-3 py-1 text-[10px] font-black rounded-md transition-all ${
+                days === d
+                  ? 'bg-cyan-500 text-white shadow-md'
+                  : darkMode 
+                    ? 'text-slate-400 hover:text-slate-200' 
+                    : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              {d} 天
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* 象限 2: 右上 - 節點身份資訊 - 確保 node 更新時重繪 */}
-      <div key={`identity-${node?.node_id}`} className={`h-auto lg:h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-1 p-5 rounded-xl border shadow-inner ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50 border-slate-100'}`}>
-        <h5 className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest flex items-center gap-2">
-          <Smartphone size={14} className="text-cyan-500" /> 節點身份資訊 Node Identity
-        </h5>
-        {node && node.node_id ? (
-          <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Long Name</span> {/* Added units to labels */}
-              <span className="font-bold truncate" title={node.long_name}>{node.long_name || 'Unknown'}</span>
-            </div>
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Short Name</span> {/* Added units to labels */}
-              <span className="font-bold">{node.short_name || '??'}</span>
-            </div>
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span> {/* Added units to labels */}
-              <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
-            </div>
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span> {/* Added units to labels */}
-              <span className="font-bold truncate text-slate-500" title={node.firmware_version}>{node.firmware_version || 'UNKNOWN'}</span>
-            </div>
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Build</span>
-              <span className="font-bold truncate text-slate-500" title={node.firmware_build_num}>{node.firmware_build_num || 'UNKNOWN'}</span>
-            </div>
-            <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
-              <span className="text-slate-400 text-[9px] uppercase font-bold">Role</span>
-              <span className="font-bold text-cyan-500">{node.role || 'CLIENT'}</span>
-            </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-10">
+        {/* 象限 1: 左上 - 電池與通道 */}
+        <div className="h-56 col-start-1 row-start-1">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-[10px] font-black text-blue-500 uppercase tracking-widest">Q1. 電池與通道佔用率</span>
           </div>
-        ) : (
-          <p className="text-[10px] text-slate-400 italic">無身份資料</p>
-        )}
-      </div>
+          <Line data={batteryChartData} options={batteryOptions} />
+        </div>
 
-      {/* 象限 3: 左下 - 電力監測 */}
-      <div className="h-56 col-start-1 row-start-auto lg:row-start-2">
-        <div className="flex justify-between items-center mb-2">
-          <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備綜合電力監測 (V / mA)</span> {/* Added units to labels */}
-        </div> {/* Added units to labels */}
-        <Line data={powerChartData} options={powerOptions} />
-      </div>
+        {/* 象限 2: 右上 - 節點身份資訊 */}
+        <div key={`identity-${node?.node_id}`} className={`h-auto lg:h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-1 p-5 rounded-xl border shadow-inner ${darkMode ? 'bg-slate-800/30 border-slate-700/50' : 'bg-slate-50 border-slate-100'}`}>
+          <h5 className="text-[10px] font-black uppercase text-slate-500 mb-4 tracking-widest flex items-center gap-2">
+            <Smartphone size={14} className="text-cyan-500" /> 節點身份資訊 Node Identity
+          </h5>
+          {node && node.node_id ? (
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Long Name</span>
+                <span className="font-bold truncate" title={node.long_name}>{node.long_name || 'Unknown'}</span>
+              </div>
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Short Name</span>
+                <span className="font-bold">{node.short_name || '??'}</span>
+              </div>
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span>
+                <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
+              </div>
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span>
+                <span className="font-bold truncate text-slate-500" title={node.firmware_version}>{node.firmware_version || 'UNKNOWN'}</span>
+              </div>
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Build</span>
+                <span className="font-bold truncate text-slate-500" title={node.firmware_build_num}>{node.firmware_build_num || 'UNKNOWN'}</span>
+              </div>
+              <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
+                <span className="text-slate-400 text-[9px] uppercase font-bold">Role</span>
+                <span className="font-bold text-cyan-500">{node.role || 'CLIENT'}</span>
+              </div>
+            </div>
+          ) : (
+            <p className="text-[10px] text-slate-400 italic">無身份資料</p>
+          )}
+        </div>
 
-      {/* 象限 4: 右下 - 環境遙測 */}
-      <div className="h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-2">
-        <div className="flex justify-between items-center mb-2">
-          <span className="text-[10px] font-black text-cyan-500 uppercase tracking-widest">Q4. 環境遙測趨勢 (Temp/Hum)</span> {/* Added units to labels */}
-        </div> {/* Added units to labels */}
-        <Line data={envChartData} options={commonOptions} />
+        {/* 象限 3: 左下 - 電力監測 */}
+        <div className="h-56 col-start-1 row-start-auto lg:row-start-2">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-[10px] font-black text-orange-500 uppercase tracking-widest">Q3. 設備綜合電力監測 (V / mA)</span>
+          </div>
+          <Line data={powerChartData} options={powerOptions} />
+        </div>
+
+        {/* 象限 4: 右下 - 環境遙測 */}
+        <div className="h-56 col-start-1 lg:col-start-2 row-start-auto lg:row-start-2">
+          <div className="flex justify-between items-center mb-2">
+            <span className="text-[10px] font-black text-cyan-500 uppercase tracking-widest">Q4. 環境遙測趨勢 (Temp/Hum)</span>
+          </div>
+          <Line data={envChartData} options={commonOptions} />
+        </div>
       </div>
     </div>
   );

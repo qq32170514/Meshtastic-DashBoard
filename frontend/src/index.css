@@ -1,3 +1,27 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ====================================================
+   自訂節點 Hover Tooltip 樣式 (Override Leaflet defaults)
+   ==================================================== */
+.node-hover-tooltip.leaflet-tooltip {
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.12) !important;
+  border-radius: 10px !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+}
+
+/* 隱藏 Tooltip 箭頭 */
+.node-hover-tooltip.leaflet-tooltip::before {
+  display: none !important;
+}
+
+/* 節點群組 Cluster 動畫 */
+.leaflet-cluster-anim .leaflet-marker-icon,
+.leaflet-cluster-anim .leaflet-marker-shadow {
+  transition: transform 0.15s ease-in-out, opacity 0.15s ease-in-out;
+}

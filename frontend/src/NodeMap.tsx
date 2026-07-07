@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle, GeoJSON, Circle } from 'react-leaflet';
+import * as turf from '@turf/turf';
 import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
@@ -85,7 +86,6 @@ interface NodeMapProps {
   onSelectNode: (id: string) => void;
   onShowDetail?: (id: string) => void; // 新增：顯示漂浮詳情頁的回呼
   isDetailView?: boolean; // 新增：是否為節點詳情模式
-  showTopology?: boolean;  // 新增：顯示拓撲圖層
   showUtilization?: boolean; // 新增：顯示利用率圖層
   showNodes?: boolean;     // 新增：顯示節點標記
   neighbors?: any[];       // 新增：鄰居關係資料
@@ -96,6 +96,13 @@ interface NodeMapProps {
   traceroutePath?: any[];
   selectedNodePath?: any[];
   showTrackerHistory?: boolean;
+  simResultMap?: Map<string, { hop: number, pathSnr: number }>;
+  simState?: { sourceNodeId: string, maxHops: number, minSnr: number };
+  showSimulator?: boolean;
+  showLogicGraph?: boolean;
+  fusionEdges?: any[];
+  isMapFullScreen?: boolean;
+  mapCenter?: [number, number];
 }
 
 const getHopColor = (hops: number) => {
@@ -109,9 +116,19 @@ const getHopColor = (hops: number) => {
   return "#ef4444";             // 5+ 跳: 紅色
 };
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showTopology = false, showUtilization = false, showNodes = true, neighbors = [], activeTab, showTraceroute = false, showHopGrid = false, coverageData = [], traceroutePath = [], selectedNodePath = [], showTrackerHistory = false }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
+
+  const MapController = ({ center }: { center?: [number, number] }) => {
+    const map = useMap();
+    useEffect(() => {
+      if (center) {
+        map.flyTo(center, 14);
+      }
+    }, [center, map]);
+    return null;
+  };
 
   const MapInvalidator = () => {
     const map = useMap();
@@ -119,7 +136,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
       setTimeout(() => {
         map.invalidateSize();
       }, 100);
-    }, [activeTab, map]);
+    }, [activeTab, isMapFullScreen, map]);
     return null;
   };
 
@@ -141,6 +158,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     <div className="relative w-full h-full">
       <MapContainer center={[23.6, 121]} zoom={7} className="w-full h-full" style={{ width: '100%', height: '100%' }}>
         <MapInvalidator />
+        <MapController center={mapCenter} />
         <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
@@ -244,79 +262,224 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                   fillOpacity: 0.8 
                 }}
               >
-                <Tooltip>
-                  時間: {new Date(p.timestamp).toLocaleString()}
+                <Tooltip sticky>
+                  <div className="text-[10px] p-1 font-sans">
+                    時間: {new Date(p.timestamp).toLocaleString()}<br />
+                    接收閘道: {p.gateway_id || 'Unknown'}<br />
+                    訊號品質: SNR {p.snr !== null && p.snr !== undefined ? p.snr + ' dB' : 'N/A'} / RSSI {p.rssi !== null && p.rssi !== undefined ? p.rssi + ' dBm' : 'N/A'}
+                  </div>
                 </Tooltip>
               </CircleMarker>
             ))}
+            {/* Draw lines to gateways for each track point */}
+            {selectedNodePath.map((p, idx) => {
+              if (!p.gateway_id) return null;
+              const gwNode = allNodes.find(n => n.node_id === p.gateway_id);
+              if (gwNode && gwNode.latitude && gwNode.longitude) {
+                return (
+                  <Polyline
+                    key={`gw-link-${idx}`}
+                    positions={[[p.latitude, p.longitude], [gwNode.latitude, gwNode.longitude]] as any}
+                    pathOptions={{ color: '#10b981', weight: 1.5, opacity: 0.4, dashArray: '3, 6' }}
+                  >
+                    <Tooltip sticky>
+                      <div className="text-[10px] font-mono p-1">
+                        📡 收發路徑 | 時間: {new Date(p.timestamp).toLocaleString()}<br />
+                        閘道器: {gwNode.short_name || gwNode.node_id}<br />
+                        訊號品質: SNR {p.snr !== null && p.snr !== undefined ? p.snr + ' dB' : 'N/A'} / RSSI {p.rssi !== null && p.rssi !== undefined ? p.rssi + ' dBm' : 'N/A'}
+                      </div>
+                    </Tooltip>
+                  </Polyline>
+                );
+              }
+              return null;
+            })}
           </React.Fragment>
-        )}
-
-        {/* 繪製主節點 */}
-        {showNodes && nodesWithGPS.map(node => (
-          <Marker
-            key={node.node_id}
-            icon={createColoredIcon(node.role, node.last_seen)}
-            position={[node.latitude!, node.longitude!]}
-            eventHandlers={{ click: () => onSelectNode(node.node_id) }}
-          >
-            <Popup>
-              <div className="font-sans p-1 flex flex-col gap-1 min-w-[140px]">
-                {/* 1. Long Name */}
-                <div className="font-bold text-slate-800 text-sm border-b border-slate-100 pb-1 mb-1">{node.long_name || 'Unknown'}</div>
-
-                {/* 2. Short Name */}
-                <div className="text-xs text-slate-600 flex justify-between gap-4">
-                  <span className="text-slate-400">Short:</span> <span className="font-bold">{node.short_name || '??'}</span>
-                </div>
-
-                {/* 3. ID */}
-                <div className="text-xs text-slate-600 flex justify-between gap-4">
-                  <span className="text-slate-400">ID:</span>
-                  <button onClick={() => onShowDetail?.(node.node_id)} className="font-mono font-bold text-blue-600 hover:text-blue-800 hover:underline">{node.node_id}</button>
-                </div>
-
-                {/* 4. Role */}
-                <div className="text-xs text-slate-600 flex justify-between items-center gap-4">
-                  <span className="text-slate-400">Role:</span>
-                  <span className="px-1.5 py-0.5 bg-slate-100 text-slate-500 rounded text-[9px] font-bold uppercase border border-slate-200">{node.role || 'CLIENT'}</span>
-                </div>
-
-                {/* 5. Channel */}
-                <div className="text-xs text-slate-600 flex justify-between gap-4">
-                  <span className="text-slate-400">Channel:</span>
-                  <span className="font-mono text-cyan-600 font-bold">
-                    {(() => {
-                      const rawChannel = node.channel || '';
-                      const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
-                      const channelName = isInvalid ? (() => {
-                        const parts = (node.last_topic || '').split('/');
-                        return parts.find(p => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
-                      })() : rawChannel;
-                      return channelName === 'MediumFast' ? '⚡ ' + channelName : channelName;
-                    })()}
-                  </span>
-                </div>
-              </div>
-            </Popup>
-          </Marker>
-        ))}
-
-        {/* 繪製網路拓撲圖層 (NeighborInfo Lines) */}
-        {showTopology && neighbors.map((rel, idx) => {
-          const source = allNodes.find(n => n.node_id === rel.node_id);
-          const target = allNodes.find(n => n.node_id === rel.neighbor_id);
-          if (source?.latitude && target?.latitude) {
+        )}        {/* 3. 繪製地理邏輯拓撲連線 (Geographic Logic Topology Network Links) */}
+        {showLogicGraph && fusionEdges && fusionEdges.map((edge, idx) => {
+          const sourceNode = allNodes.find(n => String(n.node_id).toLowerCase() === String(edge.source_id).toLowerCase());
+          const targetNode = allNodes.find(n => String(n.node_id).toLowerCase() === String(edge.target_id).toLowerCase());
+          
+          if (sourceNode && targetNode && sourceNode.latitude && sourceNode.longitude && targetNode.latitude && targetNode.longitude) {
+            // Get color based on method
+            let color = '#94a3b8'; // Slate (Default)
+            if (edge.method === 'NEIGHBOR_INFO') color = '#22c55e'; // Green (Direct neighbor info)
+            if (edge.method === 'TRACEROUTE') color = '#3b82f6'; // Blue (Traceroute path)
+            if (edge.method === 'HOP_LIMIT') color = '#f59e0b'; // Orange (Hop limit estimation)
+            
+            // Map confidence to opacity
+            const opacity = Math.max(0.15, Math.min(0.7, edge.confidence / 100));
+            const weight = edge.method === 'NEIGHBOR_INFO' ? 4 : (edge.method === 'TRACEROUTE' ? 3 : 2);
+            
             return (
               <Polyline
-                key={`topo-${idx}`}
-                positions={[[source.latitude, source.longitude], [target.latitude, target.longitude]]}
-                pathOptions={{ color: '#06b6d4', weight: Math.max(0.5, rel.snr / 2), opacity: 0.4, dashArray: '3, 6' }}
-              />
+                key={`topo-edge-${idx}`}
+                positions={[[sourceNode.latitude, sourceNode.longitude], [targetNode.latitude, targetNode.longitude]] as any}
+                pathOptions={{ color, weight, opacity }}
+              >
+                <Tooltip sticky>
+                  <div className="text-[11px] font-black p-1">
+                    🔗 拓撲連線 ({edge.method === 'NEIGHBOR_INFO' ? '鄰居直連' : edge.method === 'TRACEROUTE' ? '路徑追蹤' : '跳數估算'})<br />
+                    <span className="text-slate-600">起點: {sourceNode.long_name || sourceNode.short_name || sourceNode.node_id}</span><br />
+                    <span className="text-slate-600">終點: {targetNode.long_name || targetNode.short_name || targetNode.node_id}</span><br />
+                    <span className="text-indigo-600 font-bold">SNR: {edge.snr !== null && edge.snr !== undefined ? edge.snr + ' dB' : 'N/A'}</span><br />
+                    <span className="text-emerald-600 font-bold">信心度: {edge.confidence}%</span>
+                  </div>
+                </Tooltip>
+              </Polyline>
             );
           }
           return null;
         })}
+
+        {/* 繪製主節點（含 Cluster 群組化解決重疊問題） */}
+        {showNodes && (
+          <MarkerClusterGroup
+            chunkedLoading
+            maxClusterRadius={40}
+            spiderfyOnMaxZoom
+            showCoverageOnHover={false}
+            iconCreateFunction={(cluster: any) => {
+              const count = cluster.getChildCount();
+              const size = count < 5 ? 32 : count < 15 ? 38 : 44;
+              return L.divIcon({
+                html: `<div style="
+                  width:${size}px;height:${size}px;
+                  background:linear-gradient(135deg,#0ea5e9,#6366f1);
+                  border:2.5px solid white;
+                  border-radius:50%;
+                  display:flex;align-items:center;justify-content:center;
+                  color:white;font-weight:900;font-size:${count<10?13:11}px;
+                  box-shadow:0 3px 10px rgba(0,0,0,0.3);
+                  font-family:sans-serif;
+                ">${count}</div>`,
+                className: '',
+                iconSize: [size, size],
+                iconAnchor: [size / 2, size / 2],
+              });
+            }}
+          >
+            {nodesWithGPS.map(node => {
+              // 計算 Channel 顯示名稱（與原邏輯相同）
+              const rawChannel = node.channel || '';
+              const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
+              const channelName = isInvalid ? (() => {
+                const parts = (node.last_topic || '').split('/');
+                return parts.find((p: string) => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
+              })() : rawChannel;
+              const channelDisplay = channelName === 'MediumFast' ? '⚡ MediumFast' : channelName;
+
+              // 計算最後活躍時間顯示
+              const getLastSeenText = (lastSeen?: string) => {
+                if (!lastSeen) return '從未';
+                const diffMs = Date.now() - new Date(lastSeen).getTime();
+                const diffMin = Math.floor(diffMs / 60000);
+                if (diffMin < 60) return `${diffMin} 分鐘前`;
+                const diffHr = Math.floor(diffMin / 60);
+                if (diffHr < 24) return `${diffHr} 小時前`;
+                return `${Math.floor(diffHr / 24)} 天前`;
+              };
+
+              return (
+                <Marker
+                  key={node.node_id}
+                  icon={createColoredIcon(node.role, node.last_seen)}
+                  position={[node.latitude!, node.longitude!]}
+                  eventHandlers={{ click: () => onSelectNode(node.node_id) }}
+                >
+                  {/* Hover 顯示簡易節點圖卡 Tooltip */}
+                  <Tooltip
+                    direction="top"
+                    offset={[0, -38]}
+                    opacity={1}
+                    className="node-hover-tooltip"
+                  >
+                    <div style={{
+                      fontFamily: 'sans-serif',
+                      minWidth: '170px',
+                      maxWidth: '240px',
+                      padding: '0',
+                      borderRadius: '10px',
+                      overflow: 'hidden',
+                    }}>
+                      {/* 頭部：Long Name + Role badge */}
+                      <div style={{
+                        background: `${getRoleColor(node.role)}22`,
+                        borderBottom: `2px solid ${getRoleColor(node.role)}55`,
+                        padding: '7px 10px 5px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '6px',
+                      }}>
+                        <div style={{ fontWeight: 900, fontSize: '12px', color: '#1e293b', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {node.long_name || 'Unknown'}
+                        </div>
+                        <div style={{
+                          background: getRoleColor(node.role),
+                          color: 'white',
+                          fontSize: '8px',
+                          fontWeight: 900,
+                          padding: '2px 5px',
+                          borderRadius: '999px',
+                          whiteSpace: 'nowrap',
+                          letterSpacing: '0.05em',
+                          textTransform: 'uppercase',
+                        }}>
+                          {node.role || 'CLIENT'}
+                        </div>
+                      </div>
+
+                      {/* 主體：節點資訊列表 */}
+                      <div style={{ padding: '7px 10px', display: 'flex', flexDirection: 'column', gap: '4px', background: 'white' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>Short</span>
+                          <span style={{ color: '#334155', fontWeight: 900 }}>{node.short_name || '??'}</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>ID</span>
+                          <span style={{ color: '#2563eb', fontWeight: 900, fontFamily: 'monospace', fontSize: '9px' }}>{node.node_id}</span>
+                        </div>
+                        {channelDisplay !== '-' && (
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>Channel</span>
+                            <span style={{ color: '#0891b2', fontWeight: 900 }}>{channelDisplay}</span>
+                          </div>
+                        )}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>最後活躍</span>
+                          <span style={{ color: '#475569', fontWeight: 700 }}>{getLastSeenText(node.last_seen)}</span>
+                        </div>
+                        {node.snr !== undefined && node.snr !== null && (
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>SNR</span>
+                            <span style={{ color: node.snr > 5 ? '#16a34a' : node.snr > -5 ? '#d97706' : '#dc2626', fontWeight: 900 }}>{node.snr} dB</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* 底部：點擊提示 */}
+                      <div style={{
+                        padding: '4px 10px',
+                        background: '#f8fafc',
+                        borderTop: '1px solid #e2e8f0',
+                        fontSize: '9px',
+                        color: '#94a3b8',
+                        fontWeight: 700,
+                        textAlign: 'center',
+                        letterSpacing: '0.05em'
+                      }}>
+                        點擊查看節點詳情
+                      </div>
+                    </div>
+                  </Tooltip>
+                </Marker>
+              );
+            })}
+          </MarkerClusterGroup>
+        )}
+
+
 
         {/* 繪製頻道利用率圖層 (Utilization Heat Rings) */}
         {showUtilization && allNodes.filter(n => n.latitude && n.longitude).map(node => {
@@ -391,6 +554,75 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
             </React.Fragment>
           );
         })})()}
+
+        {/* --- 動態 Hop 覆蓋模擬器 (Weighted Reachability Map) --- */}
+        {showSimulator && simResultMap && simState && simState.sourceNodeId && (() => {
+          const hopGroups = new Map<number, Node[]>();
+          simResultMap.forEach((info, nodeId) => {
+            if (!hopGroups.has(info.hop)) hopGroups.set(info.hop, []);
+            const n = allNodes.find(n => n.node_id === nodeId) || nodes.find(n => n.node_id === nodeId);
+            if (n && n.latitude && n.longitude) {
+              hopGroups.get(info.hop)!.push(n);
+            }
+          });
+
+          // Sort descending so larger hops (usually larger area) are drawn first and don't cover smaller ones
+          const sortedHops = Array.from(hopGroups.keys()).sort((a, b) => b - a);
+          
+          return sortedHops.map(hop => {
+            const groupNodes = hopGroups.get(hop)!;
+            if (groupNodes.length === 0) return null;
+
+            let totalSnr = 0;
+            groupNodes.forEach(n => {
+              totalSnr += simResultMap.get(n.node_id)!.pathSnr;
+            });
+            const avgSnr = totalSnr / groupNodes.length;
+            
+            const isWeak = avgSnr < -10;
+            const pathOptions = {
+              color: getHopColor(hop),
+              weight: isWeak ? 1 : 2,
+              dashArray: isWeak ? '10, 10' : undefined,
+              fillOpacity: isWeak ? 0.1 : 0.3,
+              fillColor: getHopColor(hop)
+            };
+
+            const points = groupNodes.map(n => [n.longitude!, n.latitude!] as [number, number]);
+            
+            if (points.length < 3) {
+              return groupNodes.map(n => (
+                <Circle 
+                  key={`sim-${hop}-${n.node_id}`} 
+                  center={[n.latitude!, n.longitude!]} 
+                  radius={2000} 
+                  pathOptions={pathOptions} 
+                >
+                  <Tooltip>Hop: {hop} | Avg SNR: {avgSnr.toFixed(1)}</Tooltip>
+                </Circle>
+              ));
+            }
+
+            try {
+              const fc = turf.featureCollection(points.map(p => turf.point(p)));
+              const hull = turf.convex(fc);
+              if (!hull) return null;
+              const buffered = turf.buffer(hull, 2, { units: 'kilometers' });
+              
+              if (!buffered) return null;
+
+              return (
+                <GeoJSON key={`sim-poly-${hop}`} data={buffered} pathOptions={pathOptions}>
+                  <Tooltip>Hop {hop} Coverage | Avg SNR: {avgSnr.toFixed(1)} | Nodes: {groupNodes.length}</Tooltip>
+                </GeoJSON>
+              );
+            } catch (e) {
+              console.error("Turf error", e);
+              return null;
+            }
+          });
+        })()}
+
       </MapContainer>
 
       {/* 圖例 Legend Overlay */}
