@@ -287,9 +287,30 @@ db.serialize(() => {
             lat REAL,
             lon REAL,
             snr REAL,
-            rssi REAL,
             source TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+
+    db.run(`
+        CREATE TABLE IF NOT EXISTS daily_analytics_summary (
+            date TEXT PRIMARY KEY,
+            active_count INTEGER DEFAULT 0,
+            ghost_count INTEGER DEFAULT 0,
+            snr_sum REAL DEFAULT 0,
+            snr_count INTEGER DEFAULT 0,
+            rssi_sum REAL DEFAULT 0,
+            rssi_count INTEGER DEFAULT 0,
+            temp_sum REAL DEFAULT 0,
+            temp_count INTEGER DEFAULT 0,
+            hum_sum REAL DEFAULT 0,
+            hum_count INTEGER DEFAULT 0,
+            position_count INTEGER DEFAULT 0,
+            telemetry_count INTEGER DEFAULT 0,
+            text_count INTEGER DEFAULT 0,
+            routing_count INTEGER DEFAULT 0,
+            other_count INTEGER DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
 
@@ -359,20 +380,20 @@ const PORT_NAME_TO_ID = {
 };
 
 // ==========================================
-// 1.2 資料清理任務 (保留 3 天)
+// 1.2 資料清理任務 (保留 90 天 / 3 個月)
 // ==========================================
-const DATA_RETENTION_DAYS = 30; // 🚀 在這裡設定你想要保留數據的天數 (例如 30 天)
+const DATA_RETENTION_DAYS = 90; // 🚀 保留 90 天 (3 個月)
 
 function cleanupOldData() {
     const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
-    // 新增：聊天紀錄保留 30 天，避免資料庫無限增長
+    // 聊天紀錄保留 90 天
     const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
 
     db.run(sql, function (err) {
         if (err) console.error('❌ 清理舊資料失敗:', err.message);
         else if (this.changes > 0) {
-            console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 14 天的舊資料`);
+            console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 90 天的舊資料`);
         }
     });
     db.run(sqlPackets);
@@ -388,10 +409,11 @@ cleanupOldData(); // 啟動時先執行一次
 // ==========================================
 
 // 🛸 輔助函式：構建封包查詢條件
-const buildPacketQuery = (req, baseSql) => {
+const buildPacketQuery = (req, baseSql, opts = {}) => {
     let sql = baseSql;
     const params = [];
     const conditions = [];
+    const excludeTunnelPackets = opts.excludeTunnelPackets || req.excludeTunnelPackets || false;
 
     if (req.params.nodeId) {
         conditions.push("node_id = ?");
@@ -414,8 +436,14 @@ const buildPacketQuery = (req, baseSql) => {
         }
     }
     if (req.query.gateway_id) {
-        conditions.push("gateway_id LIKE ?");
-        params.push(`%${req.query.gateway_id}%`);
+        conditions.push("(gateway_id LIKE ? OR gateway_id IN (SELECT node_id FROM nodes WHERE long_name LIKE ? OR short_name LIKE ?))");
+        const term = `%${req.query.gateway_id}%`;
+        params.push(term, term, term);
+    }
+    if (req.query.sender) {
+        conditions.push("(node_id LIKE ? OR node_id IN (SELECT node_id FROM nodes WHERE long_name LIKE ? OR short_name LIKE ?))");
+        const term = `%${req.query.sender}%`;
+        params.push(term, term, term);
     }
     if (req.query.timeStart) {
         conditions.push("timestamp >= ?");
@@ -430,7 +458,7 @@ const buildPacketQuery = (req, baseSql) => {
         params.push(parseFloat(req.query.minSnr));
     }
     // 🚀 新增：排除隧道封包的條件 (僅用於全域封包觀察)
-    if (req.excludeTunnelPackets) {
+    if (excludeTunnelPackets) {
         conditions.push("(source IS NULL OR source = 'mqtt')");
     }
 
@@ -512,8 +540,9 @@ app.get('/api/packets', withCache(), (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const offset = (page - 1) * limit;
 
-    const { sql, params } = buildPacketQuery({ ...req, excludeTunnelPackets: true }, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
+    const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`, { excludeTunnelPackets: true });
     const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+    console.log('[DEBUG] sender query:', req.query.sender, '| SQL WHERE:', sql.includes('WHERE') ? sql.substring(sql.indexOf('WHERE')) : 'NONE', '| params:', params);
 
     db.all(finalSql, [...params, limit, offset], (err, rows) => {
         if (err) {
@@ -537,9 +566,33 @@ app.get('/api/packets/:id', (req, res) => {
     });
 });
 
+// 🚀 取得同一封包被哪些 gateway 收到（±60 秒同 node_id + portnum 的所有紀錄）
+app.get('/api/packets/:id/gateways', (req, res) => {
+    // 先查原始封包以取得 node_id, portnum, timestamp
+    db.get(`SELECT node_id, portnum, timestamp, gateway_id FROM packet_logs WHERE id = ?`, [req.params.id], (err, origin) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!origin) return res.status(404).json({ error: 'Not found' });
+
+        const sql = `
+            SELECT gateway_id, snr, rssi, hops_away, hop_limit, hop_start, timestamp, id
+            FROM packet_logs
+            WHERE node_id = ?
+              AND portnum = ?
+              AND ABS(CAST((julianday(timestamp) - julianday(?)) * 86400 AS INTEGER)) <= 60
+              AND gateway_id IS NOT NULL
+              AND gateway_id != ''
+            ORDER BY timestamp ASC
+        `;
+        db.all(sql, [origin.node_id, origin.portnum, origin.timestamp], (err2, rows) => {
+            if (err2) return res.status(500).json({ error: err2.message });
+            res.json(rows);
+        });
+    });
+});
+
 // 🚀 全域封包總數統計（加快取）
 app.get('/api/packets/count', withCache(), (req, res) => {
-    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
+    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs", { excludeTunnelPackets: true });
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ count: row?.count || 0 });
@@ -700,10 +753,19 @@ app.get('/api/traceroute/latest', (req, res) => {
 // 🚀 核心升級：網格化覆蓋率聚合 API
 // 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
 app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
-    // 🚀 CTE 實作方式：
-    // 1. 第一個 CTE 先對每個網格分組找出最新那筆的 hops_away
-    // 2. 第二個層做聚合統計
-    // 3. JOIN 合併起來，對每行只跟資料庫講一次
+    // 🚀 CTE 實作方式（支援 timeStart / timeEnd 日期篩選）
+    const timeConditions = [];
+    const timeParams = [];
+    if (req.query.timeStart) {
+        timeConditions.push(`timestamp >= ?`);
+        timeParams.push(req.query.timeStart);
+    }
+    if (req.query.timeEnd) {
+        timeConditions.push(`timestamp <= ?`);
+        timeParams.push(req.query.timeEnd);
+    }
+    const extraWhere = timeConditions.length > 0 ? `AND ${timeConditions.join(' AND ')}` : '';
+
     const sql = `
         WITH base AS (
             SELECT 
@@ -715,6 +777,7 @@ app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
               AND longitude IS NOT NULL
               AND node_id != gateway_id
               AND gateway_id != 'Unknown'
+              ${extraWhere}
         ),
         latest_per_grid AS (
             SELECT grid_lat, grid_lng, hops_away
@@ -740,7 +803,7 @@ app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
         JOIN latest_per_grid l USING (grid_lat, grid_lng)
         GROUP BY b.grid_lat, b.grid_lng
     `;
-    db.all(sql, [], (err, rows) => {
+    db.all(sql, timeParams, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
@@ -818,10 +881,407 @@ app.get('/api/node/:nodeId/packet-stats', (req, res) => {
     });
 });
 
+// ==========================================
+// 🚀 全網宏觀戰情分析 API (Network Analytics)
+// ==========================================
+
+// 1. 全網 KPI 營運指標
+app.get('/api/analytics/kpi', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '24h';
+    let hours = 24;
+    if (range === '7d') hours = 7 * 24;
+    if (range === '30d') hours = 30 * 24;
+
+    const sqlActive = `SELECT COUNT(DISTINCT node_id) as count FROM packet_logs WHERE timestamp >= datetime('now', '-${hours} hours')`;
+    const sqlOffline = `SELECT COUNT(*) as count FROM nodes WHERE last_seen < datetime('now', '-48 hours') OR last_seen IS NULL`;
+    const sqlGhost = `
+        SELECT COUNT(DISTINCT node_id) as count FROM packet_logs 
+        WHERE timestamp >= datetime('now', '-${hours} hours')
+          AND node_id NOT IN (
+              SELECT node_id FROM nodes WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0
+          )
+    `;
+    const sqlLowBattery = `SELECT COUNT(*) as count FROM nodes WHERE voltage IS NOT NULL AND voltage > 0 AND voltage < 3.4`;
+
+    Promise.all([
+        new Promise((resolve, reject) => db.get(sqlActive, [], (err, r) => err ? reject(err) : resolve(r?.count || 0))),
+        new Promise((resolve, reject) => db.get(sqlOffline, [], (err, r) => err ? reject(err) : resolve(r?.count || 0))),
+        new Promise((resolve, reject) => db.get(sqlGhost, [], (err, r) => err ? reject(err) : resolve(r?.count || 0))),
+        new Promise((resolve, reject) => db.get(sqlLowBattery, [], (err, r) => err ? reject(err) : resolve(r?.count || 0)))
+    ]).then(([activeNodes, offlineNodes, ghostNodes, lowBatteryAlerts]) => {
+        res.json({ activeNodes, offlineNodes, ghostNodes, lowBatteryAlerts });
+    }).catch(err => {
+        res.status(500).json({ error: err.message });
+    });
+});
+
+// ⚡ [流式即時累加 & 快照歸檔] 核心函式
+function computeAndSaveDaySummary(dateStr, callback) {
+    const summarySql = `
+        SELECT 
+            (SELECT COUNT(DISTINCT node_id) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ?) as active_count,
+            (SELECT COUNT(DISTINCT node_id) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND node_id NOT IN (SELECT node_id FROM nodes WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0)) as ghost_count,
+            (SELECT COALESCE(SUM(snr), 0) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND snr BETWEEN -35 AND 35) as snr_sum,
+            (SELECT COUNT(snr) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND snr BETWEEN -35 AND 35) as snr_count,
+            (SELECT COALESCE(SUM(rssi), 0) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND rssi BETWEEN -150 AND 0) as rssi_sum,
+            (SELECT COUNT(rssi) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND rssi BETWEEN -150 AND 0) as rssi_count,
+            (SELECT COALESCE(SUM(temperature), 0) FROM telemetry_data WHERE strftime('%Y-%m-%d', timestamp) = ? AND temperature IS NOT NULL) as temp_sum,
+            (SELECT COUNT(temperature) FROM telemetry_data WHERE strftime('%Y-%m-%d', timestamp) = ? AND temperature IS NOT NULL) as temp_count,
+            (SELECT COALESCE(SUM(humidity), 0) FROM telemetry_data WHERE strftime('%Y-%m-%d', timestamp) = ? AND humidity IS NOT NULL) as hum_sum,
+            (SELECT COUNT(humidity) FROM telemetry_data WHERE strftime('%Y-%m-%d', timestamp) = ? AND humidity IS NOT NULL) as hum_count,
+            (SELECT COUNT(*) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND (portnum = 'POSITION' OR portnum = '3' OR portnum = 'POSITION_APP')) as position_count,
+            (SELECT COUNT(*) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND (portnum = 'TELEMETRY' OR portnum = '67' OR portnum = 'TELEMETRY_APP')) as telemetry_count,
+            (SELECT COUNT(*) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND (portnum = 'TEXT_MESSAGE' OR portnum = '1' OR portnum = 'TEXT_MESSAGE_APP')) as text_count,
+            (SELECT COUNT(*) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND (portnum = 'ROUTING' OR portnum = '5' OR portnum = 'ROUTING_APP')) as routing_count,
+            (SELECT COUNT(*) FROM packet_logs WHERE strftime('%Y-%m-%d', timestamp) = ? AND portnum NOT IN ('POSITION','3','POSITION_APP','TELEMETRY','67','TELEMETRY_APP','TEXT_MESSAGE','1','TEXT_MESSAGE_APP','ROUTING','5','ROUTING_APP')) as other_count
+    `;
+
+    db.get(summarySql, Array(15).fill(dateStr), (err, row) => {
+        if (err || !row) return callback && callback(err);
+        const upsertSql = `
+            INSERT INTO daily_analytics_summary 
+            (date, active_count, ghost_count, snr_sum, snr_count, rssi_sum, rssi_count, temp_sum, temp_count, hum_sum, hum_count, position_count, telemetry_count, text_count, routing_count, other_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(date) DO UPDATE SET
+                active_count = excluded.active_count,
+                ghost_count = excluded.ghost_count,
+                snr_sum = excluded.snr_sum,
+                snr_count = excluded.snr_count,
+                rssi_sum = excluded.rssi_sum,
+                rssi_count = excluded.rssi_count,
+                temp_sum = excluded.temp_sum,
+                temp_count = excluded.temp_count,
+                hum_sum = excluded.hum_sum,
+                hum_count = excluded.hum_count,
+                position_count = excluded.position_count,
+                telemetry_count = excluded.telemetry_count,
+                text_count = excluded.text_count,
+                routing_count = excluded.routing_count,
+                other_count = excluded.other_count,
+                updated_at = CURRENT_TIMESTAMP
+        `;
+        db.run(upsertSql, [
+            dateStr, row.active_count, row.ghost_count, row.snr_sum, row.snr_count,
+            row.rssi_sum, row.rssi_count, row.temp_sum, row.temp_count,
+            row.hum_sum, row.hum_count, row.position_count, row.telemetry_count,
+            row.text_count, row.routing_count, row.other_count
+        ], (uErr) => {
+            if (callback) callback(uErr);
+        });
+    });
+}
+
+function bootstrapAnalyticsSummary() {
+    console.log('⚡ [戰情快照] 檢查歷史快照完整度...');
+    const todayStr = new Date().toISOString().split('T')[0];
+    computeAndSaveDaySummary(todayStr);
+
+    const sql = `
+        SELECT DISTINCT strftime('%Y-%m-%d', timestamp) as date
+        FROM packet_logs
+        WHERE strftime('%Y-%m-%d', timestamp) NOT IN (SELECT date FROM daily_analytics_summary)
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err || !rows || rows.length === 0) {
+            console.log('⚡ [戰情快照] 歷史快照已是最新，無需補算。');
+            return;
+        }
+        console.log(`⚡ [戰情快照] 發現 ${rows.length} 天未彙總的歷史數據，開始自動歸檔補算...`);
+        let done = 0;
+        rows.forEach(r => {
+            computeAndSaveDaySummary(r.date, () => {
+                done++;
+                if (done === rows.length) {
+                    console.log('⚡ [戰情快照] 歷史數據補算完畢！所有天數均已歸檔快照。');
+                }
+            });
+        });
+    });
+}
+
+function recordLivePacketAnalytics(port, snr, rssi, temp, hum) {
+    const today = new Date().toISOString().split('T')[0];
+    let pType = 'other_count';
+    const pStr = (port || '').toString();
+    if (['POSITION', '3', 'POSITION_APP'].includes(pStr)) pType = 'position_count';
+    else if (['TELEMETRY', '67', 'TELEMETRY_APP'].includes(pStr)) pType = 'telemetry_count';
+    else if (['TEXT_MESSAGE', '1', 'TEXT_MESSAGE_APP'].includes(pStr)) pType = 'text_count';
+    else if (['ROUTING', '5', 'ROUTING_APP'].includes(pStr)) pType = 'routing_count';
+
+    let validSnr = (snr !== null && snr !== undefined && snr >= -35 && snr <= 35) ? parseFloat(snr) : null;
+    let validRssi = (rssi !== null && rssi !== undefined && rssi >= -150 && rssi <= 0) ? parseFloat(rssi) : null;
+    let validTemp = (temp !== null && temp !== undefined) ? parseFloat(temp) : null;
+    let validHum = (hum !== null && hum !== undefined) ? parseFloat(hum) : null;
+
+    const sql = `
+        INSERT INTO daily_analytics_summary (date, ${pType}, snr_sum, snr_count, rssi_sum, rssi_count, temp_sum, temp_count, hum_sum, hum_count)
+        VALUES (?, 1, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END)
+        ON CONFLICT(date) DO UPDATE SET
+            ${pType} = ${pType} + 1,
+            snr_sum = snr_sum + COALESCE(?, 0),
+            snr_count = snr_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
+            rssi_sum = rssi_sum + COALESCE(?, 0),
+            rssi_count = rssi_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
+            temp_sum = temp_sum + COALESCE(?, 0),
+            temp_count = temp_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
+            hum_sum = hum_sum + COALESCE(?, 0),
+            hum_count = hum_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
+            updated_at = CURRENT_TIMESTAMP
+    `;
+    queueDbOp(sql, [
+        today, validSnr, validSnr, validRssi, validRssi, validTemp, validTemp, validHum, validHum,
+        validSnr, validSnr, validRssi, validRssi, validTemp, validTemp, validHum, validHum
+    ]);
+}
+
+// 2. 歷史活躍度趨勢 (由 daily_analytics_summary 快照極速讀取)
+app.get('/api/analytics/trends', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    computeAndSaveDaySummary(todayStr, () => {
+        const sql = `
+            SELECT 
+                date,
+                active_count as activeNodes,
+                ghost_count as ghostNodes
+            FROM daily_analytics_summary
+            WHERE date >= date('now', '-' || ? || ' days')
+            ORDER BY date ASC
+        `;
+
+        db.all(sql, [days], (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json(rows || []);
+        });
+    });
+});
+
+// 3. 網路角色分佈
+app.get('/api/analytics/roles', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT COALESCE(role, 'CLIENT') as role, COUNT(*) as count
+        FROM nodes
+        GROUP BY COALESCE(role, 'CLIENT')
+        ORDER BY count DESC
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// 4. 全網封包流量種類 (由 daily_analytics_summary 快照極速讀取)
+app.get('/api/analytics/traffic', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            date,
+            position_count as Position,
+            telemetry_count as Telemetry,
+            text_count as TextMessage,
+            routing_count as Routing,
+            other_count as Other
+        FROM daily_analytics_summary
+        WHERE date >= date('now', '-' || ? || ' days')
+        ORDER BY date ASC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// 5. 全網平均 SNR / RSSI 歷史品質趨勢 (由 daily_analytics_summary 快照極速讀取)
+app.get('/api/analytics/signal-health', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            date,
+            CASE WHEN snr_count > 0 THEN ROUND(snr_sum / snr_count, 2) ELSE 0 END as avgSnr,
+            CASE WHEN rssi_count > 0 THEN ROUND(rssi_sum / rssi_count, 1) ELSE 0 END as avgRssi
+        FROM daily_analytics_summary
+        WHERE date >= date('now', '-' || ? || ' days')
+        ORDER BY date ASC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// 6. 跳數 (Hop Count) 傳遞分佈
+app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            CASE 
+                WHEN (hop_start IS NOT NULL AND hop_limit IS NOT NULL AND (hop_start - hop_limit) <= 0) OR hops_away = 0 THEN '0 Hop (Direct)'
+                WHEN (hop_start - hop_limit) = 1 OR hops_away = 1 THEN '1 Hop'
+                WHEN (hop_start - hop_limit) = 2 OR hops_away = 2 THEN '2 Hops'
+                ELSE '3+ Hops'
+            END as hop_category,
+            COUNT(*) as count
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-' || ? || ' days')
+        GROUP BY hop_category
+        ORDER BY count DESC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// 7. 24 小時時段熱門活動分佈
+app.get('/api/analytics/hourly-activity', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            strftime('%H', timestamp) as hour,
+            COUNT(*) as count
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-' || ? || ' days')
+        GROUP BY strftime('%H', timestamp)
+        ORDER BY hour ASC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        // 確保 00~23 小時完整包含
+        const resultMap = new Map();
+        for (let h = 0; h < 24; h++) {
+            const hStr = h.toString().padStart(2, '0');
+            resultMap.set(hStr, { hour: `${hStr}:00`, count: 0 });
+        }
+        (rows || []).forEach(r => {
+            if (r.hour && resultMap.has(r.hour)) {
+                resultMap.get(r.hour).count = r.count;
+            }
+        });
+        res.json(Array.from(resultMap.values()));
+    });
+});
+
+// 8. 硬體晶片與型號統計
+app.get('/api/analytics/hardware-models', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT COALESCE(hw_model, 'UNKNOWN') as model, COUNT(*) as count
+        FROM nodes
+        GROUP BY COALESCE(hw_model, 'UNKNOWN')
+        ORDER BY count DESC
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// 9. 韌體版本升級進度 (離散官方版本系列與主要版號聚合)
+app.get('/api/analytics/firmware-versions', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            node_id,
+            COALESCE(
+                firmware_version,
+                (SELECT json_extract(payload_json, '$.firmware_version') 
+                 FROM packet_logs 
+                 WHERE node_id = nodes.node_id AND payload_json LIKE '%firmware_version%' 
+                 ORDER BY timestamp DESC LIMIT 1)
+            ) as fw_ver
+        FROM nodes
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const seriesMap = new Map();
+        const exactMap = new Map();
+
+        (rows || []).forEach(r => {
+            let rawFw = r.fw_ver;
+            if (!rawFw) return;
+
+            let matchSeries = rawFw.match(/^(\d+\.\d+)/);
+            let seriesName = matchSeries ? 'v' + matchSeries[1] + '.x' : 'Other';
+            seriesMap.set(seriesName, (seriesMap.get(seriesName) || 0) + 1);
+
+            let matchExact = rawFw.match(/^(\d+\.\d+\.\d+)/);
+            let exactName = matchExact ? matchExact[1] : rawFw;
+            exactMap.set(exactName, (exactMap.get(exactName) || 0) + 1);
+        });
+
+        // 大版本系列 (v2.7.x, v2.6.x ...)
+        const series = Array.from(seriesMap.entries())
+            .map(([version, count]) => ({ version, count }))
+            .sort((a, b) => b.count - a.count);
+
+        // 詳細 Top 5 版號 + 其他 (Other)
+        const sortedExact = Array.from(exactMap.entries())
+            .sort((a, b) => b[1] - a[1]);
+        const topExact = sortedExact.slice(0, 5).map(([version, count]) => ({ version, count }));
+        const otherCount = sortedExact.slice(5).reduce((sum, item) => sum + item[1], 0);
+        if (otherCount > 0) {
+            topExact.push({ version: 'Other', count: otherCount });
+        }
+
+        res.json({
+            series,
+            exact: topExact,
+            // 保持向後相容
+            versions: topExact
+        });
+    });
+});
+
+// 10. 全網氣候環境遙測趨勢 (由 daily_analytics_summary 快照極速讀取)
+app.get('/api/analytics/environment-trends', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            date,
+            CASE WHEN temp_count > 0 THEN ROUND(temp_sum / temp_count, 1) ELSE null END as avgTemp,
+            CASE WHEN hum_count > 0 THEN ROUND(hum_sum / hum_count, 1) ELSE null END as avgHumidity
+        FROM daily_analytics_summary
+        WHERE date >= date('now', '-' || ? || ' days')
+        ORDER BY date ASC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
 // 啟動 Express 伺服器
 server.listen(PORT, () => {
     console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
     console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
+    bootstrapAnalyticsSummary();
     // 啟動 RF 監聽
     setupRFListener(io, db);
 });
@@ -1174,6 +1634,9 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
             queueDbOp(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, latitude, longitude, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex, packetLat, packetLng, hopsAway]);
 
+            // ⚡ 戰情中心即時流式增量累加
+            recordLivePacketAnalytics(port, packet.rx_snr, packet.rx_rssi);
+
             batchEmit('raw_packet', {
                 from: fromId,
                 portnum: port,
@@ -1245,17 +1708,31 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
                     const report = MapReport.decode(decodedData.payload);
                     const lat = report.latitude_i / 1e7;
                     const lng = report.longitude_i / 1e7;
+                    const fwVer = report.firmware_version || report.firmwareVersion || null;
+                    const hwModel = report.hw_model || report.hwModel || null;
+                    const role = report.role || null;
                     queueDbOp(`
-                        UPDATE nodes SET long_name = ?, short_name = ?, latitude = ?, longitude = ? WHERE node_id = ?
-                    `, [report.long_name, report.short_name, lat, lng, fromId], function (err) {
+                        UPDATE nodes SET 
+                            long_name = COALESCE(?, nodes.long_name), 
+                            short_name = COALESCE(?, nodes.short_name), 
+                            latitude = ?, 
+                            longitude = ?,
+                            hw_model = COALESCE(?, nodes.hw_model),
+                            role = COALESCE(?, nodes.role),
+                            firmware_version = COALESCE(?, nodes.firmware_version)
+                        WHERE node_id = ?
+                    `, [report.long_name, report.short_name, lat, lng, hwModel, role, fwVer, fromId], function (err) {
                         if (!err) {
-                            console.log(`🗺️ [地圖報告] 節點: ${report.short_name} -> ${lat}, ${lng}`);
+                            console.log(`🗺️ [地圖報告] 節點: ${report.short_name} -> ${lat}, ${lng} FW: ${fwVer || '--'}`);
                             batchEmit('node_seen', {
                                 node_id: fromId,
                                 long_name: report.long_name,
                                 short_name: report.short_name,
                                 latitude: lat,
                                 longitude: lng,
+                                hw_model: hwModel,
+                                role: role,
+                                firmware_version: fwVer,
                                 last_seen: new Date().toISOString(),
                                 last_topic: topic
                             });
@@ -1314,6 +1791,8 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 
                 queueDbOp(sql, params, function (err) {
                     if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
+
+                    recordLivePacketAnalytics(port, packet.rx_snr, packet.rx_rssi, env.temperature, env.relative_humidity);
 
                     console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
                     // 🚀 透過批次推播即時將新資料推播到前端

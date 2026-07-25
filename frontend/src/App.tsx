@@ -7,6 +7,7 @@ import NodeMap from './NodeMap';
 import TelemetryCharts from './TelemetryCharts';
 import PacketTypePieChart from './PacketTypePieChart';
 import TopologyGraph from './TopologyGraph';
+import NetworkAnalytics from './NetworkAnalytics';
 import { throttle } from 'lodash';
 
 export interface Node {
@@ -151,12 +152,189 @@ const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.2！
 
 const socket = io();
 
+const SearchInput = ({ value, onChange, placeholder, icon, label, darkMode, type = "text", list }: any) => {
+  const [localValue, setLocalValue] = useState(value || '');
+  
+  useEffect(() => {
+    setLocalValue(value || '');
+  }, [value]);
+
+  const handleApply = () => {
+    if (localValue !== (value || '')) {
+      onChange(localValue);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      handleApply();
+    }
+  };
+
+  return (
+    <div className="space-y-1">
+      <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap">
+        {icon} {label}
+      </label>
+      <div className="relative">
+        <input
+          type={type}
+          placeholder={placeholder}
+          value={localValue}
+          onChange={(e) => setLocalValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onBlur={handleApply}
+          className={`w-full p-1 pr-6 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}
+          list={list}
+        />
+        <button
+          onClick={handleApply}
+          className="absolute right-1 top-1/2 -translate-y-1/2 text-slate-400 hover:text-cyan-500 p-0.5"
+          title="搜尋 (Enter)"
+        >
+          <Search size={10} />
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// ===================================================
+// 🚀 FilterBar — 必須定義在 App 元件外部
+// 定義在元件內部會導致每次父元件重新渲染時 React 視之為
+// 不同的元件類型，強制 unmount/remount 並丟失本地狀態。
+// ===================================================
+const uniquePorts = Array.from(new Set(Object.values(PORTNUM_NAMES))).sort();
+
+interface FilterBarProps {
+  filter: any;
+  setFilter: (f: any) => void;
+  darkMode: boolean;
+}
+
+const FilterBar = ({ filter, setFilter, darkMode }: FilterBarProps) => {
+  const [pendingStart, setPendingStart] = useState(filter.startTime || '');
+  const [pendingEnd, setPendingEnd] = useState(filter.endTime || '');
+
+  // 當外部 filter 的 timePreset 改變時，同步 pending state
+  useEffect(() => {
+    if (filter.timePreset !== 'CUSTOM') {
+      setPendingStart('');
+      setPendingEnd('');
+    }
+    // 注意：不在 CUSTOM 模式下同步回去，避免使用者輸入被覆蓋
+  }, [filter.timePreset]);
+
+  const applyCustomDate = () => {
+    setFilter({ ...filter, startTime: pendingStart, endTime: pendingEnd });
+  };
+
+  return (
+    <div className={`p-3 border-b grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-8 gap-3 items-end ${darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-50/50 border-slate-100'}`}>
+      <div className="space-y-1">
+        <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap"><Filter size={10} /> 種類 (Type)</label>
+        <select value={filter.port} onChange={(e) => setFilter({ ...filter, port: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}>
+          <option value="ALL">全部種類 (ALL)</option>
+          {uniquePorts.map(p => <option key={p} value={p}>{p}</option>)}
+        </select>
+      </div>
+
+      <div className="space-y-1">
+        <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap"><Clock size={10} /> 時間範圍</label>
+        <select value={filter.timePreset} onChange={(e) => setFilter({ ...filter, timePreset: e.target.value, startTime: '', endTime: '' })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}>
+          <option value="ALL">全部 (ALL)</option>
+          <option value="1h">1 小時內</option>
+          <option value="6h">6 小時內</option>
+          <option value="24h">24 小時內</option>
+          <option value="CUSTOM">自定義範圍</option>
+        </select>
+      </div>
+
+      {filter.timePreset === 'CUSTOM' ? (
+        <>
+          <div className="space-y-1">
+            <label className="text-[9px] font-bold text-slate-500 uppercase">開始 (起)</label>
+            <input
+              type="datetime-local"
+              step="3600"
+              value={pendingStart}
+              onChange={(e) => setPendingStart(e.target.value)}
+              className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[9px] font-bold text-slate-500 uppercase">結束 (止)</label>
+            <input
+              type="datetime-local"
+              step="3600"
+              value={pendingEnd}
+              onChange={(e) => setPendingEnd(e.target.value)}
+              className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}
+            />
+          </div>
+        </>
+      ) : (
+        <div className="hidden lg:block lg:col-span-2"></div>
+      )}
+
+      <SearchInput
+        value={filter.gateway}
+        onChange={(val: string) => setFilter({ ...filter, gateway: val })}
+        placeholder="搜尋閘道器..."
+        icon={<Signal size={10} />}
+        label="Gateway ID"
+        darkMode={darkMode}
+        list="node-list"
+      />
+
+      <SearchInput
+        value={filter.sender || ''}
+        onChange={(val: string) => setFilter({ ...filter, sender: val })}
+        placeholder="搜尋發送者 ID..."
+        icon={<Smartphone size={10} />}
+        label="發送者 (Sender)"
+        darkMode={darkMode}
+        list="node-list"
+      />
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <label className="text-[9px] font-bold text-slate-500 uppercase whitespace-nowrap">SNR &ge;</label>
+          <input type="number" step="0.1" value={filter.minSnr} onChange={(e) => setFilter({ ...filter, minSnr: e.target.value === '' ? '' : Number(e.target.value) })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
+        </div>
+        <div className="space-y-1">
+          <label className="text-[9px] font-bold text-slate-500 uppercase whitespace-nowrap">RSSI &ge;</label>
+          <input type="number" value={filter.minRssi} onChange={(e) => setFilter({ ...filter, minRssi: e.target.value === '' ? '' : Number(e.target.value) })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
+        </div>
+      </div>
+      <div className="flex gap-1.5 items-center">
+        {filter.timePreset === 'CUSTOM' && (
+          <button
+            onClick={applyCustomDate}
+            className={`flex-1 p-1.5 rounded text-[9px] font-black uppercase transition-colors whitespace-nowrap ${darkMode ? 'bg-cyan-700 hover:bg-cyan-600 border border-cyan-600 text-white' : 'bg-cyan-500 hover:bg-cyan-400 border border-cyan-400 text-white'}`}
+            title="套用自定義日期範圍"
+          >
+            ✓ 確定
+          </button>
+        )}
+        <button
+          onClick={() => setFilter({ port: 'ALL', gateway: '', sender: '', minSnr: '', minRssi: '', timePreset: 'ALL', startTime: '', endTime: '' })}
+          className={`flex-1 p-1.5 rounded text-[9px] font-bold uppercase transition-colors whitespace-nowrap ${darkMode ? 'bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-500 border border-slate-200'}`}
+        >
+          清除過濾
+        </button>
+      </div>
+    </div>
+  );
+};
+
 function App() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [packets, setPackets] = useState<Packet[]>([]);
   const [favoritePackets, setFavoritePackets] = useState<Packet[]>([]);
   const [mqttConnected, setMqttConnected] = useState(false);
   const [activeTab, setActiveTab] = useState<'favorites' | 'nodes' | 'details' | 'map' | 'logs' | 'chat' | 'gateways'>('favorites');
+  const [nodeListSubTab, setNodeListSubTab] = useState<'list' | 'analytics'>('list');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [mapShowFavoritesOnly, setMapShowFavoritesOnly] = useState(false);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
@@ -172,10 +350,13 @@ function App() {
   // 🚀 懶加載封包詳情（payload_json + raw_hex）
   const [selectedPacketDetail, setSelectedPacketDetail] = useState<any>(null);
   const [loadingPacketDetail, setLoadingPacketDetail] = useState(false);
+  const [selectedPacketGateways, setSelectedPacketGateways] = useState<any[]>([]);
+  const [loadingPacketGateways, setLoadingPacketGateways] = useState(false);
   const [chatFilter, setChatFilter] = useState({ favoritesOnly: false, nodeId: '', searchText: '' });
   const [showChatAnalytics, setShowChatAnalytics] = useState(false);
   const [chatAnalyticsData, setChatAnalyticsData] = useState<any>(null);
   const [sysStatus, setSysStatus] = useState<any>(null);
+  const [displayedUptime, setDisplayedUptime] = useState<number | null>(null);
   const [appLoading, setAppLoading] = useState(true);
   const [coverageData, setCoverageData] = useState<any[]>([]);
   const [showTraceroute, setShowTraceroute] = useState(false);
@@ -432,6 +613,7 @@ function App() {
   const [globalFilter, setGlobalFilter] = useState({
     port: 'ALL',
     gateway: '',
+    sender: '',
     minSnr: '' as number | '',
     minRssi: '' as number | '',
     timePreset: 'ALL',
@@ -441,6 +623,7 @@ function App() {
   const [nodeLogFilter, setNodeLogFilter] = useState({
     port: 'ALL',
     gateway: '',
+    sender: '',
     minSnr: '' as number | '',
     minRssi: '' as number | '',
     timePreset: 'ALL',
@@ -450,6 +633,7 @@ function App() {
   const [favLogFilter, setFavLogFilter] = useState({
     port: 'ALL',
     gateway: '',
+    sender: '',
     minSnr: '' as number | '',
     minRssi: '' as number | '',
     timePreset: 'ALL',
@@ -461,6 +645,7 @@ function App() {
   const [nodeFilter, setNodeFilter] = useState({ role: 'ALL', hardware: 'ALL', timePreset: 'ALL' });
 
   const uniquePorts = useMemo(() => Array.from(new Set(Object.values(PORTNUM_NAMES))).sort(), []);
+  // 注意：uniquePorts 也在模組層級定義供 FilterBar 元件使用（filterbar 在 App 外部）
 
   // 自動從節點列表中找出被選中的節點物件
   const selectedNode = useMemo(() => {
@@ -500,7 +685,20 @@ function App() {
     return pkts.filter(p => {
       const type = PORTNUM_NAMES[p.portnum] || p.portnum;
       if (filter.port !== 'ALL' && type !== filter.port) return false;
-      if (filter.gateway && !p.gateway_id?.toLowerCase().includes(filter.gateway.toLowerCase())) return false;
+      if (filter.gateway) {
+        const q = filter.gateway.toLowerCase();
+        const n = nodes.find(n => n.node_id === p.gateway_id);
+        const matchesId = p.gateway_id?.toLowerCase().includes(q);
+        const matchesName = n && ((n.long_name && n.long_name.toLowerCase().includes(q)) || (n.short_name && n.short_name.toLowerCase().includes(q)));
+        if (!matchesId && !matchesName) return false;
+      }
+      if (filter.sender) {
+        const q = filter.sender.toLowerCase();
+        const n = nodes.find(n => n.node_id === p.from);
+        const matchesId = p.from?.toLowerCase().includes(q);
+        const matchesName = n && ((n.long_name && n.long_name.toLowerCase().includes(q)) || (n.short_name && n.short_name.toLowerCase().includes(q)));
+        if (!matchesId && !matchesName) return false;
+      }
 
       const pTime = p.timestamp ? new Date(p.timestamp).getTime() : 0;
       const now = Date.now();
@@ -518,8 +716,9 @@ function App() {
     });
   };
 
-  const filteredGlobalPackets = useMemo(() => applyFilter(packets, globalFilter), [packets, globalFilter]);
-  const filteredNodePackets = useMemo(() => applyFilter(nodePackets, nodeLogFilter), [nodePackets, nodeLogFilter]);
+  // 前端過濾器：只對 SNR/RSSI/時間做二次過濾（Gateway/Sender 已由後端 API 過濾完畢）
+  const filteredGlobalPackets = useMemo(() => packets, [packets]);
+  const filteredNodePackets = useMemo(() => nodePackets, [nodePackets]);
 
   const filteredGateways = useMemo(() => {
     return gatewayLeaderboard.filter(gw => {
@@ -530,65 +729,32 @@ function App() {
     });
   }, [gatewayLeaderboard, gatewayFilter]);
 
+
   const renderFilterBar = (filter: any, setFilter: any) => (
-    <div className={`p-3 border-b grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-8 gap-3 items-end ${darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-50/50 border-slate-100'}`}>
-      <div className="space-y-1">
-        <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap"><Filter size={10} /> 種類 (Type)</label>
-        <select value={filter.port} onChange={(e) => setFilter({ ...filter, port: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}>
-          <option value="ALL">全部種類 (ALL)</option>
-          {uniquePorts.map(p => <option key={p} value={p}>{p}</option>)}
-        </select>
-      </div>
-
-      <div className="space-y-1">
-        <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap"><Clock size={10} /> 時間範圍</label>
-        <select value={filter.timePreset} onChange={(e) => setFilter({ ...filter, timePreset: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`}>
-          <option value="ALL">全部 (ALL)</option>
-          <option value="1h">1 小時內</option>
-          <option value="6h">6 小時內</option>
-          <option value="24h">24 小時內</option>
-          <option value="CUSTOM">自定義範圍</option>
-        </select>
-      </div>
-
-      {filter.timePreset === 'CUSTOM' ? (
-        <>
-          <div className="space-y-1">
-            <label className="text-[9px] font-bold text-slate-500 uppercase">開始 (起)</label>
-            <input type="datetime-local" step="3600" value={filter.startTime} onChange={(e) => setFilter({ ...filter, startTime: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
-          </div>
-          <div className="space-y-1">
-            <label className="text-[9px] font-bold text-slate-500 uppercase">結束 (止)</label>
-            <input type="datetime-local" step="3600" value={filter.endTime} onChange={(e) => setFilter({ ...filter, endTime: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
-          </div>
-        </>
-      ) : (
-        <div className="hidden lg:block lg:col-span-2"></div>
-      )}
-
-      <div className="space-y-1">
-        <label className="text-[9px] font-bold text-slate-500 uppercase flex items-center gap-1 whitespace-nowrap"><Signal size={10} /> Gateway ID</label>
-        <input type="text" placeholder="搜尋閘道器..." value={filter.gateway} onChange={(e) => setFilter({ ...filter, gateway: e.target.value })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
-      </div>
-
-      <div className="grid grid-cols-2 gap-2">
-        <div className="space-y-1">
-          <label className="text-[9px] font-bold text-slate-500 uppercase whitespace-nowrap">SNR &ge;</label>
-          <input type="number" step="0.1" value={filter.minSnr} onChange={(e) => setFilter({ ...filter, minSnr: e.target.value === '' ? '' : Number(e.target.value) })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
-        </div>
-        <div className="space-y-1">
-          <label className="text-[9px] font-bold text-slate-500 uppercase whitespace-nowrap">RSSI &ge;</label>
-          <input type="number" value={filter.minRssi} onChange={(e) => setFilter({ ...filter, minRssi: e.target.value === '' ? '' : Number(e.target.value) })} className={`w-full p-1 rounded border text-[10px] outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-white border-slate-200'}`} />
-        </div>
-      </div>
-      <button onClick={() => setFilter({ port: 'ALL', gateway: '', minSnr: '', minRssi: '', timePreset: 'ALL', startTime: '', endTime: '' })} className={`p-1.5 rounded text-[9px] font-bold uppercase transition-colors ${darkMode ? 'bg-slate-800 hover:bg-slate-700 text-slate-400' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`}>清除過濾</button>
-    </div>
+    <FilterBar filter={filter} setFilter={setFilter} darkMode={darkMode} />
   );
+
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const selectedNodeIdRef = useRef<string | null>(null);
   const activeTabRef = useRef(activeTab);
   const currentChatChannelRef = useRef(currentChatChannel);
+  // 當任何過濾條件啟動時，禁止 WebSocket 即時封包污染查詢結果
+  const filterActiveRef = useRef(false);
+  const nodeFilterActiveRef = useRef(false);
+
+  // 同步 filterActiveRef
+  useEffect(() => {
+    const f = globalFilter;
+    filterActiveRef.current = f.port !== 'ALL' || !!f.gateway || !!f.sender ||
+      f.minSnr !== '' || f.minRssi !== '' || f.timePreset !== 'ALL';
+  }, [globalFilter]);
+
+  useEffect(() => {
+    const f = nodeLogFilter;
+    nodeFilterActiveRef.current = f.port !== 'ALL' || !!f.gateway || !!f.sender ||
+      f.minSnr !== '' || f.minRssi !== '' || f.timePreset !== 'ALL';
+  }, [nodeLogFilter]);
 
   const favoriteNodes = useMemo(() => {
     return nodes
@@ -684,19 +850,23 @@ function App() {
 
       if (filter.port && filter.port !== 'ALL') queryParams.append('portnum', filter.port);
       if (filter.gateway) queryParams.append('gateway_id', filter.gateway);
+      if (filter.sender) queryParams.append('sender', filter.sender);
       if (filter.minSnr !== '' && filter.minSnr !== undefined) queryParams.append('minSnr', filter.minSnr.toString());
       if (filter.minRssi !== '' && filter.minRssi !== undefined) queryParams.append('minRssi', filter.minRssi.toString());
+      
+      const formatToUTCString = (dateObj: Date) => dateObj.toISOString().replace('T', ' ').substring(0, 19);
+
       if (filter.timePreset === 'CUSTOM') {
-        if (filter.startTime) queryParams.append('timeStart', filter.startTime);
-        if (filter.endTime) queryParams.append('timeEnd', filter.endTime);
+        if (filter.startTime) queryParams.append('timeStart', formatToUTCString(new Date(filter.startTime)));
+        if (filter.endTime) queryParams.append('timeEnd', formatToUTCString(new Date(filter.endTime)));
       } else if (filter.timePreset !== 'ALL') {
         const now = new Date();
         let timeAgo = new Date();
         if (filter.timePreset === '1h') timeAgo.setHours(now.getHours() - 1);
         if (filter.timePreset === '6h') timeAgo.setHours(now.getHours() - 6);
         if (filter.timePreset === '24h') timeAgo.setHours(now.getHours() - 24);
-        queryParams.append('timeStart', timeAgo.toISOString());
-        queryParams.append('timeEnd', now.toISOString());
+        queryParams.append('timeStart', formatToUTCString(timeAgo));
+        queryParams.append('timeEnd', formatToUTCString(now));
       }
 
       if (type === 'global') {
@@ -780,25 +950,33 @@ function App() {
   const openPacketDetail = useCallback(async (packet: Packet) => {
     setSelectedPacket(packet);
     setSelectedPacketDetail(null);
+    setSelectedPacketGateways([]);
     // 如果封包是從 WebSocket 即時進來的（有 payload_json），直接用
     if (packet.payload_json !== undefined) {
       setSelectedPacketDetail({ payload_json: packet.payload_json, rawData: packet.rawData });
       return;
     }
-    // 否則從 API 懶加載
+    // 否則從 API 懶加載（同時取得封包詳情與所有收到該封包的 gateway）
     if (!packet.id) return;
     setLoadingPacketDetail(true);
+    setLoadingPacketGateways(true);
     try {
-      const res = await fetch(`/api/packets/${packet.id}`);
+      const [res, gwRes] = await Promise.all([
+        fetch(`/api/packets/${packet.id}`),
+        fetch(`/api/packets/${packet.id}/gateways`)
+      ]);
       const detail = await res.json();
+      const gwData = await gwRes.json();
       setSelectedPacketDetail({
         payload_json: detail.payload_json,
         rawData: detail.raw_hex
       });
+      setSelectedPacketGateways(Array.isArray(gwData) ? gwData : []);
     } catch (e) {
       console.error('Failed to load packet detail:', e);
     } finally {
       setLoadingPacketDetail(false);
+      setLoadingPacketGateways(false);
     }
   }, []);
 
@@ -821,11 +999,23 @@ function App() {
       const aData = await aRes.json();
 
       setSysStatus(sData);
+      // 🚀 以伺服器回傳的 uptime 作為起點，之後由本地計時器每秒遞增
+      if (sData?.uptime != null) setDisplayedUptime(sData.uptime);
       const activityMap: Record<string, number> = {};
       aData.forEach((item: any) => activityMap[item.node_id] = item.count);
       setNodeActivity(activityMap);
     } catch (e) { }
   }, []);
+
+  // 🚀 每秒遞增 displayedUptime，讓頁面底部的連續運行時間動態計時
+  useEffect(() => {
+    if (displayedUptime == null) return;
+    const timer = setInterval(() => {
+      setDisplayedUptime(prev => (prev != null ? prev + 1 : prev));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [displayedUptime == null]);
+
 
   const estimateBatteryLife = (node: Node) => {
     if (!node.voltage || node.voltage < 3.2) return "N/A";
@@ -836,7 +1026,6 @@ function App() {
 
   const fetchNodeStats = async (nodeId: string) => {
     setLoadingPackets(true);
-    setNodePacketsCurrentPage(1);
     try {
       const [gwRes, statRes] = await Promise.all([
         fetch(`/api/node/${encodeURIComponent(nodeId)}/gateways`),
@@ -853,6 +1042,9 @@ function App() {
   };
 
   const handleShowModal = (nodeId: string) => {
+    if (selectedNodeId !== nodeId) {
+      setNodePacketsCurrentPage(1);
+    }
     setSelectedNodeId(nodeId);
     setIsDetailModalOpen(true);
   };
@@ -1150,10 +1342,11 @@ function App() {
 
       // 3. 一次性更新封包串流
       const mqttPackets = packets.filter(p => !p.source);
-      if (mqttPackets.length > 0) {
+      if (mqttPackets.length > 0 && !filterActiveRef.current) {
         setPackets(prev => {
           const formatted = mqttPackets.map(packet => ({
             ...packet,
+            from: packet.node_id,
             timestamp: nowIso,
             time: nowTime,
             payload_json: packet.payload_json
@@ -1263,6 +1456,11 @@ function App() {
   useEffect(() => {
     if (selectedNodeId) {
       fetchNodeStats(selectedNodeId);
+    }
+  }, [selectedNodeId]);
+
+  useEffect(() => {
+    if (selectedNodeId) {
       fetchNodeSpecificPackets(selectedNodeId, nodePacketsCurrentPage, nodeLogFilter);
     }
   }, [selectedNodeId, nodePacketsCurrentPage, nodeLogFilter, fetchNodeSpecificPackets]);
@@ -1355,6 +1553,11 @@ function App() {
 
   return (
     <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans text-${fontSize}`}>
+      <datalist id="node-list">
+        {nodes.map(n => (
+          <option key={n.node_id} value={n.node_id}>{n.long_name || n.node_id} ({n.short_name || '?'})</option>
+        ))}
+      </datalist>
       {/* Top Navbar */}
       <nav className={`${darkMode ? 'bg-slate-900' : 'bg-[#1e293b]'} text-white px-6 py-3 flex justify-between items-center shadow-lg border-b ${darkMode ? 'border-slate-800' : 'border-slate-700'}`}>
         <div className="flex items-center gap-3">
@@ -1454,7 +1657,35 @@ function App() {
           <main className="flex-1 w-full">
             {activeTab === 'nodes' && (
               <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
-                <div className="flex flex-col lg:flex-row gap-4 mb-4">
+                {/* 🚀 節點清單 / 戰情統計 次級 Tab 切換列 */}
+                <div className={`p-1.5 rounded-xl border inline-flex gap-1 shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <button
+                    onClick={() => setNodeListSubTab('list')}
+                    className={`px-4 py-2 rounded-lg text-xs font-black transition-all flex items-center gap-2 ${
+                      nodeListSubTab === 'list'
+                        ? 'bg-cyan-500 text-white shadow-md'
+                        : darkMode ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <List size={16} /> 📋 節點清單 (Node List)
+                  </button>
+                  <button
+                    onClick={() => setNodeListSubTab('analytics')}
+                    className={`px-4 py-2 rounded-lg text-xs font-black transition-all flex items-center gap-2 ${
+                      nodeListSubTab === 'analytics'
+                        ? 'bg-cyan-500 text-white shadow-md'
+                        : darkMode ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <BarChart3 size={16} /> 📊 全網戰情分析 (Network Analytics)
+                  </button>
+                </div>
+
+                {nodeListSubTab === 'analytics' ? (
+                  <NetworkAnalytics darkMode={darkMode} />
+                ) : (
+                  <>
+                    <div className="flex flex-col lg:flex-row gap-4 mb-4">
                   <div className="relative flex-1 max-w-md">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
                     <input
@@ -1599,6 +1830,8 @@ function App() {
                     </tbody>
                   </table>
                 </div>
+                  </>
+                )}
               </div>
             )}
 
@@ -2071,7 +2304,7 @@ function App() {
                             <th className="p-3">時間</th>
                             <th className="p-3">發送者</th>
                             <th className="p-3">種類</th>
-                            <th className="p-3">Gateway</th>
+                            <th className="p-3">Gateway (最後轉傳)</th>
                             <th className="p-3 text-center">SNR/RSSI</th>
                             <th className="p-3 text-right">詳情</th>
                           </tr>
@@ -2393,7 +2626,7 @@ function App() {
                               <tr>
                                 <th className="p-3">收到時間</th>
                                 <th className="p-3">種類</th>
-                                <th className="p-3">Gateway</th>
+                                <th className="p-3">Gateway (最後轉傳)</th>
                                 <th className="p-3 text-center">SNR/RSSI</th>
                               </tr>
                             </thead>
@@ -2451,6 +2684,12 @@ function App() {
                             </tbody>
                           </table>
                           {filteredNodePackets.length === 0 && <div className="p-10 text-center text-slate-300 italic">無符合過濾條件之紀錄</div>}
+                          <div className={`p-4 border-t flex justify-end items-center gap-4 ${darkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                            <span className="text-xs text-slate-500">總計 {nodePacketsTotalCount} 筆</span>
+                            <button onClick={() => setNodePacketsCurrentPage(prev => Math.max(1, prev - 1))} disabled={nodePacketsCurrentPage === 1 || loadingPackets} className={`px-3 py-1 rounded text-xs font-bold ${darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'} disabled:opacity-50`}>上一頁</button>
+                            <span className="text-xs font-bold text-slate-400">{nodePacketsCurrentPage} / {Math.ceil(nodePacketsTotalCount / packetsPerPage) || 1}</span>
+                            <button onClick={() => setNodePacketsCurrentPage(prev => prev + 1)} disabled={nodePacketsCurrentPage * packetsPerPage >= nodePacketsTotalCount || loadingPackets} className={`px-3 py-1 rounded text-xs font-bold ${darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'} disabled:opacity-50`}>下一頁</button>
+                          </div>
                         </div>
                       </section>
                     </div>
@@ -3031,7 +3270,7 @@ function App() {
                           <th className="p-3">收到時間</th>
                           <th className="p-3">發送者 (Sender)</th>
                           <th className="p-3">種類 (Port)</th>
-                          <th className="p-3">Gateway</th>
+                          <th className="p-3">Gateway (最後轉傳)</th>
                           <th className="p-3 text-center">SNR/RSSI</th>
                           <th className="p-3 text-right">詳情</th>
                         </tr>
@@ -3227,7 +3466,7 @@ function App() {
             {/* 封包細節解析懸浮頁 (Packet JSON Detail Modal) */}
             {selectedPacket && (
               <div className="fixed inset-0 z-[3000] flex items-center justify-center p-6">
-                <div className="absolute inset-0 bg-black/80 backdrop-blur-md" onClick={() => { setSelectedPacket(null); setSelectedPacketDetail(null); }}></div>
+                <div className="absolute inset-0 bg-black/80 backdrop-blur-md" onClick={() => { setSelectedPacket(null); setSelectedPacketDetail(null); setSelectedPacketGateways([]); }}></div>
                 <div className={`relative w-full max-w-2xl rounded-2xl shadow-2xl border overflow-hidden flex flex-col max-h-[80vh] ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
                   <div className="p-4 bg-blue-600 text-white flex justify-between items-center">
                     <div className="flex items-center gap-2">
@@ -3237,8 +3476,9 @@ function App() {
                         <span className="text-[10px] text-blue-200 animate-pulse ml-1">Loading detail...</span>
                       )}
                     </div>
-                    <button onClick={() => { setSelectedPacket(null); setSelectedPacketDetail(null); }} className="hover:rotate-90 transition-transform"><X size={20} /></button>
+                    <button onClick={() => { setSelectedPacket(null); setSelectedPacketDetail(null); setSelectedPacketGateways([]); }} className="hover:rotate-90 transition-transform"><X size={20} /></button>
                   </div>
+
 
                   <div className="p-6 overflow-y-auto space-y-4">
                     <div className="grid grid-cols-2 gap-4 text-[11px]">
@@ -3324,6 +3564,77 @@ function App() {
                     {/* 🚀 使用懶加載的 detail 資料渲染視覺化 */}
                     {selectedPacketDetail && renderPacketVisualizer({ ...selectedPacket, payload_json: selectedPacketDetail.payload_json, rawData: selectedPacketDetail.rawData })}
 
+                    {/* 📡 所有收到該封包的 Gateway 列表 */}
+                    <div>
+                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block flex items-center gap-1">
+                        <Signal size={12} className="text-cyan-500" /> 收到此封包的閘道器 (Received Gateways)
+                        {loadingPacketGateways && <span className="text-[9px] text-cyan-400 animate-pulse ml-1">載入中...</span>}
+                      </span>
+                      {selectedPacketGateways.length > 0 ? (
+                        <div className={`rounded-xl overflow-hidden border ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                          <table className="w-full text-[10px] font-mono">
+                            <thead className={`${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>
+                              <tr>
+                                <th className="p-2 text-left font-black uppercase">Gateway ID</th>
+                                <th className="p-2 text-left font-black uppercase">名稱</th>
+                                <th className="p-2 text-center font-black uppercase">SNR</th>
+                                <th className="p-2 text-center font-black uppercase">RSSI</th>
+                                <th className="p-2 text-center font-black uppercase">跳數</th>
+                                <th className="p-2 text-right font-black uppercase">收到時間</th>
+                              </tr>
+                            </thead>
+                            <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+                              {selectedPacketGateways.map((gw, i) => {
+                                const gwNode = nodes.find(n => n.node_id === gw.gateway_id);
+                                const isCurrent = gw.gateway_id === selectedPacket.gateway_id;
+                                return (
+                                  <tr key={i} className={`${isCurrent ? (darkMode ? 'bg-cyan-900/30' : 'bg-cyan-50') : ''}`}>
+                                    <td className="p-2">
+                                      <button
+                                        onClick={() => {
+                                          setSelectedPacket(null);
+                                          setSelectedPacketDetail(null);
+                                          setSelectedPacketGateways([]);
+                                          handleShowModal(gw.gateway_id);
+                                        }}
+                                        className={`font-bold hover:underline text-left ${
+                                          isCurrent
+                                            ? 'text-cyan-400'
+                                            : darkMode
+                                            ? 'text-blue-400 hover:text-blue-300'
+                                            : 'text-blue-600 hover:text-blue-800'
+                                        }`}
+                                        title="查看此 Gateway 的節點詳情"
+                                      >
+                                        {gw.gateway_id}{isCurrent && <span className="ml-1 text-[8px] text-cyan-500">(此筆)</span>}
+                                      </button>
+                                    </td>
+                                    <td className="p-2 text-slate-400">{gwNode?.long_name || gwNode?.short_name || '--'}</td>
+                                    <td className="p-2 text-center">
+                                      <span className={gw.snr >= 0 ? 'text-green-400' : gw.snr >= -10 ? 'text-yellow-400' : 'text-red-400'}>
+                                        {gw.snr?.toFixed(2) ?? '--'} dB
+                                      </span>
+                                    </td>
+                                    <td className="p-2 text-center text-slate-400">{gw.rssi ?? '--'} dBm</td>
+                                    <td className="p-2 text-center text-slate-400">{gw.hops_away ?? '--'}</td>
+                                    <td className="p-2 text-right text-slate-500">
+                                      {gw.timestamp ? new Date(gw.timestamp.includes(' ') ? gw.timestamp.replace(' ', 'T') + 'Z' : gw.timestamp).toLocaleTimeString('zh-TW', { hour12: false }) : '--'}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
+                        !loadingPacketGateways && (
+                          <div className={`p-3 rounded-xl text-center text-[10px] italic ${darkMode ? 'bg-slate-800 text-slate-500' : 'bg-slate-50 text-slate-400'}`}>
+                            僅由單一 Gateway 收到，或無閘道器資訊
+                          </div>
+                        )
+                      )}
+                    </div>
+
                     <div>
                       <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block">Decoded JSON Data</span>
                       <div className={`p-4 rounded-xl font-mono text-xs overflow-x-auto ${darkMode ? 'bg-black text-emerald-400' : 'bg-slate-900 text-slate-200'}`}>
@@ -3347,7 +3658,8 @@ function App() {
                         </div>
                       </div>
                     )}
-                  </div>
+
+                  </div>{/* end p-6 overflow-y-auto */}
 
                   <div className={`p-4 border-t text-[10px] text-center font-bold tracking-widest ${darkMode ? 'border-slate-800 text-slate-600' : 'border-slate-100 text-slate-400'}`}>
                     NODE_ID: {selectedPacket.from} | GW: {selectedPacket.gateway_id}
@@ -3355,6 +3667,7 @@ function App() {
                 </div>
               </div>
             )}
+
 
 
           </main>
@@ -3369,7 +3682,7 @@ function App() {
               <div className="flex items-center gap-6">
                 <div className="flex items-center gap-1.5 uppercase tracking-widest">
                   <Activity size={12} className="text-orange-500" />
-                  連續運行時間: {sysStatus?.uptime ? `${Math.floor(sysStatus.uptime / 3600)}h ${Math.floor((sysStatus.uptime % 3600) / 60)}m` : '--'}
+                  連續運行時間: {displayedUptime != null ? `${Math.floor(displayedUptime / 3600)}h ${Math.floor((displayedUptime % 3600) / 60)}m ${Math.floor(displayedUptime % 60)}s` : '--'}
                 </div>
                 <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.2</div>
               </div>

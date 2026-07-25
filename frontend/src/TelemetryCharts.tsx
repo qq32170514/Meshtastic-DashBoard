@@ -72,7 +72,8 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
       legend: { 
         position: 'top' as const,
         labels: { boxWidth: 10, font: { size: 10 } }
-      }
+      },
+      tooltip: { mode: 'index' as const, intersect: false }
     },
     scales: {
       x: { 
