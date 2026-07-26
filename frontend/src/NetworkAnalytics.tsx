@@ -146,7 +146,26 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
   const [traffic, setTraffic] = useState<TrafficPoint[]>([]);
   const [signalHealth, setSignalHealth] = useState<SignalHealthPoint[]>([]);
   const [hopDist, setHopDist] = useState<HopDistPoint[]>([]);
+  const [hopAnalysis, setHopAnalysis] = useState<{
+    actualHops: { hop: number; count: number }[];
+    configuredHops: { hop: number; count: number }[];
+    avgActualHops: number;
+    avgConfiguredHops: number;
+    diff: number;
+    recommendation: string | null;
+  } | null>(null);
   const [hourlyActivity, setHourlyActivity] = useState<HourlyPoint[]>([]);
+  const [hourlyStacked, setHourlyStacked] = useState<any[]>([]);
+  const [cuDist, setCuDist] = useState<{
+    totalNodes: number;
+    avgCU: number;
+    tiers: {
+      critical: { count: number; pct: number; nodes: any[] };
+      congested: { count: number; pct: number; nodes: any[] };
+      normal: { count: number; pct: number; nodes: any[] };
+      low: { count: number; pct: number; nodes: any[] };
+    };
+  } | null>(null);
   const [hwModels, setHwModels] = useState<ModelPoint[]>([]);
   const [firmwareVersions, setFirmwareVersions] = useState<{ series: FirmwarePoint[]; exact: FirmwarePoint[] }>({ series: [], exact: [] });
   const [fwViewMode, setFwViewMode] = useState<'series' | 'exact'>('series');
@@ -166,7 +185,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
     cwaStationCount: number;
     cwaReady: boolean;
   } | null>(null);
-  const [cwaViewMode, setCwaViewMode] = useState<'region' | 'nodes' | 'map'>('region');
+  const [cwaViewMode, setCwaViewMode] = useState<'region' | 'nodes' | 'map'>('map');
 
   const fetchData = async (range: string) => {
     setLoading(true);
@@ -178,7 +197,10 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         trafficRes,
         signalRes,
         hopRes,
+        hopAnalysisRes,
         hourlyRes,
+        hourlyStackedRes,
+        cuRes,
         modelRes,
         fwRes,
         envRes,
@@ -191,7 +213,10 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fetch(`/api/analytics/traffic?range=${range}`),
         fetch(`/api/analytics/signal-health?range=${range}`),
         fetch(`/api/analytics/hop-distribution?range=${range}`),
+        fetch('/api/analytics/hop-distribution'),
         fetch(`/api/analytics/hourly-activity?range=${range}`),
+        fetch('/api/analytics/hourly-peak-stacked'),
+        fetch('/api/analytics/cu-distribution'),
         fetch('/api/analytics/hardware-models'),
         fetch('/api/analytics/firmware-versions'),
         fetch(`/api/analytics/environment-trends?range=${range}`),
@@ -206,7 +231,10 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         trafficData,
         signalData,
         hopData,
+        hopAnalysisData,
         hourlyData,
+        hourlyStackedData,
+        cuData,
         modelData,
         fwData,
         envData,
@@ -219,7 +247,10 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         trafficRes.json(),
         signalRes.json(),
         hopRes.json(),
+        hopAnalysisRes.json(),
         hourlyRes.json(),
+        hourlyStackedRes.json(),
+        cuRes.json(),
         modelRes.json(),
         fwRes.json(),
         envRes.json(),
@@ -233,6 +264,10 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
       setTraffic(Array.isArray(trafficData) ? trafficData : []);
       setSignalHealth(Array.isArray(signalData) ? signalData : []);
       setHopDist(Array.isArray(hopData) ? hopData : []);
+      if (hopAnalysisData && !hopAnalysisData.error) setHopAnalysis(hopAnalysisData);
+      setHourlyActivity(Array.isArray(hourlyData) ? hourlyData : []);
+      if (Array.isArray(hourlyStackedData)) setHourlyStacked(hourlyStackedData);
+      if (cuData && !cuData.error) setCuDist(cuData);
       setHourlyActivity(Array.isArray(hourlyData) ? hourlyData : []);
       setHwModels(Array.isArray(modelData) ? modelData : []);
       setFirmwareVersions({
@@ -383,16 +418,16 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
           </div>
         </div>
 
-        {/* 右圖: 跳數傳播深度分佈圖 (Hop Count) */}
+        {/* 右圖: 跳數傳播深度分佈圖 (Hop Count) & 網路健康診斷 */}
         <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
           <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
             <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-indigo-500">
               <Share2 size={16} /> 跳數傳播深度分佈 (Hop Count Distribution)
             </h3>
-            <span className="text-[10px] text-slate-400 font-mono">Direct vs Multi-Hop 比例</span>
+            <span className="text-[10px] text-slate-400 font-mono">實際跳數 vs 預設 Hop 限額</span>
           </div>
 
-          <div className="h-64 w-full">
+          <div className="h-48 w-full">
             {hopDist.length === 0 ? (
               <div className="h-full flex items-center justify-center text-slate-500 italic text-xs">
                 {loading ? '載入跳數分佈中...' : '暫無跳數分佈紀錄'}
@@ -413,10 +448,83 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
               </ResponsiveContainer>
             )}
           </div>
+
+          {/* 💡 網路 Hop 數健康度診斷提醒卡片 */}
+          {hopAnalysis && hopAnalysis.recommendation && (
+            <div className={`p-3 rounded-xl border text-[11px] font-mono leading-relaxed shadow-sm ${
+              hopAnalysis.diff >= 1.2
+                ? 'bg-amber-950/30 border-amber-500/40 text-amber-300'
+                : 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+            }`}>
+              <div className="font-bold flex items-center justify-between mb-1 text-xs">
+                <span>💡 Hop 網路傳播健康度診斷</span>
+                <span>實際 {hopAnalysis.avgActualHops} 跳 / 設定 {hopAnalysis.avgConfiguredHops} 跳</span>
+              </div>
+              <div>{hopAnalysis.recommendation}</div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* 🚀 4. 流量負載與時段熱區 (Traffic & Peak Hours) */}
+      {/* 🚀 4. 頻道佔用率 (CU) 4 階健康度分級與風險分析 */}
+      {cuDist && (
+        <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
+            <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-cyan-400">
+              <Activity size={16} /> 頻道佔用率 (Channel Utilization) 4 階分級統計
+            </h3>
+            <span className="text-[10px] text-slate-400 font-mono">全網平均 CU: {cuDist.avgCU}%</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="p-3.5 rounded-xl border border-red-500/40 bg-red-950/30 space-y-1">
+              <div className="flex justify-between items-center text-xs font-bold text-red-300">
+                <span>🚨 危險 (Dangerous)</span>
+                <span>≥ 25%</span>
+              </div>
+              <div className="text-2xl font-black font-mono text-red-400">
+                {cuDist.tiers.critical.count} <span className="text-xs text-red-400/80 font-normal">節點 ({cuDist.tiers.critical.pct}%)</span>
+              </div>
+              <div className="text-[10px] text-slate-400">頻寬嚴重耗盡，碰撞風險極高</div>
+            </div>
+
+            <div className="p-3.5 rounded-xl border border-orange-500/40 bg-orange-950/30 space-y-1">
+              <div className="flex justify-between items-center text-xs font-bold text-orange-300">
+                <span>⚠️ 壅塞 (Congested)</span>
+                <span>20% - 25%</span>
+              </div>
+              <div className="text-2xl font-black font-mono text-orange-400">
+                {cuDist.tiers.congested.count} <span className="text-xs text-orange-400/80 font-normal">節點 ({cuDist.tiers.congested.pct}%)</span>
+              </div>
+              <div className="text-[10px] text-slate-400">通道流量熱化，建議關注</div>
+            </div>
+
+            <div className="p-3.5 rounded-xl border border-emerald-500/40 bg-emerald-950/30 space-y-1">
+              <div className="flex justify-between items-center text-xs font-bold text-emerald-300">
+                <span>🟢 普通 (Normal)</span>
+                <span>5% - 20%</span>
+              </div>
+              <div className="text-2xl font-black font-mono text-emerald-400">
+                {cuDist.tiers.normal.count} <span className="text-xs text-emerald-400/80 font-normal">節點 ({cuDist.tiers.normal.pct}%)</span>
+              </div>
+              <div className="text-[10px] text-slate-400">負載健康，傳播順暢</div>
+            </div>
+
+            <div className="p-3.5 rounded-xl border border-blue-500/40 bg-blue-950/30 space-y-1">
+              <div className="flex justify-between items-center text-xs font-bold text-blue-300">
+                <span>🔵 低度使用 (Low)</span>
+                <span>&lt; 5%</span>
+              </div>
+              <div className="text-2xl font-black font-mono text-blue-400">
+                {cuDist.tiers.low.count} <span className="text-xs text-blue-400/80 font-normal">節點 ({cuDist.tiers.low.pct}%)</span>
+              </div>
+              <div className="text-[10px] text-slate-400">極度空閒或初次上線</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 🚀 5. 流量負載與時段熱區 (Traffic & Peak Hours) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* 左側 2 欄: 活躍與幽靈趨勢折線圖 */}
         <div className={`lg:col-span-2 p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
@@ -448,28 +556,33 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
           </div>
         </div>
 
-        {/* 右側 1 欄: 24小時時段熱門活動高峰圖 */}
+        {/* 右側 1 欄: 24小時時段熱門活動高峰圖 (依封包種類堆疊) */}
         <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
           <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
             <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-amber-500">
               <Clock size={16} /> 24 小時熱點活動高峰 (Hourly Peak)
             </h3>
-            <span className="text-[10px] text-slate-400 font-mono">00:00 ~ 23:00</span>
+            <span className="text-[10px] text-slate-400 font-mono">00:00 ~ 23:00 (依類型堆疊)</span>
           </div>
 
           <div className="h-64 w-full">
-            {hourlyActivity.length === 0 ? (
+            {hourlyStacked.length === 0 ? (
               <div className="h-full flex items-center justify-center text-slate-500 italic text-xs">
                 {loading ? '載入時段熱區中...' : '暫無時段活動數據'}
               </div>
             ) : (
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={hourlyActivity} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
+                <BarChart data={hourlyStacked} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke={darkMode ? '#1e293b' : '#f1f5f9'} />
                   <XAxis dataKey="hour" stroke={darkMode ? '#64748b' : '#94a3b8'} tick={{ fontSize: 9 }} interval={3} />
                   <YAxis stroke={darkMode ? '#64748b' : '#94a3b8'} tick={{ fontSize: 10 }} />
                   <Tooltip contentStyle={customTooltipStyle} />
-                  <Bar dataKey="count" name="封包數量" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                  <Legend wrapperStyle={{ fontSize: '10px', paddingTop: '4px' }} />
+                  <Bar dataKey="text" name="文字訊息" stackId="a" fill="#06b6d4" />
+                  <Bar dataKey="position" name="位置廣播" stackId="a" fill="#10b981" />
+                  <Bar dataKey="telemetry" name="遙測數據" stackId="a" fill="#f59e0b" />
+                  <Bar dataKey="routing" name="路由控制" stackId="a" fill="#8b5cf6" />
+                  <Bar dataKey="other" name="其他" stackId="a" fill="#64748b" />
                 </BarChart>
               </ResponsiveContainer>
             )}

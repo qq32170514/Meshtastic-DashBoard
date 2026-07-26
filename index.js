@@ -1438,6 +1438,202 @@ app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
 });
 
 // ==========================================
+// 📊 API 2.1: 跳數傳播深度分佈 (Hop Count Distribution & 診斷)
+// ==========================================
+app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
+    const sqlActual = `
+        SELECT 
+            COALESCE(hops_away, (hop_start - hop_limit)) as hop,
+            COUNT(*) as count
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-24 hours')
+          AND (hops_away IS NOT NULL OR (hop_start IS NOT NULL AND hop_limit IS NOT NULL))
+          AND COALESCE(hops_away, (hop_start - hop_limit)) >= 0
+        GROUP BY hop
+        ORDER BY hop ASC
+    `;
+    
+    const sqlConfigured = `
+        SELECT 
+            hop_limit as hop,
+            COUNT(*) as count
+        FROM nodes
+        WHERE hop_limit IS NOT NULL AND hop_limit > 0
+          AND last_seen >= datetime('now', '-7 days')
+        GROUP BY hop_limit
+        ORDER BY hop_limit ASC
+    `;
+
+    db.all(sqlActual, [], (err, actualRows) => {
+        db.all(sqlConfigured, [], (cErr, configuredRows) => {
+            let actualTotal = 0, actualSum = 0;
+            (actualRows || []).forEach(r => {
+                actualTotal += r.count;
+                actualSum += r.hop * r.count;
+            });
+            const avgActualHops = actualTotal > 0 ? Math.round((actualSum / actualTotal) * 10) / 10 : 0;
+
+            let confTotal = 0, confSum = 0;
+            (configuredRows || []).forEach(r => {
+                confTotal += r.count;
+                confSum += r.hop * r.count;
+            });
+            const avgConfiguredHops = confTotal > 0 ? Math.round((confSum / confTotal) * 10) / 10 : 0;
+
+            const diff = Math.round((avgConfiguredHops - avgActualHops) * 10) / 10;
+            let recommendation = null;
+            if (avgConfiguredHops > 0 && avgActualHops > 0 && diff >= 1.2) {
+                recommendation = `💡 網路診斷提醒：全網封包實際傳播深度平均僅 ${avgActualHops} 跳，但節點預設的 Hop Limit 限額平均高達 ${avgConfiguredHops} 跳（相差 ${diff} 跳）。建議引導用戶將 Hop Limit 降低至 2~3，以大幅減少無謂重複廣播與頻道碰撞，有效節省 Mesh 頻寬！`;
+            } else {
+                recommendation = `✅ 網路診斷良好：封包實際跳轉數 (${avgActualHops} 跳) 與節點 Hop 限額設定 (${avgConfiguredHops} 跳) 匹配良好，頻寬利用順暢。`;
+            }
+
+            res.json({
+                actualHops: actualRows || [],
+                configuredHops: configuredRows || [],
+                avgActualHops,
+                avgConfiguredHops,
+                diff,
+                recommendation
+            });
+        });
+    });
+});
+
+// ==========================================
+// 📊 API 2.2: 24 小時熱點活動高峰 (依封包種類堆疊)
+// ==========================================
+app.get('/api/analytics/hourly-peak-stacked', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            strftime('%H', timestamp) as hour,
+            portnum,
+            COUNT(*) as count
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-24 hours')
+        GROUP BY hour, portnum
+        ORDER BY hour ASC
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        
+        const hoursMap = {};
+        for (let i = 0; i < 24; i++) {
+            const h = i.toString().padStart(2, '0');
+            hoursMap[h] = { hour: `${h}:00`, text: 0, position: 0, telemetry: 0, routing: 0, admin: 0, other: 0, total: 0 };
+        }
+
+        (rows || []).forEach(r => {
+            const h = r.hour;
+            if (!hoursMap[h]) return;
+            const cnt = r.count;
+            const p = r.portnum;
+            hoursMap[h].total += cnt;
+
+            if (p === 1) hoursMap[h].text += cnt;
+            else if (p === 3) hoursMap[h].position += cnt;
+            else if (p === 67) hoursMap[h].telemetry += cnt;
+            else if (p === 32) hoursMap[h].routing += cnt;
+            else if (p === 6) hoursMap[h].admin += cnt;
+            else hoursMap[h].other += cnt;
+        });
+
+        res.json(Object.values(hoursMap));
+    });
+});
+
+// ==========================================
+// 📊 API 2.3: 頻道佔用率 (CU) 分級統計
+// ==========================================
+app.get('/api/analytics/cu-distribution', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            t.node_id,
+            t.channel_utilization as cu,
+            n.long_name,
+            n.short_name,
+            n.last_seen
+        FROM telemetry_data t
+        INNER JOIN (
+            SELECT node_id, MAX(timestamp) as max_ts
+            FROM telemetry_data
+            WHERE channel_utilization IS NOT NULL AND timestamp >= datetime('now', '-24 hours')
+            GROUP BY node_id
+        ) latest ON t.node_id = latest.node_id AND t.timestamp = latest.max_ts
+        INNER JOIN nodes n ON t.node_id = n.node_id
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const critical = [];
+        const congested = [];
+        const normal = [];
+        const low = [];
+        let sumCU = 0;
+
+        (rows || []).forEach(r => {
+            const cu = Math.round(r.channel_utilization * 10) / 10;
+            sumCU += cu;
+            const item = { nodeId: r.node_id, name: r.long_name || r.short_name || r.node_id, cu };
+            if (cu >= 25) critical.push(item);
+            else if (cu >= 20) congested.push(item);
+            else if (cu >= 5) normal.push(item);
+            else low.push(item);
+        });
+
+        const total = (rows || []).length;
+        const avgCU = total > 0 ? Math.round((sumCU / total) * 10) / 10 : 0;
+
+        res.json({
+            totalNodes: total,
+            avgCU,
+            tiers: {
+                critical: { count: critical.length, pct: total > 0 ? Math.round((critical.length / total) * 100) : 0, nodes: critical },
+                congested: { count: congested.length, pct: total > 0 ? Math.round((congested.length / total) * 100) : 0, nodes: congested },
+                normal: { count: normal.length, pct: total > 0 ? Math.round((normal.length / total) * 100) : 0, nodes: normal },
+                low: { count: low.length, pct: total > 0 ? Math.round((low.length / total) * 100) : 0, nodes: low }
+            }
+        });
+    });
+});
+
+// ==========================================
+// 🛰️ API 2.4: 閘道器經手節點清單
+// ==========================================
+app.get('/api/gateway/relayed-nodes/:gatewayId', (req, res) => {
+    const gatewayId = req.params.gatewayId;
+    const sql = `
+        SELECT 
+            p.node_id,
+            n.long_name,
+            n.short_name,
+            n.latitude,
+            n.longitude,
+            COUNT(p.id) as packet_count,
+            MAX(p.timestamp) as last_activity,
+            ROUND(AVG(p.snr), 1) as avg_snr,
+            ROUND(AVG(p.rssi), 0) as avg_rssi
+        FROM packet_logs p
+        LEFT JOIN nodes n ON p.node_id = n.node_id
+        WHERE p.gateway_id = ? AND p.timestamp >= datetime('now', '-24 hours')
+        GROUP BY p.node_id
+        ORDER BY last_activity DESC
+    `;
+
+    db.all(sql, [gatewayId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({
+            gatewayId,
+            relayedCount: (rows || []).length,
+            totalPackets: (rows || []).reduce((sum, r) => sum + r.packet_count, 0),
+            relayedNodes: rows || []
+        });
+    });
+});
+
+// ==========================================
 // 🎯 API 3: 精準地理配對比對 (Per-Node Nearest Station)
 // 每個 Mesh 節點 → 找最近 CWA 站 → 個別 ΔT / ΔH → 按縣市分區聚合
 // ==========================================

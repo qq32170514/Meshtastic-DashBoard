@@ -119,7 +119,40 @@ const getHopColor = (hops: number) => {
 
 const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
+  const [mapColorMode, setMapColorMode] = useState<'role' | 'cu'>('role');
+  const [selectedGwId, setSelectedGwId] = useState<string | null>(null);
+  const [relayedNodesData, setRelayedNodesData] = useState<{
+    gatewayId: string;
+    relayedCount: number;
+    totalPackets: number;
+    relayedNodes: any[];
+  } | null>(null);
+
   const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
+
+  const getCuColor = (cu?: number | null) => {
+    if (cu === null || cu === undefined || isNaN(cu)) return '#94a3b8';
+    if (cu >= 25) return '#ef4444'; // 🚨 危險
+    if (cu >= 20) return '#f97316'; // ⚠️ 壅塞
+    if (cu >= 5) return '#22c55e';  // 🟢 普通
+    return '#3b82f6';               // 🔵 低度使用
+  };
+
+  const handleGatewayClick = async (gwId: string) => {
+    if (selectedGwId === gwId) {
+      setSelectedGwId(null);
+      setRelayedNodesData(null);
+      return;
+    }
+    setSelectedGwId(gwId);
+    try {
+      const res = await fetch(`/api/gateway/relayed-nodes/${encodeURIComponent(gwId)}`);
+      const data = await res.json();
+      setRelayedNodesData(data);
+    } catch (err) {
+      console.error("Fetch relayed nodes error:", err);
+    }
+  };
 
   const MapController = ({ center }: { center?: [number, number] }) => {
     const map = useMap();
@@ -505,56 +538,92 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           return gatewayMarkers.map((gw: any) => {
             const packets = gw.total_packets || gw.count || 0;
             const hops = gw.hop_start - gw.hop_limit;
+            const isSelected = selectedGwId === gw.gateway_id;
             return (
               <React.Fragment key={gw.gateway_id}>
-                  <CircleMarker
-                    center={[gw.latitude, gw.longitude]}
-                    radius={isDetailView ? 12 : 8 + (packets / maxPackets) * 32}
+                <CircleMarker
+                  center={[gw.latitude, gw.longitude]}
+                  radius={isDetailView ? 12 : 8 + (packets / maxPackets) * 32}
                   pathOptions={{
-                    fillColor: getRecencyColor(gw.last_seen || gw.last_active),
-                    color: '#fff',
-                    weight: 2,
-                    fillOpacity: 0.9
+                    fillColor: isSelected ? '#06b6d4' : getRecencyColor(gw.last_seen || gw.last_active),
+                    color: isSelected ? '#38bdf8' : '#fff',
+                    weight: isSelected ? 4 : 2,
+                    fillOpacity: 0.95
+                  }}
+                  eventHandlers={{
+                    click: () => handleGatewayClick(gw.gateway_id)
                   }}
                 >
                   <Popup>
-                    <div className="font-sans">
-                      <strong>Gateway: {gw.short_name || gw.gateway_id}</strong><br />
-                      Hops: {hops}<br />
-                      Packets: {packets}
+                    <div className="font-sans text-xs space-y-1">
+                      <strong className="text-cyan-600">📡 Gateway: {gw.short_name || gw.gateway_id}</strong><br />
+                      <span>Hops: {hops}</span><br />
+                      <span>經手封包數: {packets} pkts</span><br />
+                      <span className="text-[10px] text-slate-400 font-mono">點擊解鎖經手節點連線圖層</span>
                     </div>
                   </Popup>
-              </CircleMarker>
+                </CircleMarker>
 
-              {/* 繪製連線 (如果主節點有 GPS) */}
-              {isDetailView && nodesWithGPS[0] && (
-                <Polyline
-                  positions={[[nodesWithGPS[0].latitude!, nodesWithGPS[0].longitude!], [gw.latitude, gw.longitude]]}
-                  pathOptions={{
-                    color: getRecencyColor(gw.last_seen || gw.last_active),
-                    weight: Math.min(12, 2 + (gw.count / 5)), // 優化公式：每 5 個封包增加 1px，最大寬度 12px
-                    dashArray: hops > 0 ? '5, 5' : undefined,
-                    opacity: 0.8
-                  }}
-                >
-                  <Tooltip sticky>
-                    <div className="text-xs font-sans p-1">
-                      <div className="font-bold border-b border-slate-100 mb-1 pb-1">路徑資訊 Path Info</div>
-                      <div className="flex justify-between gap-4">
-                        <span className="text-slate-400">跳數 Hops:</span>
-                        <span className="font-bold text-blue-600">{hops}</span>
+                {/* 繪製連線 (如果主節點有 GPS) */}
+                {isDetailView && nodesWithGPS[0] && (
+                  <Polyline
+                    positions={[[nodesWithGPS[0].latitude!, nodesWithGPS[0].longitude!], [gw.latitude, gw.longitude]]}
+                    pathOptions={{
+                      color: getRecencyColor(gw.last_seen || gw.last_active),
+                      weight: Math.min(12, 2 + (gw.count / 5)),
+                      dashArray: hops > 0 ? '5, 5' : undefined,
+                      opacity: 0.8
+                    }}
+                  >
+                    <Tooltip sticky>
+                      <div className="text-xs font-sans p-1">
+                        <div className="font-bold border-b border-slate-100 mb-1 pb-1">路徑資訊 Path Info</div>
+                        <div className="flex justify-between gap-4">
+                          <span className="text-slate-400">跳數 Hops:</span>
+                          <span className="font-bold text-blue-600">{hops}</span>
+                        </div>
+                        <div className="flex justify-between gap-4">
+                          <span className="text-slate-400">最後收信:</span>
+                          <span className="text-slate-600">{new Date(gw.last_seen).toLocaleString()}</span>
+                        </div>
                       </div>
-                      <div className="flex justify-between gap-4">
-                        <span className="text-slate-400">最後收信:</span>
-                        <span className="text-slate-600">{new Date(gw.last_seen).toLocaleString()}</span>
-                      </div>
-                    </div>
-                  </Tooltip>
-                </Polyline>
-              )}
-            </React.Fragment>
-          );
-        })})()}
+                    </Tooltip>
+                  </Polyline>
+                )}
+              </React.Fragment>
+            );
+          });
+        })()}
+
+        {/* 🛰️ 閘道器經手節點實時連線 Polyline */}
+        {relayedNodesData && selectedGwId && (() => {
+          const gwNode = gatewayMarkers.find((g: any) => g.gateway_id === selectedGwId);
+          if (!gwNode) return null;
+          return relayedNodesData.relayedNodes.map((rn: any) => {
+            if (!rn.latitude || !rn.longitude) return null;
+            return (
+              <Polyline
+                key={`gw-relayed-link-${rn.node_id}`}
+                positions={[[gwNode.latitude, gwNode.longitude], [rn.latitude, rn.longitude]]}
+                pathOptions={{
+                  color: '#06b6d4',
+                  weight: 2.5,
+                  opacity: 0.8,
+                  dashArray: '5, 8',
+                }}
+              >
+                <Tooltip sticky>
+                  <div className="text-[10px] font-mono p-1 space-y-0.5">
+                    <strong className="text-cyan-400">📡 閘道經手連線 | {rn.short_name || rn.long_name || rn.node_id}</strong><br />
+                    <span>經手封包數: <strong>{rn.packet_count} pkts</strong></span><br />
+                    <span>最後活動: {new Date(rn.last_activity).toLocaleTimeString()}</span><br />
+                    <span>平均 SNR: {rn.avg_snr ?? '--'} dB | RSSI: {rn.avg_rssi ?? '--'} dBm</span>
+                  </div>
+                </Tooltip>
+              </Polyline>
+            );
+          });
+        })()}
 
         {/* --- 動態 Hop 覆蓋模擬器 (Weighted Reachability Map) --- */}
         {showSimulator && simResultMap && simState && simState.sourceNodeId && (() => {
@@ -625,6 +694,55 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         })()}
 
       </MapContainer>
+
+      {/* 🛰️ 閘道器經手節點詳情 Drawer Popover Panel */}
+      {relayedNodesData && (
+        <div className="absolute top-4 right-4 z-[1000] w-80 backdrop-blur-md bg-slate-900/90 border border-cyan-500/50 p-4 rounded-2xl shadow-2xl space-y-3 text-slate-100 animate-fadeIn pointer-events-auto">
+          <div className="flex items-center justify-between border-b border-slate-700/60 pb-2">
+            <div className="font-bold text-xs text-cyan-400 flex items-center gap-1.5 font-mono">
+              <span>🛰️</span> 閘道經手封包與對應節點
+            </div>
+            <button
+              onClick={() => { setSelectedGwId(null); setRelayedNodesData(null); }}
+              className="text-slate-400 hover:text-white text-xs px-1 font-mono"
+            >✕</button>
+          </div>
+
+          <div className="flex justify-between items-center text-[11px] font-mono bg-slate-800/80 p-2 rounded-xl border border-slate-700/50">
+            <div>
+              <span className="text-slate-400 text-[10px]">閘道器 ID:</span> <span className="font-bold text-cyan-300">{relayedNodesData.gatewayId}</span>
+            </div>
+            <div>
+              <span className="text-slate-400 text-[10px]">總經手:</span> <span className="font-bold text-amber-400">{relayedNodesData.totalPackets} pkts</span>
+            </div>
+          </div>
+
+          <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+            {relayedNodesData.relayedNodes.length === 0 ? (
+              <div className="text-slate-500 text-center py-4 text-xs italic font-mono">近 24 小時無經手封包紀錄</div>
+            ) : (
+              relayedNodesData.relayedNodes.map(rn => (
+                <div
+                  key={rn.node_id}
+                  onClick={() => { onSelectNode(rn.node_id); if (onShowDetail) onShowDetail(rn.node_id); }}
+                  className="p-2 rounded-xl bg-slate-800/60 border border-slate-700/40 hover:border-cyan-500/50 hover:bg-slate-800 transition-all cursor-pointer space-y-1"
+                >
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="font-mono font-bold text-cyan-300">{rn.short_name || rn.long_name || rn.node_id}</span>
+                    <span className="text-[10px] font-mono bg-cyan-500/20 text-cyan-300 px-1.5 py-0.5 rounded-full">
+                      {rn.packet_count} pkts
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-[10px] font-mono text-slate-400">
+                    <span>SNR {rn.avg_snr ?? '--'}dB / RSSI {rn.avg_rssi ?? '--'}dBm</span>
+                    <span>{new Date(rn.last_activity).toLocaleTimeString()}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 圖例 Legend Overlay */}
       <div className="absolute bottom-4 right-4 bg-white/90 backdrop-blur-sm p-3 rounded-xl shadow-xl z-[1000] border border-slate-200 pointer-events-auto min-w-[160px] transition-all duration-300">
