@@ -10,6 +10,56 @@ import TopologyGraph from './TopologyGraph';
 import NetworkAnalytics from './NetworkAnalytics';
 import { throttle } from 'lodash';
 
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+  title?: string;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("ErrorBoundary caught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 my-6 rounded-2xl border border-red-500/30 bg-red-500/10 text-red-400 flex flex-col items-center justify-center min-h-[300px] gap-4">
+          <div className="p-3 bg-red-500/20 rounded-full text-red-400 animate-bounce">
+            ⚠️
+          </div>
+          <h3 className="font-bold text-base text-red-300">
+            {this.props.title || '此分頁載入時發生異常 (Tab Execution Error)'}
+          </h3>
+          <p className="text-xs font-mono text-red-300/80 bg-slate-900/60 p-3 rounded-lg border border-red-500/20 max-w-xl text-center overflow-auto">
+            {this.state.error?.message || '未知執行階段例外'}
+          </p>
+          <button
+            onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-5 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs shadow-lg transition flex items-center gap-2"
+          >
+            🔄 重新載入分頁
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export interface Node {
   node_id: string;
   long_name: string;
@@ -1018,9 +1068,9 @@ function App() {
 
 
   const estimateBatteryLife = (node: Node) => {
-    if (!node.voltage || node.voltage < 3.2) return "N/A";
+    if (!node?.voltage || typeof node.voltage !== 'number' || node.voltage < 3.2) return "N/A";
     const remainingPercent = Math.max(0, (node.voltage - 3.4) / (4.1 - 3.4) * 100);
-    if (node.current && node.current > 0) return `${(remainingPercent * 2000 / (node.current * 100)).toFixed(1)}h`;
+    if (typeof node.current === 'number' && node.current > 0) return `${(remainingPercent * 2000 / (node.current * 100)).toFixed(1)}h`;
     return `${remainingPercent.toFixed(0)}% 剩餘`;
   };
 
@@ -1655,6 +1705,7 @@ function App() {
       {!appLoading && (
         <div className="flex-1 flex flex-col">
           <main className="flex-1 w-full">
+            <ErrorBoundary title="切換分頁時發生組件異常 (Tab Execution Error)">
             {activeTab === 'nodes' && (
               <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
                 {/* 🚀 節點清單 / 戰情統計 次級 Tab 切換列 */}
@@ -2105,7 +2156,8 @@ function App() {
                       status = { color: 'text-red-500', glow: 'shadow-[0_0_20px_rgba(239,68,68,0.35)]', border: 'border-red-500/50', offline: false, msg: '失蹤邊緣' };
                     } else {
                       const wittyMsgs = ["大概是去外星旅行了", "冬眠中，請勿打擾", "能量耗盡，正在流浪", "進入異世界通訊範圍"];
-                      status = { color: 'text-slate-500', glow: '', border: 'border-slate-700', offline: true, msg: wittyMsgs[Math.floor(node.node_id.length % wittyMsgs.length)] };
+                      const idLen = node.node_id ? node.node_id.length : 0;
+                      status = { color: 'text-slate-500', glow: '', border: 'border-slate-700', offline: true, msg: wittyMsgs[Math.floor(idLen % wittyMsgs.length)] };
                     }
 
                     const nodeGroupId = getNodeGroupId(node.node_id);
@@ -3670,6 +3722,7 @@ function App() {
 
 
 
+          </ErrorBoundary>
           </main>
 
           <footer className={`mt-auto p-4 border-t text-[10px] font-bold ${darkMode ? 'bg-slate-900/50 border-slate-800 text-slate-500' : 'bg-white border-slate-100 text-slate-400'}`}>

@@ -310,6 +310,10 @@ db.serialize(() => {
             text_count INTEGER DEFAULT 0,
             routing_count INTEGER DEFAULT 0,
             other_count INTEGER DEFAULT 0,
+            hop0_count INTEGER DEFAULT 0,
+            hop1_count INTEGER DEFAULT 0,
+            hop2_count INTEGER DEFAULT 0,
+            hop3_count INTEGER DEFAULT 0,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
@@ -892,15 +896,9 @@ app.get('/api/analytics/kpi', withCache(60 * 1000), (req, res) => {
     if (range === '7d') hours = 7 * 24;
     if (range === '30d') hours = 30 * 24;
 
-    const sqlActive = `SELECT COUNT(DISTINCT node_id) as count FROM packet_logs WHERE timestamp >= datetime('now', '-${hours} hours')`;
+    const sqlActive = `SELECT COUNT(*) as count FROM nodes WHERE last_seen >= datetime('now', '-${hours} hours')`;
     const sqlOffline = `SELECT COUNT(*) as count FROM nodes WHERE last_seen < datetime('now', '-48 hours') OR last_seen IS NULL`;
-    const sqlGhost = `
-        SELECT COUNT(DISTINCT node_id) as count FROM packet_logs 
-        WHERE timestamp >= datetime('now', '-${hours} hours')
-          AND node_id NOT IN (
-              SELECT node_id FROM nodes WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0
-          )
-    `;
+    const sqlGhost = `SELECT COUNT(*) as count FROM nodes WHERE last_seen >= datetime('now', '-${hours} hours') AND (latitude IS NULL OR longitude IS NULL OR latitude = 0 OR longitude = 0)`;
     const sqlLowBattery = `SELECT COUNT(*) as count FROM nodes WHERE voltage IS NOT NULL AND voltage > 0 AND voltage < 3.4`;
 
     Promise.all([
@@ -1201,18 +1199,7 @@ app.get('/api/analytics/hardware-models', withCache(60 * 1000), (req, res) => {
 
 // 9. 韌體版本升級進度 (離散官方版本系列與主要版號聚合)
 app.get('/api/analytics/firmware-versions', withCache(60 * 1000), (req, res) => {
-    const sql = `
-        SELECT 
-            node_id,
-            COALESCE(
-                firmware_version,
-                (SELECT json_extract(payload_json, '$.firmware_version') 
-                 FROM packet_logs 
-                 WHERE node_id = nodes.node_id AND payload_json LIKE '%firmware_version%' 
-                 ORDER BY timestamp DESC LIMIT 1)
-            ) as fw_ver
-        FROM nodes
-    `;
+    const sql = `SELECT COALESCE(firmware_version, 'Unknown') as fw_ver FROM nodes`;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         const seriesMap = new Map();
