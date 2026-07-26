@@ -768,6 +768,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
             <CwaNodeMap
               key="cwa-node-map"
               nodes={cwaNodeComparison.nodeComparisons}
+              regionSummary={cwaNodeComparison.regionSummary}
               darkMode={darkMode}
             />
           )}

@@ -1550,6 +1550,11 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
                         county,
                         nodeCount: 0,
                         validDeltaCount: 0,
+                        cwaTempSum: 0,
+                        cwaTempCount: 0,
+                        meshTempSum: 0,
+                        meshTempCount: 0,
+                        weatherList: [],
                         deltaTempSum: 0,
                         deltaHumSum: 0,
                         maxDeltaTemp: -Infinity,
@@ -1561,6 +1566,15 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
                 const r = regionMap[county];
                 r.nodeCount++;
                 r.nodes.push(item.nodeId);
+                if (item.cwaTemp !== null && !isNaN(item.cwaTemp)) {
+                    r.cwaTempSum += item.cwaTemp;
+                    r.cwaTempCount++;
+                }
+                if (item.nodeTemp !== null && !isNaN(item.nodeTemp)) {
+                    r.meshTempSum += item.nodeTemp;
+                    r.meshTempCount++;
+                }
+                if (item.cwaWeather) r.weatherList.push(item.cwaWeather);
                 if (item.deltaTemp !== null) {
                     r.validDeltaCount++;
                     r.deltaTempSum += item.deltaTemp;
@@ -1574,10 +1588,13 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
             const regionSummary = Object.values(regionMap).map(r => ({
                 county: r.county,
                 nodeCount: r.nodeCount,
+                avgCwaTemp: r.cwaTempCount > 0 ? Math.round(r.cwaTempSum / r.cwaTempCount * 10) / 10 : null,
+                avgMeshTemp: r.meshTempCount > 0 ? Math.round(r.meshTempSum / r.meshTempCount * 10) / 10 : null,
                 avgDeltaTemp: r.validDeltaCount > 0 ? Math.round(r.deltaTempSum / r.validDeltaCount * 10) / 10 : null,
                 maxDeltaTemp: r.maxDeltaTemp === -Infinity ? null : r.maxDeltaTemp,
                 minDeltaTemp: r.minDeltaTemp === Infinity ? null : r.minDeltaTemp,
                 avgDeltaHum: r.validDeltaCount > 0 ? Math.round(r.deltaHumSum / r.validDeltaCount) : null,
+                weather: r.weatherList.length > 0 ? r.weatherList[0] : '晴',
                 anomalyCount: r.anomalyCount,
                 anomalyRate: r.nodeCount > 0 ? Math.round(r.anomalyCount / r.nodeCount * 100) : 0
             })).sort((a, b) => b.nodeCount - a.nodeCount);
