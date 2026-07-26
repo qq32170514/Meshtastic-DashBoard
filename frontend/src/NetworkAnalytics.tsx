@@ -113,6 +113,14 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
   const [firmwareVersions, setFirmwareVersions] = useState<{ series: FirmwarePoint[]; exact: FirmwarePoint[] }>({ series: [], exact: [] });
   const [fwViewMode, setFwViewMode] = useState<'series' | 'exact'>('series');
   const [envTrends, setEnvTrends] = useState<EnvPoint[]>([]);
+  const [cwaComparison, setCwaComparison] = useState<{
+    cwaAvgTemp: number;
+    cwaAvgHumidity: number;
+    meshAvgTemp: number;
+    meshAvgHumidity: number;
+    tempDelta: number;
+    humidityDelta: number;
+  } | null>(null);
 
   const fetchData = async (range: string) => {
     setLoading(true);
@@ -128,6 +136,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         modelRes,
         fwRes,
         envRes,
+        cwaRes,
       ] = await Promise.all([
         fetch(`/api/analytics/kpi?range=${range}`),
         fetch(`/api/analytics/trends?range=${range}`),
@@ -139,6 +148,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fetch('/api/analytics/hardware-models'),
         fetch('/api/analytics/firmware-versions'),
         fetch(`/api/analytics/environment-trends?range=${range}`),
+        fetch('/api/analytics/cwa-comparison'),
       ]);
 
       const [
@@ -152,6 +162,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         modelData,
         fwData,
         envData,
+        cwaData,
       ] = await Promise.all([
         kpiRes.json(),
         trendRes.json(),
@@ -163,6 +174,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         modelRes.json(),
         fwRes.json(),
         envRes.json(),
+        cwaRes.json(),
       ]);
 
       setKpi(kpiData || { activeNodes: 0, offlineNodes: 0, ghostNodes: 0, lowBatteryAlerts: 0 });
@@ -178,6 +190,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         exact: Array.isArray(fwData?.exact) ? fwData.exact : (Array.isArray(fwData) ? fwData : []),
       });
       setEnvTrends(Array.isArray(envData) ? envData : []);
+      setCwaComparison(cwaData || null);
     } catch (e) {
       console.error('Failed to fetch network analytics data:', e);
     } finally {
@@ -554,6 +567,58 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
           </div>
         </div>
       </div>
+
+      {/* 🚀 ⛅ 中央氣象署 (CWA) 官方數據對比卡片 */}
+      {cwaComparison && (
+        <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
+            <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-cyan-400">
+              <CloudSun size={18} /> 台灣中央氣象署 (CWA) 官方觀測 vs Mesh 網路數據對比
+            </h3>
+            <span className="text-[10px] text-slate-400 font-mono">即時全台官方氣象站平均比對</span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            {/* 官方氣溫 */}
+            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+              <span className="text-[11px] font-bold text-slate-400">CWA 官方氣象站平均溫度</span>
+              <div className="text-2xl font-black text-blue-400 font-mono mt-1">
+                {cwaComparison.cwaAvgTemp} °C
+              </div>
+              <span className="text-[9px] text-slate-500 mt-1">全台標準百葉箱觀測值</span>
+            </div>
+
+            {/* Mesh 氣溫 */}
+            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+              <span className="text-[11px] font-bold text-slate-400">Mesh 節點實測平均溫度</span>
+              <div className="text-2xl font-black text-amber-400 font-mono mt-1">
+                {cwaComparison.meshAvgTemp} °C
+              </div>
+              <span className="text-[9px] text-slate-500 mt-1">來自 BME280 / SHT31 感測器</span>
+            </div>
+
+            {/* 氣溫偏差 Delta T */}
+            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+              <span className="text-[11px] font-bold text-slate-400">平均氣溫偏差值 (ΔT)</span>
+              <div className={`text-2xl font-black font-mono mt-1 ${cwaComparison.tempDelta > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                {cwaComparison.tempDelta > 0 ? `+${cwaComparison.tempDelta}` : cwaComparison.tempDelta} °C
+              </div>
+              <span className="text-[9px] text-slate-500 mt-1">
+                {cwaComparison.tempDelta > 2 ? '⚠️ 氣溫高於官方 (外殼日照微氣候)' : '良好 (接近標準觀測值)'}
+              </span>
+            </div>
+
+            {/* 濕度偏差 Delta H */}
+            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+              <span className="text-[11px] font-bold text-slate-400">平均相對濕度偏差 (ΔH)</span>
+              <div className="text-2xl font-black text-cyan-400 font-mono mt-1">
+                {cwaComparison.humidityDelta > 0 ? `+${cwaComparison.humidityDelta}` : cwaComparison.humidityDelta} %
+              </div>
+              <span className="text-[9px] text-slate-500 mt-1">Mesh: {cwaComparison.meshAvgHumidity}% vs CWA: {cwaComparison.cwaAvgHumidity}%</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 🚀 6. 全網氣候環境遙測趨勢 (Environmental Telemetry) */}
       <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>

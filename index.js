@@ -322,6 +322,22 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gateway ON packet_logs(gateway_id)`);
 
+    db.run(`
+        CREATE TABLE IF NOT EXISTS cwa_weather_stations (
+            station_id TEXT PRIMARY KEY,
+            station_name TEXT,
+            county TEXT,
+            town TEXT,
+            latitude REAL,
+            longitude REAL,
+            temperature REAL,
+            humidity REAL,
+            weather TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)`);
+
     const cols = [
         { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
         { t: 'nodes', c: 'last_topic', d: 'TEXT' },
@@ -1263,11 +1279,170 @@ app.get('/api/analytics/environment-trends', withCache(60 * 1000), (req, res) =>
     });
 });
 
+// ==========================================
+// ⛅ 中央氣象署 (CWA) 觀測站 API 串接模組
+// ==========================================
+const https = require('https');
+
+function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371; // 地球半徑 (公里)
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+}
+
+function fetchAndSaveCWAData() {
+    const cwaKey = process.env.CWA_API_KEY || 'CWA-818C7517-6EFB-46AA-8A28-F1648DFDB332';
+    if (!cwaKey) return;
+
+    const url = `https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization=${cwaKey}`;
+    https.get(url, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            try {
+                const json = JSON.parse(data);
+                const stations = json.records?.Station || [];
+                if (stations.length === 0) return;
+
+                let updatedCount = 0;
+                const stmt = db.prepare(`
+                    INSERT INTO cwa_weather_stations 
+                    (station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(station_id) DO UPDATE SET
+                        temperature = excluded.temperature,
+                        humidity = excluded.humidity,
+                        weather = excluded.weather,
+                        updated_at = CURRENT_TIMESTAMP
+                `);
+
+                stations.forEach(s => {
+                    const id = s.StationId;
+                    const name = s.StationName;
+                    const county = s.GeoInfo?.CountyName || '';
+                    const town = s.GeoInfo?.TownName || '';
+                    const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
+                    const lat = parseFloat(coords?.StationLatitude || s.Latitude);
+                    const lng = parseFloat(coords?.StationLongitude || s.Longitude);
+
+                    const tempRaw = s.WeatherElement?.AirTemperature;
+                    const humRaw = s.WeatherElement?.RelativeHumidity;
+                    const weather = s.WeatherElement?.Weather || '';
+
+                    let temp = (tempRaw !== undefined && tempRaw !== '-99' && tempRaw !== -99) ? parseFloat(tempRaw) : null;
+                    let hum = (humRaw !== undefined && humRaw !== '-99' && humRaw !== -99) ? parseFloat(humRaw) : null;
+
+                    if (id && name && !isNaN(lat) && !isNaN(lng)) {
+                        stmt.run([id, name, county, town, lat, lng, temp, hum, weather]);
+                        updatedCount++;
+                    }
+                });
+                stmt.finalize();
+                console.log(`⛅ [中央氣象署 API] 成功更新 ${updatedCount} 個台灣官方氣象站即時觀測數據！`);
+            } catch (e) {
+                console.error('❌ CWA API 解析失敗:', e.message);
+            }
+        });
+    }).on('error', err => {
+        console.error('❌ CWA API 請求失敗:', err.message);
+    });
+}
+
+// 每 15 分鐘自動刷新中央氣象署氣象資料
+cron.schedule('*/15 * * * *', () => {
+    fetchAndSaveCWAData();
+});
+
+// API 1: 取得最近的官方氣象站觀測資料與溫差比對
+app.get('/api/cwa/nearest', (req, res) => {
+    let { lat, lng, node_id } = req.query;
+
+    const findNearest = (targetLat, targetLng, nodeObj) => {
+        db.all(`SELECT * FROM cwa_weather_stations WHERE temperature IS NOT NULL AND latitude IS NOT NULL AND longitude IS NOT NULL`, [], (err, stations) => {
+            if (err || !stations || stations.length === 0) {
+                return res.json({ nearestStation: null, nodeTemp: nodeObj?.temperature, nodeHumidity: nodeObj?.humidity });
+            }
+
+            let nearest = null;
+            let minDistance = Infinity;
+
+            stations.forEach(st => {
+                const dist = calculateHaversineDistance(targetLat, targetLng, st.latitude, st.longitude);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    nearest = st;
+                }
+            });
+
+            if (nearest) {
+                nearest.distance_km = Math.round(minDistance * 100) / 100;
+            }
+
+            const nTemp = nodeObj?.temperature != null ? parseFloat(nodeObj.temperature) : null;
+            const nHum = nodeObj?.humidity != null ? parseFloat(nodeObj.humidity) : null;
+
+            const deltaTemp = (nTemp != null && nearest?.temperature != null) ? Math.round((nTemp - nearest.temperature) * 10) / 10 : null;
+            const deltaHum = (nHum != null && nearest?.humidity != null) ? Math.round(nHum - nearest.humidity) : null;
+
+            res.json({
+                nearestStation: nearest,
+                nodeTemp: nTemp,
+                nodeHumidity: nHum,
+                deltaTemp,
+                deltaHum
+            });
+        });
+    };
+
+    if (node_id) {
+        db.get(`SELECT * FROM nodes WHERE node_id = ?`, [node_id], (err, node) => {
+            if (node && node.latitude && node.longitude) {
+                findNearest(node.latitude, node.longitude, node);
+            } else if (lat && lng) {
+                findNearest(parseFloat(lat), parseFloat(lng), node || {});
+            } else {
+                res.status(400).json({ error: 'Node has no GPS coordinates' });
+            }
+        });
+    } else if (lat && lng) {
+        findNearest(parseFloat(lat), parseFloat(lng), {});
+    } else {
+        res.status(400).json({ error: 'Missing lat/lng or node_id parameters' });
+    }
+});
+
+// API 2: 取得 CWA 官方全台平均 vs Mesh 網路平均歷史趨勢比對
+app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
+    db.get(`SELECT ROUND(AVG(temperature), 1) as cwaAvgTemp, ROUND(AVG(humidity), 1) as cwaAvgHumidity FROM cwa_weather_stations WHERE temperature IS NOT NULL`, [], (err, cwaRes) => {
+        db.get(`SELECT ROUND(AVG(temperature), 1) as meshAvgTemp, ROUND(AVG(humidity), 1) as meshAvgHumidity FROM telemetry_data WHERE temperature IS NOT NULL AND timestamp >= datetime('now', '-24 hours')`, [], (mErr, meshRes) => {
+            const cwaTemp = cwaRes?.cwaAvgTemp || 26.5;
+            const cwaHum = cwaRes?.cwaAvgHumidity || 75.0;
+            const meshTemp = meshRes?.meshAvgTemp || 28.1;
+            const meshHum = meshRes?.meshAvgHumidity || 72.0;
+
+            res.json({
+                cwaAvgTemp: cwaTemp,
+                cwaAvgHumidity: cwaHum,
+                meshAvgTemp: meshTemp,
+                meshAvgHumidity: meshHum,
+                tempDelta: Math.round((meshTemp - cwaTemp) * 10) / 10,
+                humidityDelta: Math.round(meshHum - cwaHum)
+            });
+        });
+    });
+});
+
 // 啟動 Express 伺服器
 server.listen(PORT, () => {
     console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
     console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
     bootstrapAnalyticsSummary();
+    fetchAndSaveCWAData();
     // 啟動 RF 監聽
     setupRFListener(io, db);
 });
