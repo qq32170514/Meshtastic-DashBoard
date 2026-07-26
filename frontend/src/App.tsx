@@ -1602,7 +1602,8 @@ function App() {
   }, [activeTab, currentChatChannel, unreadChannels]);
 
   return (
-    <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans text-${fontSize}`}>
+    <ErrorBoundary title="全域網頁畫面異常 (Global Application Error)">
+      <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans text-${fontSize}`}>
       <datalist id="node-list">
         {nodes.map(n => (
           <option key={n.node_id} value={n.node_id}>{n.long_name || n.node_id} ({n.short_name || '?'})</option>
@@ -3771,7 +3772,8 @@ function App() {
         </div>
       )}
     </div>
-  );
+  </ErrorBoundary>
+);
 }
 
 export default App;
