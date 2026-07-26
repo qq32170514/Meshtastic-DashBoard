@@ -18,8 +18,9 @@ const DefaultIcon = L.icon({
 L.Marker.prototype.options.icon = DefaultIcon;
 
 // 顏色映射函數：根據 Role 返回對應顏色
-const getRoleColor = (role?: string) => {
-  switch (role?.toUpperCase()) {
+const getRoleColor = (role?: any) => {
+  const roleStr = String(role || '').toUpperCase();
+  switch (roleStr) {
     case 'ROUTER': return '#dc2626';        // 紅色 (基礎設施)
     case 'ROUTER_CLIENT': return '#ea580c'; // 橘色
     case 'TRACKER': return '#16a34a';       // 綠色 (追蹤器)
