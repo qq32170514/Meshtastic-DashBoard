@@ -680,15 +680,15 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
                         <td className="px-4 py-3 text-center font-mono font-bold">
                           {r.avgDeltaTemp !== null ? (
                             <span className={r.avgDeltaTemp > 2 ? 'text-red-400' : r.avgDeltaTemp < -2 ? 'text-blue-400' : 'text-emerald-400'}>
-                              {r.avgDeltaTemp > 0 ? '+' : ''}{r.avgDeltaTemp}
+                              {r.avgDeltaTemp > 0 ? '+' : ''}{r.avgDeltaTemp.toFixed(1)}
                             </span>
                           ) : <span className="text-slate-500">--</span>}
                         </td>
                         <td className="px-4 py-3 text-center font-mono text-red-400">
-                          {r.maxDeltaTemp !== null ? (r.maxDeltaTemp > 0 ? '+' : '') + r.maxDeltaTemp : '--'}
+                          {r.maxDeltaTemp !== null ? (r.maxDeltaTemp > 0 ? '+' : '') + r.maxDeltaTemp.toFixed(1) : '--'}
                         </td>
                         <td className="px-4 py-3 text-center font-mono text-blue-400">
-                          {r.minDeltaTemp !== null ? (r.minDeltaTemp > 0 ? '+' : '') + r.minDeltaTemp : '--'}
+                          {r.minDeltaTemp !== null ? (r.minDeltaTemp > 0 ? '+' : '') + r.minDeltaTemp.toFixed(1) : '--'}
                         </td>
                         <td className="px-4 py-3 text-center font-mono text-slate-400">
                           {r.avgDeltaHum !== null ? (r.avgDeltaHum > 0 ? '+' : '') + r.avgDeltaHum : '--'}
@@ -736,18 +736,18 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
                         <div className={`text-[10px] ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>{n.nodeName}</div>
                       </td>
                       <td className="px-4 py-3 font-mono font-bold text-amber-400">
-                        {n.nodeTemp !== null ? `${n.nodeTemp} °C` : '--'}
+                        {n.nodeTemp !== null ? `${Number(n.nodeTemp).toFixed(1)} °C` : '--'}
                       </td>
                       <td className="px-4 py-3">
                         <div className={`font-bold text-[11px] ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>{n.cwaStationName}</div>
                         <div className="text-[10px] text-slate-500">{n.cwaCounty} {n.cwaTown}</div>
                       </td>
-                      <td className="px-4 py-3 font-mono text-slate-400 text-[11px]">{n.distanceKm} km</td>
-                      <td className="px-4 py-3 font-mono font-bold text-blue-400">{n.cwaTemp} °C</td>
+                      <td className="px-4 py-3 font-mono text-slate-400 text-[11px]">{Number(n.distanceKm).toFixed(1)} km</td>
+                      <td className="px-4 py-3 font-mono font-bold text-blue-400">{n.cwaTemp !== null ? `${Number(n.cwaTemp).toFixed(1)} °C` : '--'}</td>
                       <td className="px-4 py-3 font-mono font-bold text-[12px]">
                         {n.deltaTemp !== null ? (
                           <span className={n.anomaly ? 'text-red-400' : n.deltaTemp > 0 ? 'text-orange-400' : 'text-emerald-400'}>
-                            {n.deltaTemp > 0 ? '+' : ''}{n.deltaTemp} °C
+                            {n.deltaTemp > 0 ? '+' : ''}{Number(n.deltaTemp).toFixed(1)} °C
                             {n.anomaly && ' ⚠️'}
                           </span>
                         ) : '--'}
