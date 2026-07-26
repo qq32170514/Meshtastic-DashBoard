@@ -241,8 +241,8 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         </div>
       </div>
 
-      {/* 🚀 2. 頂部 KPI 卡片區 (4 欄 Grid) */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      {/* 🚀 2. 頂部 KPI 卡片區 (3 欄 Grid) */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {/* 卡片 1: 總活躍節點 */}
         <div className={`p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
           <div className="space-y-1">
@@ -282,20 +282,6 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
           </div>
           <div className="p-3.5 rounded-2xl bg-amber-500/10 text-amber-500 border border-amber-500/20">
             <MapPinOff size={24} />
-          </div>
-        </div>
-
-        {/* 卡片 4: 低電量警報 */}
-        <div className={`p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="space-y-1">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">低電量警報 (&lt; 3.4V)</span>
-            <div className="text-2xl font-black text-red-500 font-mono">
-              {kpi.lowBatteryAlerts} <span className="text-xs text-slate-400 font-normal">nodes</span>
-            </div>
-            <span className="text-[10px] text-slate-500 block">電壓低於臨界值需維護</span>
-          </div>
-          <div className="p-3.5 rounded-2xl bg-red-500/10 text-red-500 border border-red-500/20 animate-pulse">
-            <BatteryLow size={24} />
           </div>
         </div>
       </div>
