@@ -383,7 +383,7 @@ function App() {
   const [packets, setPackets] = useState<Packet[]>([]);
   const [favoritePackets, setFavoritePackets] = useState<Packet[]>([]);
   const [mqttConnected, setMqttConnected] = useState(false);
-  const [activeTab, setActiveTab] = useState<'favorites' | 'nodes' | 'details' | 'map' | 'logs' | 'chat' | 'gateways'>('favorites');
+  const [activeTab, setActiveTab] = useState<'analytics' | 'favorites' | 'nodes' | 'details' | 'map' | 'logs' | 'chat' | 'gateways'>('favorites');
   const [nodeListSubTab, setNodeListSubTab] = useState<'list' | 'analytics'>('list');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [mapShowFavoritesOnly, setMapShowFavoritesOnly] = useState(false);
@@ -1645,6 +1645,12 @@ function App() {
       <div className={`border-b sticky top-0 z-50 shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
         <div className="max-w-6xl mx-auto flex overflow-x-auto no-scrollbar whitespace-nowrap">
           <button
+            onClick={() => setActiveTab('analytics')}
+            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'analytics' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+          >
+            <BarChart3 size={16} /> 全網戰情分析
+          </button>
+          <button
             onClick={() => setActiveTab('favorites')}
             className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'favorites' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
           >
@@ -1706,37 +1712,15 @@ function App() {
         <div className="flex-1 flex flex-col">
           <main className="flex-1 w-full">
             <ErrorBoundary title="切換分頁時發生組件異常 (Tab Execution Error)">
+            {activeTab === 'analytics' && (
+              <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
+                <NetworkAnalytics darkMode={darkMode} />
+              </div>
+            )}
+
             {activeTab === 'nodes' && (
               <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
-                {/* 🚀 節點清單 / 戰情統計 次級 Tab 切換列 */}
-                <div className={`p-1.5 rounded-xl border inline-flex gap-1 shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                  <button
-                    onClick={() => setNodeListSubTab('list')}
-                    className={`px-4 py-2 rounded-lg text-xs font-black transition-all flex items-center gap-2 ${
-                      nodeListSubTab === 'list'
-                        ? 'bg-cyan-500 text-white shadow-md'
-                        : darkMode ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <List size={16} /> 📋 節點清單 (Node List)
-                  </button>
-                  <button
-                    onClick={() => setNodeListSubTab('analytics')}
-                    className={`px-4 py-2 rounded-lg text-xs font-black transition-all flex items-center gap-2 ${
-                      nodeListSubTab === 'analytics'
-                        ? 'bg-cyan-500 text-white shadow-md'
-                        : darkMode ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    <BarChart3 size={16} /> 📊 全網戰情分析 (Network Analytics)
-                  </button>
-                </div>
-
-                {nodeListSubTab === 'analytics' ? (
-                  <NetworkAnalytics darkMode={darkMode} />
-                ) : (
-                  <>
-                    <div className="flex flex-col lg:flex-row gap-4 mb-4">
+                <div className="flex flex-col lg:flex-row gap-4 mb-4">
                   <div className="relative flex-1 max-w-md">
                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
                     <input
@@ -1881,8 +1865,6 @@ function App() {
                     </tbody>
                   </table>
                 </div>
-                  </>
-                )}
               </div>
             )}
 
