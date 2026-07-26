@@ -1,4 +1,4 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Tooltip as LeafletTooltip } from 'react-leaflet';
 
 export interface NodeComparison {
@@ -101,34 +101,51 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
   });
   const uniqueCwaStations = Array.from(cwaStationMap.values());
 
-  // 如果 backend 沒有傳 regionSummary，由前端從 nodes 動態計算各縣市卡片
-  const countyCards: RegionSummary[] = regionSummary.length > 0 ? regionSummary : (() => {
-    const map = new Map<string, { county: string; nodes: NodeComparison[] }>();
+  // 動態精確計算各縣市圖卡數據（自動相容新舊 Backend）
+  const countyCards = React.useMemo(() => {
+    const map = new Map<string, { county: string; list: NodeComparison[] }>();
     nodes.forEach(n => {
       const c = n.cwaCounty || '未知縣市';
-      if (!map.has(c)) map.set(c, { county: c, nodes: [] });
-      map.get(c)!.nodes.push(n);
+      if (!map.has(c)) map.set(c, { county: c, list: [] });
+      map.get(c)!.list.push(n);
     });
-    return Array.from(map.values()).map(({ county, nodes: list }) => {
-      const validDeltas = list.map(x => x.deltaTemp).filter((d): d is number => d !== null);
-      const meshTemps = list.map(x => x.nodeTemp).filter((t): t is number => t !== null);
-      const cwaTemps = list.map(x => x.cwaTemp).filter((t): t is number => t !== null);
-      const anomalies = list.filter(x => x.anomaly).length;
+
+    return Array.from(map.values()).map(({ county, list }) => {
+      const reg = regionSummary.find(r => r.county === county);
+
+      const validMeshTemps = list
+        .map(x => (x.nodeTemp !== null && x.nodeTemp !== undefined ? Number(x.nodeTemp) : NaN))
+        .filter(t => !isNaN(t));
+
+      const validCwaTemps = list
+        .map(x => (x.cwaTemp !== null && x.cwaTemp !== undefined ? Number(x.cwaTemp) : NaN))
+        .filter(t => !isNaN(t));
+
+      const validDeltas = list
+        .map(x => (x.deltaTemp !== null && x.deltaTemp !== undefined ? Number(x.deltaTemp) : NaN))
+        .filter(d => !isNaN(d));
+
+      const avgMeshTemp = reg?.avgMeshTemp ?? (validMeshTemps.length > 0 ? validMeshTemps.reduce((a, b) => a + b, 0) / validMeshTemps.length : null);
+      const avgCwaTemp = reg?.avgCwaTemp ?? (validCwaTemps.length > 0 ? validCwaTemps.reduce((a, b) => a + b, 0) / validCwaTemps.length : null);
+      const avgDeltaTemp = reg?.avgDeltaTemp ?? (validDeltas.length > 0 ? validDeltas.reduce((a, b) => a + b, 0) / validDeltas.length : null);
+      const anomalyCount = list.filter(x => x.anomaly).length;
+      const weather = reg?.weather || list.find(x => x.cwaWeather)?.cwaWeather || '晴';
+
       return {
         county,
         nodeCount: list.length,
-        avgMeshTemp: meshTemps.length > 0 ? meshTemps.reduce((a, b) => a + b, 0) / meshTemps.length : null,
-        avgCwaTemp: cwaTemps.length > 0 ? cwaTemps.reduce((a, b) => a + b, 0) / cwaTemps.length : null,
-        avgDeltaTemp: validDeltas.length > 0 ? validDeltas.reduce((a, b) => a + b, 0) / validDeltas.length : null,
+        avgMeshTemp,
+        avgCwaTemp,
+        avgDeltaTemp,
         maxDeltaTemp: validDeltas.length > 0 ? Math.max(...validDeltas) : null,
         minDeltaTemp: validDeltas.length > 0 ? Math.min(...validDeltas) : null,
         avgDeltaHum: null,
-        weather: list[0]?.cwaWeather || '晴',
-        anomalyCount: anomalies,
-        anomalyRate: Math.round((anomalies / list.length) * 100),
+        weather,
+        anomalyCount,
+        anomalyRate: Math.round((anomalyCount / list.length) * 100),
       };
     }).sort((a, b) => b.nodeCount - a.nodeCount);
-  })();
+  }, [nodes, regionSummary]);
 
   return (
     <div className="space-y-4">
