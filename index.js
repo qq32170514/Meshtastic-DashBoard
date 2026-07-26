@@ -546,7 +546,6 @@ app.get('/api/packets', withCache(), (req, res) => {
 
     const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`, { excludeTunnelPackets: true });
     const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
-    console.log('[DEBUG] sender query:', req.query.sender, '| SQL WHERE:', sql.includes('WHERE') ? sql.substring(sql.indexOf('WHERE')) : 'NONE', '| params:', params);
 
     db.all(finalSql, [...params, limit, offset], (err, rows) => {
         if (err) {
