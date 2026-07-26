@@ -1529,6 +1529,8 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
                     cwaStationName: nearest.station_name,
                     cwaCounty: nearest.county,
                     cwaTown: nearest.town,
+                    cwaLat: nearest.latitude,
+                    cwaLng: nearest.longitude,
                     cwaTemp,
                     cwaHumidity: cwaHum,
                     cwaWeather: nearest.weather,
