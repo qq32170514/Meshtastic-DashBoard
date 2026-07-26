@@ -1139,7 +1139,7 @@ function App() {
               <MapPin size={14} className="text-green-500" /> 位置廣播 Position Broadcast
             </h5>
             <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-              <MapContainer center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
+              <MapContainer key={`pos-map-${lat}-${lon}`} center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
                 <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
                 <CircleMarker center={[lat, lon]} radius={8} pathOptions={{ fillColor: '#22c55e', color: 'white', weight: 2, fillOpacity: 0.9 }} />
               </MapContainer>
@@ -1203,7 +1203,7 @@ function App() {
             </h5>
             {points.length >= 2 ? (
               <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-                <MapContainer center={points[0]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={false}>
+                <MapContainer key={`route-map-${points.map(p=>p.join(',')).join('|')}`} center={points[0]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={false}>
                   <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
                   {points.map((p, idx) => (
                     <CircleMarker
