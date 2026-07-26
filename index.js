@@ -1416,7 +1416,7 @@ app.get('/api/cwa/nearest', (req, res) => {
     }
 });
 
-// API 2: 取得 CWA 官方全台平均 vs Mesh 網路平均歷史趨勢比對
+// API 2: 取得 CWA 官方全台平均 vs Mesh 網路平均 (舊版，保留向下相容)
 app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
     db.get(`SELECT ROUND(AVG(temperature), 1) as cwaAvgTemp, ROUND(AVG(humidity), 1) as cwaAvgHumidity FROM cwa_weather_stations WHERE temperature IS NOT NULL`, [], (err, cwaRes) => {
         db.get(`SELECT ROUND(AVG(temperature), 1) as meshAvgTemp, ROUND(AVG(humidity), 1) as meshAvgHumidity FROM telemetry_data WHERE temperature IS NOT NULL AND timestamp >= datetime('now', '-24 hours')`, [], (mErr, meshRes) => {
@@ -1432,6 +1432,161 @@ app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
                 meshAvgHumidity: meshHum,
                 tempDelta: Math.round((meshTemp - cwaTemp) * 10) / 10,
                 humidityDelta: Math.round(meshHum - cwaHum)
+            });
+        });
+    });
+});
+
+// ==========================================
+// 🎯 API 3: 精準地理配對比對 (Per-Node Nearest Station)
+// 每個 Mesh 節點 → 找最近 CWA 站 → 個別 ΔT / ΔH → 按縣市分區聚合
+// ==========================================
+app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) => {
+    // 步驟 1: 取得所有有 GPS 座標的 Mesh 節點及其最新遙測數據
+    const meshSql = `
+        SELECT 
+            n.node_id,
+            n.long_name,
+            n.short_name,
+            n.latitude,
+            n.longitude,
+            t.temperature as node_temp,
+            t.humidity as node_humidity,
+            t.timestamp as telemetry_time
+        FROM nodes n
+        INNER JOIN (
+            SELECT node_id, temperature, humidity, timestamp,
+                   ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY timestamp DESC) as rn
+            FROM telemetry_data
+            WHERE temperature IS NOT NULL
+              AND timestamp >= datetime('now', '-24 hours')
+        ) t ON n.node_id = t.node_id AND t.rn = 1
+        WHERE n.latitude IS NOT NULL 
+          AND n.longitude IS NOT NULL
+          AND n.latitude != 0
+          AND n.longitude != 0
+    `;
+
+    db.all(meshSql, [], (meshErr, meshNodes) => {
+        if (meshErr) return res.status(500).json({ error: meshErr.message });
+        if (!meshNodes || meshNodes.length === 0) {
+            return res.json({ nodeComparisons: [], regionSummary: [], totalNodes: 0 });
+        }
+
+        // 步驟 2: 取得所有有效 CWA 測站 (只取平地/丘陵站，排除高山)
+        // 策略：不用高度過濾（DB沒有高度欄位），改用溫度合理性過濾 (< 10°C 的明顯高山站在夏天才會出現)
+        const cwaSql = `
+            SELECT station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather
+            FROM cwa_weather_stations
+            WHERE temperature IS NOT NULL
+              AND latitude IS NOT NULL
+              AND longitude IS NOT NULL
+        `;
+
+        db.all(cwaSql, [], (cwaErr, cwaStations) => {
+            if (cwaErr) return res.status(500).json({ error: cwaErr.message });
+            if (!cwaStations || cwaStations.length === 0) {
+                return res.json({ nodeComparisons: [], regionSummary: [], totalNodes: 0, cwaReady: false });
+            }
+
+            // 步驟 3: 對每個 Mesh 節點找最近的 CWA 站
+            const nodeComparisons = [];
+
+            for (const node of meshNodes) {
+                let nearest = null;
+                let minDist = Infinity;
+
+                for (const st of cwaStations) {
+                    const dist = calculateHaversineDistance(
+                        node.latitude, node.longitude,
+                        st.latitude, st.longitude
+                    );
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearest = st;
+                    }
+                }
+
+                if (!nearest) continue;
+
+                const nodeTemp = parseFloat(node.node_temp);
+                const cwaTemp = parseFloat(nearest.temperature);
+                const nodeHum = node.node_humidity != null ? parseFloat(node.node_humidity) : null;
+                const cwaHum = nearest.humidity != null ? parseFloat(nearest.humidity) : null;
+
+                const deltaTemp = isNaN(nodeTemp) || isNaN(cwaTemp) ? null : Math.round((nodeTemp - cwaTemp) * 10) / 10;
+                const deltaHum = (nodeHum != null && cwaHum != null) ? Math.round(nodeHum - cwaHum) : null;
+
+                nodeComparisons.push({
+                    nodeId: node.node_id,
+                    nodeName: node.long_name || node.short_name || node.node_id,
+                    nodeShortName: node.short_name,
+                    nodeLat: node.latitude,
+                    nodeLng: node.longitude,
+                    nodeTemp: isNaN(nodeTemp) ? null : nodeTemp,
+                    nodeHumidity: nodeHum,
+                    cwaStationId: nearest.station_id,
+                    cwaStationName: nearest.station_name,
+                    cwaCounty: nearest.county,
+                    cwaTown: nearest.town,
+                    cwaTemp,
+                    cwaHumidity: cwaHum,
+                    cwaWeather: nearest.weather,
+                    distanceKm: Math.round(minDist * 100) / 100,
+                    deltaTemp,
+                    deltaHum,
+                    anomaly: deltaTemp !== null && Math.abs(deltaTemp) > 3 // 超過 3°C 為異常
+                });
+            }
+
+            // 步驟 4: 按 CWA 縣市分區聚合統計
+            const regionMap = {};
+            for (const item of nodeComparisons) {
+                const county = item.cwaCounty || '未知縣市';
+                if (!regionMap[county]) {
+                    regionMap[county] = {
+                        county,
+                        nodeCount: 0,
+                        validDeltaCount: 0,
+                        deltaTempSum: 0,
+                        deltaHumSum: 0,
+                        maxDeltaTemp: -Infinity,
+                        minDeltaTemp: Infinity,
+                        anomalyCount: 0,
+                        nodes: []
+                    };
+                }
+                const r = regionMap[county];
+                r.nodeCount++;
+                r.nodes.push(item.nodeId);
+                if (item.deltaTemp !== null) {
+                    r.validDeltaCount++;
+                    r.deltaTempSum += item.deltaTemp;
+                    r.maxDeltaTemp = Math.max(r.maxDeltaTemp, item.deltaTemp);
+                    r.minDeltaTemp = Math.min(r.minDeltaTemp, item.deltaTemp);
+                }
+                if (item.deltaHum !== null) r.deltaHumSum += item.deltaHum;
+                if (item.anomaly) r.anomalyCount++;
+            }
+
+            const regionSummary = Object.values(regionMap).map(r => ({
+                county: r.county,
+                nodeCount: r.nodeCount,
+                avgDeltaTemp: r.validDeltaCount > 0 ? Math.round(r.deltaTempSum / r.validDeltaCount * 10) / 10 : null,
+                maxDeltaTemp: r.maxDeltaTemp === -Infinity ? null : r.maxDeltaTemp,
+                minDeltaTemp: r.minDeltaTemp === Infinity ? null : r.minDeltaTemp,
+                avgDeltaHum: r.validDeltaCount > 0 ? Math.round(r.deltaHumSum / r.validDeltaCount) : null,
+                anomalyCount: r.anomalyCount,
+                anomalyRate: r.nodeCount > 0 ? Math.round(r.anomalyCount / r.nodeCount * 100) : 0
+            })).sort((a, b) => b.nodeCount - a.nodeCount);
+
+            res.json({
+                nodeComparisons,
+                regionSummary,
+                totalNodes: nodeComparisons.length,
+                cwaStationCount: cwaStations.length,
+                cwaReady: true,
+                generatedAt: new Date().toISOString()
             });
         });
     });

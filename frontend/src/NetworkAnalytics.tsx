@@ -95,6 +95,38 @@ interface EnvPoint {
   avgHumidity: number;
 }
 
+interface NodeComparison {
+  nodeId: string;
+  nodeName: string;
+  nodeShortName: string;
+  nodeLat: number;
+  nodeLng: number;
+  nodeTemp: number | null;
+  nodeHumidity: number | null;
+  cwaStationId: string;
+  cwaStationName: string;
+  cwaCounty: string;
+  cwaTown: string;
+  cwaTemp: number;
+  cwaHumidity: number | null;
+  cwaWeather: string;
+  distanceKm: number;
+  deltaTemp: number | null;
+  deltaHum: number | null;
+  anomaly: boolean;
+}
+
+interface RegionSummary {
+  county: string;
+  nodeCount: number;
+  avgDeltaTemp: number | null;
+  maxDeltaTemp: number | null;
+  minDeltaTemp: number | null;
+  avgDeltaHum: number | null;
+  anomalyCount: number;
+  anomalyRate: number;
+}
+
 const PALETTE_COLORS = ['#06b6d4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#ef4444', '#64748b', '#14b8a6', '#6366f1'];
 
 export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
@@ -121,6 +153,14 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
     tempDelta: number;
     humidityDelta: number;
   } | null>(null);
+  const [cwaNodeComparison, setCwaNodeComparison] = useState<{
+    nodeComparisons: NodeComparison[];
+    regionSummary: RegionSummary[];
+    totalNodes: number;
+    cwaStationCount: number;
+    cwaReady: boolean;
+  } | null>(null);
+  const [cwaViewMode, setCwaViewMode] = useState<'region' | 'nodes'>('region');
 
   const fetchData = async (range: string) => {
     setLoading(true);
@@ -137,6 +177,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fwRes,
         envRes,
         cwaRes,
+        cwaNodeRes,
       ] = await Promise.all([
         fetch(`/api/analytics/kpi?range=${range}`),
         fetch(`/api/analytics/trends?range=${range}`),
@@ -149,6 +190,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fetch('/api/analytics/firmware-versions'),
         fetch(`/api/analytics/environment-trends?range=${range}`),
         fetch('/api/analytics/cwa-comparison'),
+        fetch('/api/analytics/cwa-node-comparison'),
       ]);
 
       const [
@@ -163,6 +205,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fwData,
         envData,
         cwaData,
+        cwaNodeData,
       ] = await Promise.all([
         kpiRes.json(),
         trendRes.json(),
@@ -175,6 +218,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fwRes.json(),
         envRes.json(),
         cwaRes.json(),
+        cwaNodeRes.json(),
       ]);
 
       setKpi(kpiData || { activeNodes: 0, offlineNodes: 0, ghostNodes: 0, lowBatteryAlerts: 0 });
@@ -191,6 +235,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
       });
       setEnvTrends(Array.isArray(envData) ? envData : []);
       setCwaComparison(cwaData || null);
+      setCwaNodeComparison(cwaNodeData?.cwaReady ? cwaNodeData : null);
     } catch (e) {
       console.error('Failed to fetch network analytics data:', e);
     } finally {
@@ -568,55 +613,175 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         </div>
       </div>
 
-      {/* 🚀 ⛅ 中央氣象署 (CWA) 官方數據對比卡片 */}
-      {cwaComparison && (
+      {/* 🚀 ⛅ 中央氣象署 (CWA) 精準地理配對比對 */}
+      {(cwaNodeComparison || cwaComparison) && (
         <div className={`p-5 rounded-2xl border shadow-sm space-y-4 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
+          {/* 標題列 */}
+          <div className="flex flex-wrap justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800 gap-3">
             <h3 className="text-sm font-black uppercase tracking-wider flex items-center gap-2 text-cyan-400">
-              <CloudSun size={18} /> 台灣中央氣象署 (CWA) 官方觀測 vs Mesh 網路數據對比
+              <CloudSun size={18} /> ⛅ 台灣中央氣象署 (CWA) 精準地理配對比對
             </h3>
-            <span className="text-[10px] text-slate-400 font-mono">即時全台官方氣象站平均比對</span>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            {/* 官方氣溫 */}
-            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-              <span className="text-[11px] font-bold text-slate-400">CWA 官方氣象站平均溫度</span>
-              <div className="text-2xl font-black text-blue-400 font-mono mt-1">
-                {cwaComparison.cwaAvgTemp} °C
-              </div>
-              <span className="text-[9px] text-slate-500 mt-1">全台標準百葉箱觀測值</span>
-            </div>
-
-            {/* Mesh 氣溫 */}
-            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-              <span className="text-[11px] font-bold text-slate-400">Mesh 節點實測平均溫度</span>
-              <div className="text-2xl font-black text-amber-400 font-mono mt-1">
-                {cwaComparison.meshAvgTemp} °C
-              </div>
-              <span className="text-[9px] text-slate-500 mt-1">來自 BME280 / SHT31 感測器</span>
-            </div>
-
-            {/* 氣溫偏差 Delta T */}
-            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-              <span className="text-[11px] font-bold text-slate-400">平均氣溫偏差值 (ΔT)</span>
-              <div className={`text-2xl font-black font-mono mt-1 ${cwaComparison.tempDelta > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
-                {cwaComparison.tempDelta > 0 ? `+${cwaComparison.tempDelta}` : cwaComparison.tempDelta} °C
-              </div>
-              <span className="text-[9px] text-slate-500 mt-1">
-                {cwaComparison.tempDelta > 2 ? '⚠️ 氣溫高於官方 (外殼日照微氣候)' : '良好 (接近標準觀測值)'}
-              </span>
-            </div>
-
-            {/* 濕度偏差 Delta H */}
-            <div className={`p-4 rounded-xl border flex flex-col justify-between ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
-              <span className="text-[11px] font-bold text-slate-400">平均相對濕度偏差 (ΔH)</span>
-              <div className="text-2xl font-black text-cyan-400 font-mono mt-1">
-                {cwaComparison.humidityDelta > 0 ? `+${cwaComparison.humidityDelta}` : cwaComparison.humidityDelta} %
-              </div>
-              <span className="text-[9px] text-slate-500 mt-1">Mesh: {cwaComparison.meshAvgHumidity}% vs CWA: {cwaComparison.cwaAvgHumidity}%</span>
+            <div className="flex items-center gap-3">
+              {cwaNodeComparison && (
+                <span className="text-[10px] text-slate-500 font-mono">
+                  {cwaNodeComparison.totalNodes} 個節點已配對 · {cwaNodeComparison.cwaStationCount} 個官方氣象站
+                </span>
+              )}
+              {cwaNodeComparison && (
+                <div className="flex gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg text-[9px] font-bold">
+                  <button
+                    onClick={() => setCwaViewMode('region')}
+                    className={`px-2 py-0.5 rounded transition-all ${cwaViewMode === 'region' ? 'bg-cyan-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                  >縣市分區</button>
+                  <button
+                    onClick={() => setCwaViewMode('nodes')}
+                    className={`px-2 py-0.5 rounded transition-all ${cwaViewMode === 'nodes' ? 'bg-cyan-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                  >節點明細</button>
+                </div>
+              )}
             </div>
           </div>
+
+          {/* 縣市分區彙整表 */}
+          {cwaNodeComparison && cwaViewMode === 'region' && (
+            <div className="space-y-3">
+              <p className="text-[10px] text-slate-500">
+                每個 Mesh 節點依 GPS 座標自動配對地理距離最近的 CWA 官方氣象站，再按縣市分組聚合 ΔT/ΔH。
+                偏差 &gt; ±3°C 標記為異常（日照過熱 / 外殼熱積累）。
+              </p>
+              <div className={`rounded-xl border overflow-hidden ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                <table className="w-full text-left text-xs">
+                  <thead className={`${darkMode ? 'bg-slate-800/60 text-slate-400' : 'bg-slate-50 text-slate-500'} border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                    <tr className="text-[10px] font-black uppercase tracking-widest">
+                      <th className="px-4 py-3">縣市</th>
+                      <th className="px-4 py-3 text-center">節點數</th>
+                      <th className="px-4 py-3 text-center">平均 ΔT (°C)</th>
+                      <th className="px-4 py-3 text-center">最大 ΔT</th>
+                      <th className="px-4 py-3 text-center">最小 ΔT</th>
+                      <th className="px-4 py-3 text-center">平均 ΔH (%)</th>
+                      <th className="px-4 py-3 text-center">異常節點</th>
+                    </tr>
+                  </thead>
+                  <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+                    {cwaNodeComparison.regionSummary.map((r) => (
+                      <tr key={r.county} className={`transition-colors ${darkMode ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}`}>
+                        <td className={`px-4 py-3 font-bold ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>{r.county}</td>
+                        <td className="px-4 py-3 text-center font-mono text-cyan-400">{r.nodeCount}</td>
+                        <td className="px-4 py-3 text-center font-mono font-bold">
+                          {r.avgDeltaTemp !== null ? (
+                            <span className={r.avgDeltaTemp > 2 ? 'text-red-400' : r.avgDeltaTemp < -2 ? 'text-blue-400' : 'text-emerald-400'}>
+                              {r.avgDeltaTemp > 0 ? '+' : ''}{r.avgDeltaTemp}
+                            </span>
+                          ) : <span className="text-slate-500">--</span>}
+                        </td>
+                        <td className="px-4 py-3 text-center font-mono text-red-400">
+                          {r.maxDeltaTemp !== null ? (r.maxDeltaTemp > 0 ? '+' : '') + r.maxDeltaTemp : '--'}
+                        </td>
+                        <td className="px-4 py-3 text-center font-mono text-blue-400">
+                          {r.minDeltaTemp !== null ? (r.minDeltaTemp > 0 ? '+' : '') + r.minDeltaTemp : '--'}
+                        </td>
+                        <td className="px-4 py-3 text-center font-mono text-slate-400">
+                          {r.avgDeltaHum !== null ? (r.avgDeltaHum > 0 ? '+' : '') + r.avgDeltaHum : '--'}
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {r.anomalyCount > 0 ? (
+                            <span className="px-2 py-0.5 bg-red-500/15 border border-red-500/30 text-red-400 rounded-full text-[10px] font-black">
+                              ⚠️ {r.anomalyCount} 個 ({r.anomalyRate}%)
+                            </span>
+                          ) : (
+                            <span className="text-emerald-500 text-[10px] font-bold">✓ 正常</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* 節點明細表 */}
+          {cwaNodeComparison && cwaViewMode === 'nodes' && (
+            <div className={`rounded-xl border overflow-x-auto ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+              <table className="w-full text-left text-xs whitespace-nowrap">
+                <thead className={`${darkMode ? 'bg-slate-800/60 text-slate-400' : 'bg-slate-50 text-slate-500'} border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                  <tr className="text-[10px] font-black uppercase tracking-widest">
+                    <th className="px-4 py-3">節點</th>
+                    <th className="px-4 py-3">節點氣溫</th>
+                    <th className="px-4 py-3">比對氣象站</th>
+                    <th className="px-4 py-3">距離</th>
+                    <th className="px-4 py-3">官方氣溫</th>
+                    <th className="px-4 py-3">ΔT</th>
+                    <th className="px-4 py-3">ΔH</th>
+                    <th className="px-4 py-3">天氣現況</th>
+                  </tr>
+                </thead>
+                <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+                  {cwaNodeComparison.nodeComparisons
+                    .sort((a, b) => Math.abs(b.deltaTemp ?? 0) - Math.abs(a.deltaTemp ?? 0))
+                    .map((n) => (
+                    <tr key={n.nodeId} className={`transition-colors ${n.anomaly ? (darkMode ? 'bg-red-950/20' : 'bg-red-50') : ''} ${darkMode ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}`}>
+                      <td className="px-4 py-3">
+                        <div className="font-bold text-cyan-400 font-mono text-[11px]">{n.nodeId}</div>
+                        <div className={`text-[10px] ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>{n.nodeName}</div>
+                      </td>
+                      <td className="px-4 py-3 font-mono font-bold text-amber-400">
+                        {n.nodeTemp !== null ? `${n.nodeTemp} °C` : '--'}
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className={`font-bold text-[11px] ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>{n.cwaStationName}</div>
+                        <div className="text-[10px] text-slate-500">{n.cwaCounty} {n.cwaTown}</div>
+                      </td>
+                      <td className="px-4 py-3 font-mono text-slate-400 text-[11px]">{n.distanceKm} km</td>
+                      <td className="px-4 py-3 font-mono font-bold text-blue-400">{n.cwaTemp} °C</td>
+                      <td className="px-4 py-3 font-mono font-bold text-[12px]">
+                        {n.deltaTemp !== null ? (
+                          <span className={n.anomaly ? 'text-red-400' : n.deltaTemp > 0 ? 'text-orange-400' : 'text-emerald-400'}>
+                            {n.deltaTemp > 0 ? '+' : ''}{n.deltaTemp} °C
+                            {n.anomaly && ' ⚠️'}
+                          </span>
+                        ) : '--'}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-slate-400">
+                        {n.deltaHum !== null ? (n.deltaHum > 0 ? '+' : '') + n.deltaHum + '%' : '--'}
+                      </td>
+                      <td className="px-4 py-3 text-[10px] text-slate-500">{n.cwaWeather || '--'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* 若 cwaNodeComparison 尚未就緒，退化顯示舊版 4 卡片 */}
+          {!cwaNodeComparison && cwaComparison && (
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className={`p-4 rounded-xl border flex flex-col gap-1 ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                <span className="text-[11px] font-bold text-slate-400">CWA 官方全台平均溫度</span>
+                <div className="text-2xl font-black text-blue-400 font-mono">{cwaComparison.cwaAvgTemp} °C</div>
+                <span className="text-[9px] text-slate-500">（含高山站，偏低）</span>
+              </div>
+              <div className={`p-4 rounded-xl border flex flex-col gap-1 ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                <span className="text-[11px] font-bold text-slate-400">Mesh 節點平均溫度</span>
+                <div className="text-2xl font-black text-amber-400 font-mono">{cwaComparison.meshAvgTemp} °C</div>
+                <span className="text-[9px] text-slate-500">BME280 / SHT31 感測器</span>
+              </div>
+              <div className={`p-4 rounded-xl border flex flex-col gap-1 ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                <span className="text-[11px] font-bold text-slate-400">全台平均 ΔT（粗估）</span>
+                <div className={`text-2xl font-black font-mono ${cwaComparison.tempDelta > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                  {cwaComparison.tempDelta > 0 ? '+' : ''}{cwaComparison.tempDelta} °C
+                </div>
+                <span className="text-[9px] text-slate-500">⚠️ 未排除高山站偏差</span>
+              </div>
+              <div className={`p-4 rounded-xl border flex flex-col gap-1 ${darkMode ? 'bg-slate-800/40 border-slate-700/50' : 'bg-slate-50 border-slate-200'}`}>
+                <span className="text-[11px] font-bold text-slate-400">全台平均 ΔH</span>
+                <div className="text-2xl font-black text-cyan-400 font-mono">
+                  {cwaComparison.humidityDelta > 0 ? '+' : ''}{cwaComparison.humidityDelta} %
+                </div>
+                <span className="text-[9px] text-slate-500">Mesh vs CWA 濕度差</span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
