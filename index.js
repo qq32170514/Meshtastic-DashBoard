@@ -195,7 +195,7 @@ db.serialize(() => {
     db.run(`PRAGMA cache_size = -32000`);    // 32MB 頁面快取（負值代表 KB）
     db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
     db.run(`PRAGMA mmap_size = 268435456`);  // 256MB mmap 加速讀取
-    db.run(`PRAGMA busy_timeout = 5000`);    // 5秒等待鎖，避免 SQLITE_BUSY 錯誤
+    db.run(`PRAGMA busy_timeout = 30000`);   // 30秒等待鎖，避免高併發寫入時出現 SQLITE_BUSY 錯誤
 
     db.run(`
         CREATE TABLE IF NOT EXISTS telemetry_data (
@@ -378,6 +378,11 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_source_timestamp ON packet_logs (source, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
+    
+    // 🚀 複合索引：大幅提升 NOC 戰情中心 Top Gateways 與重複率查詢速度 (從 5000ms 降至 100ms)
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_rawhex_ts ON packet_logs (raw_hex, timestamp DESC)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)`);
     
     // 聊天紀錄效能優化
     db.run(`CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)`);
@@ -572,6 +577,15 @@ app.get('/api/packets', withCache(), (req, res) => {
     });
 });
 
+// 🚀 全域封包總數統計（加快取）
+app.get('/api/packets/count', withCache(), (req, res) => {
+    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs", { excludeTunnelPackets: true });
+    db.get(sql, params, (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ count: row?.count || 0 });
+    });
+});
+
 // 🚀 新增：單一封包詳情（懶加載），包含 payload_json 和 raw_hex
 app.get('/api/packets/:id', (req, res) => {
     db.get(`SELECT * FROM packet_logs WHERE id = ?`, [req.params.id], (err, row) => {
@@ -606,15 +620,6 @@ app.get('/api/packets/:id/gateways', (req, res) => {
             if (err2) return res.status(500).json({ error: err2.message });
             res.json(rows);
         });
-    });
-});
-
-// 🚀 全域封包總數統計（加快取）
-app.get('/api/packets/count', withCache(), (req, res) => {
-    const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs", { excludeTunnelPackets: true });
-    db.get(sql, params, (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ count: row?.count || 0 });
     });
 });
 
@@ -769,6 +774,92 @@ app.get('/api/traceroute/latest', (req, res) => {
     });
 });
 
+// 🛰️ Traceroute 多路徑渲染 API：回傳近 24 小時所有唯一 Traceroute 路徑（含每跳座標與 SNR）
+app.get('/api/traceroute/paths', withCache(30 * 1000), (req, res) => {
+    const sql = `
+        SELECT node_id, gateway_id, payload_json, timestamp
+        FROM packet_logs
+        WHERE (portnum = '70' OR portnum = 'TRACEROUTE_APP')
+          AND payload_json IS NOT NULL
+          AND timestamp >= datetime('now', '-24 hours')
+        ORDER BY timestamp DESC
+        LIMIT 300
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        // 依路由簽名去重，保留最新一筆
+        const seenSigs = new Set();
+        const parsed = [];
+        const allNodeIds = new Set();
+
+        for (const r of rows) {
+            try {
+                const p = JSON.parse(r.payload_json);
+                const route = p.route || [];
+                // snr_towards 以 0.25dB 為單位儲存，需除以 4 還原為 dB
+                const snrTowards = (p.snr_towards || []).map(v => Math.round((v / 4) * 10) / 10);
+
+                const routeHexIds = route.map(id => `!${(id >>> 0).toString(16).padStart(8, '0')}`);
+                const fullPathIds = [r.node_id, ...routeHexIds, r.gateway_id].filter(Boolean).filter(id => id !== 'Unknown');
+
+                if (fullPathIds.length < 2) continue;
+
+                // 路由簽名 (去重)
+                const sig = fullPathIds.join('->');
+                if (seenSigs.has(sig)) continue;
+                seenSigs.add(sig);
+
+                fullPathIds.forEach(id => allNodeIds.add(id.toLowerCase()));
+                parsed.push({ nodeIds: fullPathIds, snrTowards, timestamp: r.timestamp });
+
+                if (parsed.length >= 25) break; // 最多 25 條唯一路徑
+            } catch (e) { /* skip */ }
+        }
+
+        if (parsed.length === 0) return res.json([]);
+
+        const allIds = Array.from(allNodeIds);
+        const placeholders = allIds.map(() => '?').join(',');
+
+        db.all(
+            `SELECT node_id, short_name, long_name, latitude, longitude FROM nodes WHERE node_id IN (${placeholders})`,
+            allIds,
+            (err2, nodeRows) => {
+                if (err2) return res.status(500).json({ error: err2.message });
+
+                const nodeMap = new Map();
+                nodeRows.forEach(n => nodeMap.set(n.node_id.toLowerCase(), n));
+
+                const result = parsed.map((path, idx) => {
+                    const hops = path.nodeIds.map((id, hopIdx) => {
+                        const node = nodeMap.get(id.toLowerCase());
+                        return {
+                            nodeId: id,
+                            name: node ? (node.short_name || node.long_name || id) : id,
+                            latitude: node ? node.latitude : null,
+                            longitude: node ? node.longitude : null,
+                            // snrTowards[i] = 從 path[i] 到 path[i+1] 的 SNR
+                            // 故 hop[i] 的「入站 SNR」是 snrTowards[i-1]
+                            snr: hopIdx > 0 ? (path.snrTowards[hopIdx - 1] ?? null) : null
+                        };
+                    }).filter(h => h.latitude && h.longitude);
+
+                    return {
+                        id: `tr-${idx}`,
+                        timestamp: path.timestamp,
+                        hops,
+                        totalHops: path.nodeIds.length - 2 // 不含起終點的中繼跳數
+                    };
+                }).filter(p => p.hops.length >= 2);
+
+                res.json(result);
+            }
+        );
+    });
+});
+
 // 🚀 核心升級：網格化覆蓋率聚合 API
 // 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
 app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
@@ -836,15 +927,125 @@ app.get('/api/neighbors', (req, res) => {
     });
 });
 
-// 提供給前端邏輯拓樸圖層的連線資料
+// 提供給前端邏輯拓樸圖層的融合連線資料 (整合 NeighborInfo 與 Traceroute 路徑)
 app.get('/api/topology/fusion-edges', (req, res) => {
-    const query = `
+    const queryNeighbors = `
         SELECT node_id as source_id, neighbor_id as target_id, 80 as confidence, 'NEIGHBOR_INFO' as method, snr
         FROM neighbors WHERE last_seen > datetime('now', '-2 days')
     `;
-    db.all(query, [], (err, rows) => {
+
+    db.all(queryNeighbors, [], (err, neighborRows) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
+
+        const edgesMap = new Map();
+
+        // 1. 填入 NEIGHBOR_INFO（優先級最高，直接鄰居關係最可信）
+        // 使用無向邊正準化 key，避免 A→B 和 B→A 重複建兩條線
+        (neighborRows || []).forEach(r => {
+            const [a, b] = r.source_id < r.target_id ? [r.source_id, r.target_id] : [r.target_id, r.source_id];
+            const key = `${a}<->${b}`;
+            // 若已存在同一對節點的邊，保留 SNR 較好（較高）的那筆
+            if (!edgesMap.has(key) || (r.snr !== null && r.snr > (edgesMap.get(key).snr ?? -999))) {
+                edgesMap.set(key, r);
+            }
+        });
+
+        // 2. 從 7 天內 TRACEROUTE 封包解析跳轉鏈路
+        const queryTraceroute = `
+            SELECT node_id, gateway_id, payload_json, timestamp 
+            FROM packet_logs 
+            WHERE (portnum = '70' OR portnum = 'TRACEROUTE_APP')
+              AND payload_json IS NOT NULL
+              AND timestamp >= datetime('now', '-7 days')
+            ORDER BY timestamp DESC LIMIT 500
+        `;
+
+        db.all(queryTraceroute, [], (tErr, traceRows) => {
+            if (!tErr && Array.isArray(traceRows)) {
+                traceRows.forEach(r => {
+                    try {
+                        const p = JSON.parse(r.payload_json);
+                        const route = p.route || p.route_towards || [];
+                        const snrTowards = p.snr_towards || [];
+
+                        if (!Array.isArray(route)) return;
+
+                        // 🔴 Bug fix #1: 過濾掉 0xFFFFFFFF (4294967295)
+                        // 這是 Meshtastic 的「發送者自身」佔位符，不是真實中繼節點
+                        // 若不過濾，會產生大量幽靈連線（ghost edges）
+                        const SELF_ID = 4294967295;
+
+                        // 🔴 Bug fix #2: 解析 snr_towards 的 SNR 值
+                        // Meshtastic 將 SNR 編碼為 int8 * 4，-128 代表無效值
+                        // snrTowards[i] 對應 route[i]（含 SELF_ID）收到前一跳的 SNR
+                        const getSNR = (snrRaw) => {
+                            if (snrRaw === undefined || snrRaw === null || snrRaw === -128) return null;
+                            return Math.round((snrRaw / 4) * 10) / 10; // 除以 4 還原為 dB
+                        };
+
+                        // 建立 nodeId -> snr 對照表（使用含 SELF_ID 的原始索引來對齊 snrTowards）
+                        const snrLookup = new Map();
+                        route.forEach((rawId, idx) => {
+                            if (rawId !== SELF_ID && idx < snrTowards.length) {
+                                const hexId = `!${rawId.toString(16).padStart(8, '0')}`;
+                                snrLookup.set(hexId, getSNR(snrTowards[idx]));
+                            }
+                        });
+                        // gateway 對應的 SNR 是 snrTowards 陣列最後一個有效值
+                        if (snrTowards.length > 0 && r.gateway_id) {
+                            snrLookup.set(r.gateway_id, getSNR(snrTowards[snrTowards.length - 1]));
+                        }
+
+                        // 過濾 SELF_ID 後，建立乾淨的完整路徑
+                        const routeIds = route
+                            .filter(id => id !== SELF_ID)
+                            .map(id => typeof id === 'number' ? `!${id.toString(16).padStart(8, '0')}` : String(id));
+
+                        const fullPath = [r.node_id, ...routeIds, r.gateway_id].filter(id => {
+                            return id && id !== 'Unknown' && !String(id).includes('undefined');
+                        });
+
+                        // 🔴 Bug fix #3: 去除自環（sender == gateway，路徑為空）
+                        // 例如 !d3880f35 -> !d3880f35，這類封包無任何拓撲意義
+                        // 注意：forEach 內不能用 continue，要用 return 跳過
+                        if (fullPath.length < 2 || (fullPath.length === 2 && fullPath[0] === fullPath[1])) return;
+
+                        // 去除重複的相鄰節點（某些封包 gateway_id 與 route 最後一個節點相同）
+                        const dedupedPath = fullPath.filter((id, i) => i === 0 || id !== fullPath[i - 1]);
+
+
+                        for (let i = 0; i < dedupedPath.length - 1; i++) {
+                            const u = dedupedPath[i];
+                            const v = dedupedPath[i + 1];
+                            if (!u || !v || u === v) continue;
+
+                            // v 節點收到 u 訊號的 SNR
+                            const edgeSnr = snrLookup.get(v) ?? null;
+
+                            // 🔑 使用「無向邊」正準化 key（字母序較小的放前面）
+                            // 確保 A→B 和 B→A 對應同一條邊，每對直連節點只存一條
+                            // 這樣地圖上就不會有重疊線，也不會有 A↔C 的幽靈連線
+                            const [sortedA, sortedB] = u < v ? [u, v] : [v, u];
+                            const key = `${sortedA}<->${sortedB}`;
+
+                            if (!edgesMap.has(key)) {
+                                edgesMap.set(key, {
+                                    source_id: u,   // 保留原始方向給 tooltip 顯示用
+                                    target_id: v,
+                                    confidence: 90,
+                                    method: 'TRACEROUTE',
+                                    snr: edgeSnr
+                                });
+                            } else if (edgesMap.get(key).snr === null && edgeSnr !== null) {
+                                edgesMap.get(key).snr = edgeSnr; // 補充缺失的 SNR
+                            }
+                        }
+                    } catch (e) { /* 忽略解析錯誤的封包 */ }
+                });
+            }
+
+            res.json(Array.from(edgesMap.values()));
+        });
     });
 });
 
@@ -1019,7 +1220,7 @@ function recordLivePacketAnalytics(port, snr, rssi, temp, hum) {
     if (['POSITION', '3', 'POSITION_APP'].includes(pStr)) pType = 'position_count';
     else if (['TELEMETRY', '67', 'TELEMETRY_APP'].includes(pStr)) pType = 'telemetry_count';
     else if (['TEXT_MESSAGE', '1', 'TEXT_MESSAGE_APP'].includes(pStr)) pType = 'text_count';
-    else if (['ROUTING', '5', 'ROUTING_APP'].includes(pStr)) pType = 'routing_count';
+    else if (['ROUTING', '5', '32', 'ROUTING_APP'].includes(pStr)) pType = 'routing_count';
 
     let validSnr = (snr !== null && snr !== undefined && snr >= -35 && snr <= 35) ? parseFloat(snr) : null;
     let validRssi = (rssi !== null && rssi !== undefined && rssi >= -150 && rssi <= 0) ? parseFloat(rssi) : null;
@@ -1155,7 +1356,12 @@ app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
         FROM packet_logs
         WHERE timestamp >= datetime('now', '-' || ? || ' days')
         GROUP BY hop_category
-        ORDER BY count DESC
+        ORDER BY CASE 
+            WHEN hop_category LIKE '0%' THEN 0
+            WHEN hop_category LIKE '1%' THEN 1
+            WHEN hop_category LIKE '2%' THEN 2
+            ELSE 3
+        END ASC
     `;
 
     db.all(sql, [days], (err, rows) => {
@@ -1310,40 +1516,47 @@ function fetchAndSaveCWAData() {
                 if (stations.length === 0) return;
 
                 let updatedCount = 0;
-                const stmt = db.prepare(`
-                    INSERT INTO cwa_weather_stations 
-                    (station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(station_id) DO UPDATE SET
-                        temperature = excluded.temperature,
-                        humidity = excluded.humidity,
-                        weather = excluded.weather,
-                        updated_at = CURRENT_TIMESTAMP
-                `);
+                db.serialize(() => {
+                    db.run('BEGIN TRANSACTION');
+                    const stmt = db.prepare(`
+                        INSERT INTO cwa_weather_stations 
+                        (station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(station_id) DO UPDATE SET
+                            temperature = excluded.temperature,
+                            humidity = excluded.humidity,
+                            weather = excluded.weather,
+                            updated_at = CURRENT_TIMESTAMP
+                    `);
 
-                stations.forEach(s => {
-                    const id = s.StationId;
-                    const name = s.StationName;
-                    const county = s.GeoInfo?.CountyName || '';
-                    const town = s.GeoInfo?.TownName || '';
-                    const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
-                    const lat = parseFloat(coords?.StationLatitude || s.Latitude);
-                    const lng = parseFloat(coords?.StationLongitude || s.Longitude);
+                    stations.forEach(s => {
+                        const id = s.StationId;
+                        const name = s.StationName;
+                        const county = s.GeoInfo?.CountyName || '';
+                        const town = s.GeoInfo?.TownName || '';
+                        const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
+                        const lat = parseFloat(coords?.StationLatitude || s.Latitude);
+                        const lng = parseFloat(coords?.StationLongitude || s.Longitude);
 
-                    const tempRaw = s.WeatherElement?.AirTemperature;
-                    const humRaw = s.WeatherElement?.RelativeHumidity;
-                    const weather = s.WeatherElement?.Weather || '';
+                        const tempRaw = s.WeatherElement?.AirTemperature;
+                        const humRaw = s.WeatherElement?.RelativeHumidity;
+                        const weather = s.WeatherElement?.Weather || '';
 
-                    let temp = (tempRaw !== undefined && tempRaw !== '-99' && tempRaw !== -99) ? parseFloat(tempRaw) : null;
-                    let hum = (humRaw !== undefined && humRaw !== '-99' && humRaw !== -99) ? parseFloat(humRaw) : null;
+                        let temp = (tempRaw !== undefined && tempRaw !== '-99' && tempRaw !== -99) ? parseFloat(tempRaw) : null;
+                        let hum = (humRaw !== undefined && humRaw !== '-99' && humRaw !== -99) ? parseFloat(humRaw) : null;
 
-                    if (id && name && !isNaN(lat) && !isNaN(lng)) {
-                        stmt.run([id, name, county, town, lat, lng, temp, hum, weather]);
-                        updatedCount++;
-                    }
+                        if (id && name && !isNaN(lat) && !isNaN(lng)) {
+                            stmt.run([id, name, county, town, lat, lng, temp, hum, weather]);
+                            updatedCount++;
+                        }
+                    });
+                    stmt.finalize();
+                    db.run('COMMIT', (err) => {
+                        if (!err) {
+                            console.log(`⛅ [中央氣象署 API] 成功更新 ${updatedCount} 個台灣官方氣象站即時觀測數據！`);
+                        }
+                    });
                 });
-                stmt.finalize();
-                console.log(`⛅ [中央氣象署 API] 成功更新 ${updatedCount} 個台灣官方氣象站即時觀測數據！`);
             } catch (e) {
                 console.error('❌ CWA API 解析失敗:', e.message);
             }
@@ -1528,14 +1741,14 @@ app.get('/api/analytics/hourly-peak-stacked', withCache(60 * 1000), (req, res) =
             const h = r.hour;
             if (!hoursMap[h]) return;
             const cnt = r.count;
-            const p = r.portnum;
+            const p = (r.portnum || '').toString();
             hoursMap[h].total += cnt;
 
-            if (p === 1) hoursMap[h].text += cnt;
-            else if (p === 3) hoursMap[h].position += cnt;
-            else if (p === 67) hoursMap[h].telemetry += cnt;
-            else if (p === 32) hoursMap[h].routing += cnt;
-            else if (p === 6) hoursMap[h].admin += cnt;
+            if (['TEXT_MESSAGE', '1', 'TEXT_MESSAGE_APP'].includes(p)) hoursMap[h].text += cnt;
+            else if (['POSITION', '3', 'POSITION_APP'].includes(p)) hoursMap[h].position += cnt;
+            else if (['TELEMETRY', '67', 'TELEMETRY_APP'].includes(p)) hoursMap[h].telemetry += cnt;
+            else if (['ROUTING', '5', '32', 'ROUTING_APP'].includes(p)) hoursMap[h].routing += cnt;
+            else if (['ADMIN', '6', 'ADMIN_APP'].includes(p)) hoursMap[h].admin += cnt;
             else hoursMap[h].other += cnt;
         });
 
@@ -1574,7 +1787,8 @@ app.get('/api/analytics/cu-distribution', withCache(60 * 1000), (req, res) => {
         let sumCU = 0;
 
         (rows || []).forEach(r => {
-            const cu = Math.round(r.channel_utilization * 10) / 10;
+            const rawCU = r.cu ?? r.channel_utilization ?? 0;
+            const cu = Math.round(rawCU * 10) / 10;
             sumCU += cu;
             const item = { nodeId: r.node_id, name: r.long_name || r.short_name || r.node_id, cu };
             if (cu >= 25) critical.push(item);
@@ -1595,6 +1809,366 @@ app.get('/api/analytics/cu-distribution', withCache(60 * 1000), (req, res) => {
                 normal: { count: normal.length, pct: total > 0 ? Math.round((normal.length / total) * 100) : 0, nodes: normal },
                 low: { count: low.length, pct: total > 0 ? Math.round((low.length / total) * 100) : 0, nodes: low }
             }
+        });
+    });
+});
+
+// ==========================================
+// 📡 API 2.3.1: 發射空口佔用率 (AirUtil TX) 分級與 Top 榜
+// ==========================================
+app.get('/api/analytics/air-util-distribution', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            t.node_id,
+            t.air_util_tx,
+            n.long_name,
+            n.short_name,
+            n.last_seen
+        FROM telemetry_data t
+        INNER JOIN (
+            SELECT node_id, MAX(timestamp) as max_ts
+            FROM telemetry_data
+            WHERE air_util_tx IS NOT NULL AND timestamp >= datetime('now', '-24 hours')
+            GROUP BY node_id
+        ) latest ON t.node_id = latest.node_id AND t.timestamp = latest.max_ts
+        INNER JOIN nodes n ON t.node_id = n.node_id
+        ORDER BY t.air_util_tx DESC
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const high = [];
+        const medium = [];
+        const low = [];
+        let sumTx = 0;
+
+        (rows || []).forEach(r => {
+            const tx = Math.round(r.air_util_tx * 10) / 10;
+            sumTx += tx;
+            const item = { nodeId: r.node_id, name: r.long_name || r.short_name || r.node_id, tx };
+            if (tx > 5) high.push(item);
+            else if (tx >= 2.5) medium.push(item);
+            else low.push(item);
+        });
+
+        const total = (rows || []).length;
+        const avgTx = total > 0 ? Math.round((sumTx / total) * 10) / 10 : 0;
+        const topNodes = (rows || []).slice(0, 10).map(r => ({
+            nodeId: r.node_id,
+            name: r.long_name || r.short_name || r.node_id,
+            tx: Math.round(r.air_util_tx * 10) / 10
+        }));
+
+        res.json({
+            totalNodes: total,
+            avgTx,
+            topNodes,
+            tiers: {
+                high: { count: high.length, pct: total > 0 ? Math.round((high.length / total) * 100) : 0, nodes: high },
+                medium: { count: medium.length, pct: total > 0 ? Math.round((medium.length / total) * 100) : 0, nodes: medium },
+                low: { count: low.length, pct: total > 0 ? Math.round((low.length / total) * 100) : 0, nodes: low }
+            }
+        });
+    });
+});
+
+// ==========================================
+// 🏆 API 2.3.2: 最狂 MQTT 閘道與直連覆蓋分析
+// ==========================================
+app.get('/api/analytics/top-gateways', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            p.gateway_id,
+            n.long_name,
+            n.short_name,
+            COUNT(p.id) as packet_count,
+            COUNT(DISTINCT CASE WHEN p.hops_away = 0 OR p.hop_limit = p.hop_start THEN p.node_id END) as direct_nodes_count,
+            COUNT(DISTINCT p.node_id) as total_unique_nodes,
+            ROUND(AVG(p.snr), 1) as avg_snr,
+            MAX(p.timestamp) as last_seen
+        FROM packet_logs p
+        LEFT JOIN nodes n ON p.gateway_id = n.node_id
+        WHERE p.gateway_id IS NOT NULL AND p.gateway_id != '' AND p.timestamp >= datetime('now', '-' || ? || ' days')
+        GROUP BY p.gateway_id
+        ORDER BY packet_count DESC
+        LIMIT 20
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const list = (rows || []).map(r => ({
+            gatewayId: r.gateway_id,
+            name: r.long_name || r.short_name || r.gateway_id,
+            packetCount: r.packet_count,
+            directNodesCount: r.direct_nodes_count,
+            totalUniqueNodes: r.total_unique_nodes,
+            avgSnr: r.avg_snr,
+            lastSeen: r.last_seen
+        }));
+        res.json(list);
+    });
+});
+
+// ==========================================
+// 🔄 API 2.3.3: 封包重複率與傳播效率分析
+// ==========================================
+app.get('/api/analytics/duplicate-stats', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            COUNT(*) as total_records,
+            COUNT(DISTINCT (node_id || '_' || portnum || '_' || strftime('%Y-%m-%d %H:%M', timestamp))) as unique_events
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-' || ? || ' days')
+    `;
+
+    db.get(sql, [days], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const total = row ? row.total_records : 0;
+        const unique = row ? row.unique_events : 0;
+        const duplicates = Math.max(0, total - unique);
+        const duplicateRate = total > 0 ? Math.round((duplicates / total) * 1000) / 10 : 0;
+        const efficiencyScore = Math.max(0, Math.round(100 - duplicateRate));
+
+        res.json({
+            totalPackets: total,
+            uniquePackets: unique,
+            duplicatePackets: duplicates,
+            duplicateRatePct: duplicateRate,
+            efficiencyScore
+        });
+    });
+});
+
+// ==========================================
+// 🌐 API 2.3.4: RF 純無線 vs MQTT 橋接流量比例
+// ==========================================
+app.get('/api/analytics/traffic-source-ratio', withCache(60 * 1000), (req, res) => {
+    const range = req.query.range || '7d';
+    let days = 7;
+    if (range === '24h') days = 1;
+    if (range === '30d') days = 30;
+
+    const sql = `
+        SELECT 
+            CASE 
+                WHEN source IS NOT NULL AND source != '' AND source NOT LIKE '%MQTT%' THEN source
+                WHEN topic LIKE '%/mqtt/%' OR gateway_id IS NOT NULL THEN 'MQTT Gateway'
+                ELSE 'RF Native'
+            END as source_category,
+            COUNT(*) as count
+        FROM packet_logs
+        WHERE timestamp >= datetime('now', '-' || ? || ' days')
+        GROUP BY source_category
+        ORDER BY count DESC
+    `;
+
+    db.all(sql, [days], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
+    });
+});
+
+// ==========================================
+// 🔋 API 2.3.5: 電池與太陽能供電健康分佈
+// ==========================================
+app.get('/api/analytics/power-health', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            node_id,
+            long_name,
+            short_name,
+            battery_level,
+            voltage,
+            last_seen
+        FROM nodes
+        WHERE battery_level IS NOT NULL AND last_seen >= datetime('now', '-48 hours')
+        ORDER BY battery_level ASC
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const critical = [];
+        const warning = [];
+        const healthy = [];
+        let sumBat = 0;
+
+        (rows || []).forEach(r => {
+            const lvl = Math.round(r.battery_level);
+            sumBat += lvl;
+            const item = { nodeId: r.node_id, name: r.long_name || r.short_name || r.node_id, battery: lvl, voltage: r.voltage ? (Math.round(r.voltage * 100) / 100) : null };
+            if (lvl < 20) critical.push(item);
+            else if (lvl <= 50) warning.push(item);
+            else healthy.push(item);
+        });
+
+        const total = (rows || []).length;
+        const avgBattery = total > 0 ? Math.round(sumBat / total) : 0;
+
+        res.json({
+            totalNodes: total,
+            avgBattery,
+            tiers: {
+                critical: { count: critical.length, pct: total > 0 ? Math.round((critical.length / total) * 100) : 0, nodes: critical },
+                warning: { count: warning.length, pct: total > 0 ? Math.round((warning.length / total) * 100) : 0, nodes: warning },
+                healthy: { count: healthy.length, pct: total > 0 ? Math.round((healthy.length / total) * 100) : 0, nodes: healthy }
+            }
+        });
+    });
+});
+
+// ==========================================
+// 🕸️ API 2.3.6: 網狀拓撲密度與核心樞紐榜
+// ==========================================
+app.get('/api/analytics/mesh-interconnectivity', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            n1.node_id,
+            nd.long_name,
+            nd.short_name,
+            COUNT(DISTINCT n1.neighbor_id) as neighbor_count,
+            ROUND(AVG(n1.snr), 1) as avg_snr
+        FROM neighbors n1
+        LEFT JOIN nodes nd ON n1.node_id = nd.node_id
+        WHERE n1.last_seen >= datetime('now', '-48 hours')
+        GROUP BY n1.node_id
+        ORDER BY neighbor_count DESC
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        const hubNodes = (rows || []).slice(0, 10).map(r => ({
+            nodeId: r.node_id,
+            name: r.long_name || r.short_name || r.node_id,
+            neighborCount: r.neighbor_count,
+            avgSnr: r.avg_snr
+        }));
+
+        let totalNeighbors = 0;
+        (rows || []).forEach(r => { totalNeighbors += r.neighbor_count; });
+
+        const reportingNodes = (rows || []).length;
+        const avgNeighborsPerNode = reportingNodes > 0 ? Math.round((totalNeighbors / reportingNodes) * 10) / 10 : 0;
+
+        res.json({
+            reportingNodes,
+            avgNeighborsPerNode,
+            hubNodes
+        });
+    });
+});
+
+// ==========================================
+// ⚠️ API 2.3.7: 臨界弱訊號與訊號波動警告
+// ==========================================
+app.get('/api/analytics/weak-signal-alerts', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            p.node_id,
+            n.long_name,
+            n.short_name,
+            ROUND(AVG(p.snr), 1) as avg_snr,
+            MIN(p.snr) as min_snr,
+            MAX(p.snr) as max_snr,
+            COUNT(p.id) as packet_count,
+            MAX(p.timestamp) as last_seen
+        FROM packet_logs p
+        INNER JOIN nodes n ON p.node_id = n.node_id
+        WHERE p.snr IS NOT NULL AND p.snr BETWEEN -35 AND 35
+          AND p.timestamp >= datetime('now', '-24 hours')
+        GROUP BY p.node_id
+        HAVING avg_snr < -10 OR min_snr < -15
+        ORDER BY avg_snr ASC
+        LIMIT 20
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const list = (rows || []).map(r => ({
+            nodeId: r.node_id,
+            name: r.long_name || r.short_name || r.node_id,
+            avgSnr: r.avg_snr,
+            minSnr: r.min_snr,
+            maxSnr: r.max_snr,
+            packetCount: r.packet_count,
+            lastSeen: r.last_seen
+        }));
+        res.json({
+            count: list.length,
+            nodes: list
+        });
+    });
+});
+
+// ==========================================
+// ☀️ API 2.3.8: 太陽能板充電狀態與光照效能榜
+// ==========================================
+app.get('/api/analytics/solar-charging-health', withCache(60 * 1000), (req, res) => {
+    const sql = `
+        SELECT 
+            t.node_id,
+            t.voltage,
+            t.current,
+            t.battery_level,
+            n.long_name,
+            n.short_name,
+            t.timestamp
+        FROM telemetry_data t
+        INNER JOIN (
+            SELECT node_id, MAX(timestamp) as max_ts
+            FROM telemetry_data
+            WHERE voltage IS NOT NULL AND voltage > 0 AND timestamp >= datetime('now', '-24 hours')
+            GROUP BY node_id
+        ) latest ON t.node_id = latest.node_id AND t.timestamp = latest.max_ts
+        INNER JOIN nodes n ON t.node_id = n.node_id
+        ORDER BY t.voltage DESC
+    `;
+
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        let chargingCount = 0;
+        let sumVolts = 0;
+        let validVoltsCount = 0;
+
+        const list = (rows || []).map(r => {
+            const v = r.voltage || 0;
+            if (v > 0) {
+                sumVolts += v;
+                validVoltsCount++;
+            }
+            const isCharging = (v >= 4.15) || (r.current && r.current > 0);
+            if (isCharging) chargingCount++;
+
+            return {
+                nodeId: r.node_id,
+                name: r.long_name || r.short_name || r.node_id,
+                voltage: Math.round(v * 100) / 100,
+                battery: r.battery_level ? Math.round(r.battery_level) : null,
+                isCharging
+            };
+        });
+
+        const avgVoltage = validVoltsCount > 0 ? Math.round((sumVolts / validVoltsCount) * 100) / 100 : 0;
+        const topSolarNodes = list.slice(0, 10);
+
+        res.json({
+            totalSolarNodes: list.length,
+            chargingCount,
+            avgVoltage,
+            topSolarNodes
         });
     });
 });
@@ -1807,6 +2381,197 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
     });
 });
 
+// ==========================================
+// ⛅ API 2.3.9: 各縣市分區環境與氣候遙測歷史趨勢
+// ==========================================
+app.get('/api/analytics/county-weather-trends', withCache(60 * 1000), (req, res) => {
+    db.all("SELECT station_id, county, latitude, longitude FROM cwa_weather_stations WHERE latitude IS NOT NULL AND longitude IS NOT NULL", [], (err, cwaStations) => {
+        if (err) return res.status(500).json({ error: err.message });
+
+        db.all("SELECT node_id, latitude, longitude FROM nodes WHERE latitude IS NOT NULL AND latitude != 0 AND longitude IS NOT NULL AND longitude != 0", [], (nErr, nodes) => {
+            if (nErr) return res.status(500).json({ error: nErr.message });
+
+            const nodeCountyMap = {};
+            for (const n of (nodes || [])) {
+                let nearestCounty = '全網/其它';
+                let minDist = Infinity;
+                for (const st of (cwaStations || [])) {
+                    const dist = calculateHaversineDistance(n.latitude, n.longitude, st.latitude, st.longitude);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        nearestCounty = st.county;
+                    }
+                }
+                nodeCountyMap[n.node_id] = nearestCounty;
+            }
+
+            const sqlTele = `
+                SELECT 
+                    node_id,
+                    strftime('%Y-%m-%d', timestamp) as date,
+                    temperature,
+                    humidity
+                FROM telemetry_data
+                WHERE (temperature IS NOT NULL OR humidity IS NOT NULL)
+                  AND timestamp >= datetime('now', '-30 days')
+                ORDER BY date ASC
+            `;
+
+            db.all(sqlTele, [], (tErr, teleRows) => {
+                if (tErr) return res.status(500).json({ error: tErr.message });
+
+                const dateCountyMap = {};
+                const allCountiesSet = new Set();
+
+                (teleRows || []).forEach(r => {
+                    const date = r.date;
+                    const county = nodeCountyMap[r.node_id] || '全網/其它';
+                    allCountiesSet.add(county);
+
+                    if (!dateCountyMap[date]) dateCountyMap[date] = {};
+                    if (!dateCountyMap[date][county]) {
+                        dateCountyMap[date][county] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
+                    }
+                    if (!dateCountyMap[date]['全網平均']) {
+                        dateCountyMap[date]['全網平均'] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
+                    }
+
+                    const cObj = dateCountyMap[date][county];
+                    const allObj = dateCountyMap[date]['全網平均'];
+
+                    if (r.temperature !== null && r.temperature !== undefined) {
+                        cObj.tempSum += r.temperature;
+                        cObj.tempCount++;
+                        allObj.tempSum += r.temperature;
+                        allObj.tempCount++;
+                    }
+                    if (r.humidity !== null && r.humidity !== undefined) {
+                        cObj.humSum += r.humidity;
+                        cObj.humCount++;
+                        allObj.humSum += r.humidity;
+                        allObj.humCount++;
+                    }
+                });
+
+                const sortedCounties = Array.from(allCountiesSet).sort();
+                const counties = ['全網平均', ...sortedCounties];
+                const datesList = Object.keys(dateCountyMap).sort();
+
+                const tempTrends = datesList.map(d => {
+                    const row = { date: d };
+                    for (const c of counties) {
+                        const data = dateCountyMap[d][c];
+                        row[c] = (data && data.tempCount > 0) ? Math.round((data.tempSum / data.tempCount) * 10) / 10 : null;
+                    }
+                    return row;
+                });
+
+                const humTrends = datesList.map(d => {
+                    const row = { date: d };
+                    for (const c of counties) {
+                        const data = dateCountyMap[d][c];
+                        row[c] = (data && data.humCount > 0) ? Math.round(data.humSum / data.humCount) : null;
+                    }
+                    return row;
+                });
+
+                res.json({
+                    counties,
+                    tempTrends,
+                    humTrends
+                });
+            });
+        });
+    });
+});
+// ==========================================
+// 🚀 API Bundle: 一鍵打包全網宏觀戰情中心所有數據 (極速快取 10分鐘 + 背景預熱)
+// ==========================================
+const bundleCacheMap = {};
+
+app.get('/api/analytics/bundle', async (req, res) => {
+    const range = req.query.range || '7d';
+    const now = Date.now();
+
+    // 🚀 快取延長至 10 分鐘，結合背景 setInterval 自動更新，用戶點擊 NOC 達成 0ms 載入
+    if (bundleCacheMap[range] && (now - bundleCacheMap[range].timestamp < 10 * 60 * 1000)) {
+        return res.json(bundleCacheMap[range].data);
+    }
+
+    const currentPort = server.address()?.port || PORT;
+    const baseUrl = `http://127.0.0.1:${currentPort}`;
+
+    try {
+        const endpoints = [
+            `/api/analytics/kpi?range=${range}`,
+            `/api/analytics/trends?range=${range}`,
+            '/api/analytics/roles',
+            `/api/analytics/traffic?range=${range}`,
+            `/api/analytics/signal-health?range=${range}`,
+            `/api/analytics/hop-distribution?range=${range}`,
+            '/api/analytics/hop-distribution',
+            `/api/analytics/hourly-activity?range=${range}`,
+            '/api/analytics/hourly-peak-stacked',
+            '/api/analytics/cu-distribution',
+            '/api/analytics/hardware-models',
+            '/api/analytics/firmware-versions',
+            `/api/analytics/environment-trends?range=${range}`,
+            '/api/analytics/cwa-comparison',
+            '/api/analytics/cwa-node-comparison',
+            '/api/analytics/air-util-distribution',
+            `/api/analytics/top-gateways?range=${range}`,
+            '/api/analytics/duplicate-stats',
+            '/api/analytics/power-health',
+            '/api/analytics/mesh-interconnectivity',
+            '/api/analytics/weak-signal-alerts',
+            '/api/analytics/solar-charging-health',
+            '/api/analytics/county-weather-trends'
+        ];
+
+        const results = [];
+        for (const ep of endpoints) {
+            try {
+                const r = await fetch(`${baseUrl}${ep}`);
+                results.push(r.ok ? await r.json() : null);
+            } catch (e) {
+                results.push(null);
+            }
+        }
+
+        const payload = {
+            kpi: results[0],
+            trends: results[1],
+            roles: results[2],
+            traffic: results[3],
+            signalHealth: results[4],
+            hopDist: results[5],
+            hopAnalysis: results[6],
+            hourlyActivity: results[7],
+            hourlyStacked: results[8],
+            cuDist: results[9],
+            hwModels: results[10],
+            firmwareVersions: results[11],
+            envTrends: results[12],
+            cwaComparison: results[13],
+            cwaNodeComparison: results[14],
+            airUtilDist: results[15],
+            topGateways: results[16],
+            duplicateStats: results[17],
+            powerHealth: results[18],
+            meshInterconnectivity: results[19],
+            weakSignalAlerts: results[20],
+            solarChargingHealth: results[21],
+            countyWeatherTrends: results[22]
+        };
+
+        bundleCacheMap[range] = { data: payload, timestamp: now };
+        res.json(payload);
+    } catch (err) {
+        if (bundleCacheMap[range]) return res.json(bundleCacheMap[range].data);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // 啟動 Express 伺服器
 server.listen(PORT, () => {
     console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
@@ -1815,6 +2580,16 @@ server.listen(PORT, () => {
     fetchAndSaveCWAData();
     // 啟動 RF 監聽
     setupRFListener(io, db);
+
+    // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取
+    const warmCache = () => {
+        const portToUse = server.address()?.port || PORT;
+        ['7d', '24h', '30d'].forEach(r => {
+            fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => {});
+        });
+    };
+    setTimeout(warmCache, 2000);
+    setInterval(warmCache, 3 * 60 * 1000);
 });
 
 

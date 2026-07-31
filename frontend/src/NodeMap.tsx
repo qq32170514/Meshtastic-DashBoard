@@ -5,6 +5,21 @@ import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
 
+// Traceroute 多路徑型別
+export interface TracerouteHop {
+  nodeId: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  snr: number | null;
+}
+export interface TraceroutePath {
+  id: string;
+  timestamp: string;
+  hops: TracerouteHop[];
+  totalHops: number;
+}
+
 // 修正 Leaflet 預設圖示路徑問題
 import markerIcon from 'leaflet/dist/images/marker-icon.png';
 import markerShadow from 'leaflet/dist/images/marker-shadow.png';
@@ -102,6 +117,7 @@ interface NodeMapProps {
   showSimulator?: boolean;
   showLogicGraph?: boolean;
   fusionEdges?: any[];
+  traceroutePaths?: TraceroutePath[];
   isMapFullScreen?: boolean;
   mapCenter?: [number, number];
 }
@@ -117,7 +133,7 @@ const getHopColor = (hops: number) => {
   return "#ef4444";             // 5+ 跳: 紅色
 };
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const [mapColorMode, setMapColorMode] = useState<'role' | 'cu'>('role');
   const [selectedGwId, setSelectedGwId] = useState<string | null>(null);
@@ -167,9 +183,16 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
   const MapInvalidator = () => {
     const map = useMap();
     useEffect(() => {
-      setTimeout(() => {
-        map.invalidateSize();
+      const timer = setTimeout(() => {
+        try {
+          if (map && map.getContainer()) {
+            map.invalidateSize();
+          }
+        } catch (e) {
+          // ignore map invalidated after unmount
+        }
       }, 100);
+      return () => clearTimeout(timer);
     }, [activeTab, isMapFullScreen, map]);
     return null;
   };
@@ -224,7 +247,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                     🚀 網格跳轉監控 (Hop Trace)<br />
                     <span className="text-indigo-600">最新跳數: {grid.latest_hops ?? 0} Hops</span><br />
                     <span className="text-blue-500">歷史最優: {grid.min_hops} Hops</span><br />
-                    <span className="text-slate-400">最後更新: {grid.latest_time ? new Date(grid.latest_time.replace(' ', 'T') + 'Z').toLocaleString() : '--'}</span><br />
+                    <span className="text-slate-400">最後更新: {grid.latest_time && typeof grid.latest_time === 'string' ? new Date(grid.latest_time.includes(' ') ? grid.latest_time.replace(' ', 'T') + 'Z' : grid.latest_time).toLocaleString() : '--'}</span><br />
                     <span className="text-slate-400">總計封包: {grid.packet_count} pkts</span>
                   </div>
                 </Tooltip>
@@ -247,7 +270,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                   <div className="text-[11px] font-black p-1">
                     📡 區域訊號覆蓋 (Coverage)<br />
                     <span className="text-cyan-600">封包密度: {grid.packet_count} pkts</span><br />
-                    <span className="text-slate-500">最新收到: {grid.latest_time ? new Date(grid.latest_time.replace(' ', 'T') + 'Z').toLocaleString() : '--'}</span><br />
+                    <span className="text-slate-500">最新收到: {grid.latest_time && typeof grid.latest_time === 'string' ? new Date(grid.latest_time.includes(' ') ? grid.latest_time.replace(' ', 'T') + 'Z' : grid.latest_time).toLocaleString() : '--'}</span><br />
                     <span className="text-slate-500">平均 SNR: {grid.avg_snr?.toFixed(2)} dB</span>
                   </div>
                 </Tooltip>
@@ -257,8 +280,78 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           return null;
         })}
 
-        {/* 2. 繪製最新 Traceroute 路徑 */}
-        {showTraceroute && traceroutePath.length >= 2 && (
+        {/* 2. 🛰️ 繪製多條 Traceroute 路徑（含每跳 SNR，以新舊著色） */}
+        {showTraceroute && traceroutePaths.length > 0 && traceroutePaths.map((path) => {
+          // 依封包時間計算年齡，決定顏色與透明度
+          const ageMs = Date.now() - new Date(path.timestamp.replace(' ', 'T') + 'Z').getTime();
+          const ageMin = ageMs / 60000;
+          let pathColor = '#06b6d4';   // < 15 min: 亮青
+          let pathOpacity = 0.92;
+          if (ageMin > 60) { pathColor = '#6366f1'; pathOpacity = 0.55; } // > 1h: 靛藍
+          else if (ageMin > 15) { pathColor = '#3b82f6'; pathOpacity = 0.75; } // 15-60min: 藍
+
+          const getSnrColor = (snr: number | null) => {
+            if (snr === null) return '#94a3b8';
+            if (snr > 5) return '#22c55e';
+            if (snr > -5) return '#eab308';
+            if (snr > -10) return '#f97316';
+            return '#ef4444';
+          };
+
+          const validHops = path.hops.filter(h => h.latitude && h.longitude);
+          if (validHops.length < 2) return null;
+
+          return (
+            <React.Fragment key={path.id}>
+              {/* 路徑連線 */}
+              <Polyline
+                positions={validHops.map(h => [h.latitude, h.longitude]) as any}
+                pathOptions={{ color: pathColor, weight: 3, dashArray: '8, 6', opacity: pathOpacity }}
+              />
+              {/* 每跳節點標記 */}
+              {validHops.map((hop, hIdx) => {
+                const isSource = hIdx === 0;
+                const isGateway = hIdx === validHops.length - 1;
+                const snrColor = getSnrColor(hop.snr);
+                return (
+                  <CircleMarker
+                    key={`${path.id}-h${hIdx}`}
+                    center={[hop.latitude, hop.longitude]}
+                    radius={isSource || isGateway ? 7 : 5}
+                    pathOptions={{
+                      fillColor: isSource ? '#f59e0b' : isGateway ? '#10b981' : snrColor,
+                      color: 'white',
+                      weight: 2,
+                      fillOpacity: 0.92
+                    }}
+                  >
+                    <Tooltip sticky>
+                      <div className="text-[11px] font-mono p-1 leading-relaxed">
+                        {isSource && <span className="text-amber-600 font-black">🚀 發送源點</span>}
+                        {isGateway && <span className="text-emerald-600 font-black">📡 接收閘道</span>}
+                        {!isSource && !isGateway && <span className="text-blue-500 font-black">🔀 中繼節點 #{hIdx}</span>}
+                        <br />
+                        <span className="text-slate-700">{hop.name}</span><br />
+                        {hop.snr !== null && (
+                          <span style={{ color: snrColor }} className="font-bold">
+                            入站 SNR: {hop.snr} dB
+                          </span>
+                        )}
+                        {hop.snr === null && <span className="text-slate-400">SNR: 起點無入站</span>}
+                        <br />
+                        <span className="text-slate-400 text-[10px]">
+                          {new Date(path.timestamp.replace(' ', 'T') + 'Z').toLocaleString()}
+                        </span>
+                      </div>
+                    </Tooltip>
+                  </CircleMarker>
+                );
+              })}
+            </React.Fragment>
+          );
+        })}
+        {/* Fallback: 無多路徑資料時顯示單筆最新路徑 */}
+        {showTraceroute && traceroutePaths.length === 0 && traceroutePath.length >= 2 && (
           <React.Fragment>
             <Polyline
               positions={traceroutePath.map(n => [n.latitude, n.longitude]) as any}

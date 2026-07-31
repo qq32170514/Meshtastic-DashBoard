@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
-import NodeMap from './NodeMap';
+import NodeMap, { TraceroutePath } from './NodeMap';
 import TelemetryCharts from './TelemetryCharts';
 import PacketTypePieChart from './PacketTypePieChart';
 import TopologyGraph from './TopologyGraph';
@@ -182,20 +182,31 @@ const PORTNUM_NAMES: Record<string | number, string> = {
 };
 const ITEMS_PER_PAGE = 20;
 
-const ANNOUNCEMENT_TITLE = "📢 v2.2 版本更新公告";
-const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.2！
+const ANNOUNCEMENT_TITLE = "📢 v2.3 重大版本更新公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.3！
 
 本次重大更新包含：
-1. 節點詳情圖表時間跨度選擇（可切換 1天、7天、30天）。
-2. 地圖監控新增最愛節點群組下拉選單與快速篩選。
-3. 修復網頁重新整理（F5）後最愛節點及溫濕度卡片未更新至最新封包資訊的問題。
-4. 地圖新增自定義高度與全螢幕模式，並支援搜尋地圖節點。
-5. 訊號覆蓋範圍及跳轉分析新增日期時間範圍篩選功能。
-6. 節點詳情地圖新增歷史軌跡，並動態繪製與 gateway 的連線。
-7. 封包詳情與節點封包列表新增接收閘道器地圖標示與完整日期時間戳記。
-8. 地圖節點改為滑鼠懸停即顯示簡易資訊卡（含角色、ID、最後活躍、SNR），點擊則進入節點詳情。
-9. 地圖過於靠近的節點自動群組化（Cluster），點擊可展開選擇個別節點，解決重疊點不到的問題。
-10. 設備綜合電力監測圖表的電壓縱軸，改為依實際數據動態調整並加上緩衝範圍，避免毫伏微小波動讓圖表上下劇烈震盪。
+1. 📊 全網分析 (NOC Operations Center) — 全新宏觀戰情儀表板：
+   - 頂部戰情 KPI：即時統計全網封包總量、24h 活躍節點、線上 Gateway 數與傳播比例。
+   - 每日流量與活躍趨勢：展示 7天/30天 網路成長曲線與每日活躍節點折線圖。
+   - 跳數分佈與覆蓋分析 (Hop Distribution)：圓餅圖與直方圖分析 0 Hop (直連) 至 3+ Hops 的傳輸佔比。
+   - 24小時尖峰時段熱力：統計一天 24 小時全網廣播、文字訊息與遙測封包的高峰時段。
+   - 頻道利用率 (CU) & 空口佔用 (AirUtilTX)：離散分析全網節點頻道壅塞度與發射時間佔用率。
+   - 硬體與韌體排行榜：統計台灣全網熱門開發板 (Heltec, RAK, T-Beam...) 與韌體版本分佈。
+   - 太陽能與電力健康監測：自動追蹤電池電量與充電狀況，第一時間抓出低電量或供電異常節點。
+   - CWA 官方氣象對比：結合全台近 900 個中央氣象署觀測站數據，對比 Mesh 遙測溫濕度與官方觀測差異。
+   - 0ms 秒開快取：優化數據打包與背景預熱機制，點擊「全網分析」頁籤達成極速秒開體驗。
+2. 🔗 地理邏輯拓撲網路圖 (Logic Topology Graph) 重大修正：
+   - 精確過濾 0xFFFFFFFF (發送者自身) 佔位符，徹底消除幽靈連線。
+   - 正確解碼 snr_towards 訊號強度，並在地圖提示框中標示每跳 SNR 品質。
+   - 採用無向邊正準化去重，完美支援直連連線與過濾展示。
+3. ⚡ 後端與前端效能全面優化：
+   - 後端啟用 WAL 模式、32MB 快取、MMAP，並建立巨量資料表 (150萬+ 封包) 複合索引。
+   - WebSocket 100ms 批次推播 (Batch Emission)，高流量高峰期有效降低 React 重繪負擔。
+   - 前端引入 nodeMap (Map 結構) 替代傳統 O(n) 的 .find() 查找，極速渲染熱點資料。
+4. 🎨 介面與穩定性修復：
+   - 統一頂部頁籤為整齊俐落的四字標題（全網分析、最愛節點、節點清單、節點詳情、地圖監控、封包觀察、閘道監控、頻道對話）。
+   - 修復當節點 Role 為數字型態時導致前端崩潰白畫面的例外錯誤。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
@@ -416,6 +427,7 @@ function App() {
   const [showTrackerHistory, setShowTrackerHistory] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
   const [fusionEdges, setFusionEdges] = useState<any[]>([]);
+  const [traceroutePaths, setTraceroutePaths] = useState<TraceroutePath[]>([]);
   const [mapFavoriteGroup, setMapFavoriteGroup] = useState<string>('all');
   const [isMapFullScreen, setIsMapFullScreen] = useState(false);
   const [mapSearchText, setMapSearchText] = useState('');
@@ -490,8 +502,10 @@ function App() {
   }, [nodes]);
 
   // 🚀 效能優化：日期格式化 helper（避免在 map 中重複渰譜）
-  const formatTimestamp = useCallback((ts: string) => {
-    const dateStr = ts.includes(' ') ? ts.replace(' ', 'T') + 'Z' : ts;
+  const formatTimestamp = useCallback((ts: any) => {
+    if (!ts) return '';
+    const str = String(ts);
+    const dateStr = str.includes(' ') ? str.replace(' ', 'T') + 'Z' : str;
     return new Date(dateStr).toLocaleString();
   }, []);
 
@@ -510,16 +524,22 @@ function App() {
 
   // 將 favConfig 派生成 favoriteIdSet（向下相容，全區用）
   const favoriteIdSet = useMemo<Set<string>>(() => {
-    const all = new Set<string>(favConfig.ungrouped);
-    favConfig.groups.forEach(g => g.nodeIds.forEach(id => all.add(id)));
+    const all = new Set<string>(favConfig?.ungrouped || []);
+    if (Array.isArray(favConfig?.groups)) {
+      favConfig.groups.forEach(g => {
+        if (Array.isArray(g?.nodeIds)) {
+          g.nodeIds.forEach(id => all.add(id));
+        }
+      });
+    }
     return all;
   }, [favConfig]);
 
   // 將 favConfig 派生成當前分頁展示的節點列表
   const currentGroupNodeIds = useMemo<Set<string>>(() => {
     if (activeFavGroupId === 'all') return favoriteIdSet;
-    if (activeFavGroupId === 'ungrouped') return new Set(favConfig.ungrouped);
-    const g = favConfig.groups.find(g => g.id === activeFavGroupId);
+    if (activeFavGroupId === 'ungrouped') return new Set(favConfig?.ungrouped || []);
+    const g = Array.isArray(favConfig?.groups) ? favConfig.groups.find(g => g.id === activeFavGroupId) : null;
     return new Set(g?.nodeIds || []);
   }, [activeFavGroupId, favConfig, favoriteIdSet]);
 
@@ -535,32 +555,36 @@ function App() {
   const toggleFavorite = useCallback((nodeId: string) => {
     saveFav(prev => {
       const isCurrentlyFav = favoriteIdSet.has(nodeId);
+      const groups = Array.isArray(prev?.groups) ? prev.groups : [];
+      const ungrouped = Array.isArray(prev?.ungrouped) ? prev.ungrouped : [];
       if (isCurrentlyFav) {
         // 移除：從 ungrouped 和所有群組移除
         return {
           ...prev,
-          ungrouped: prev.ungrouped.filter(id => id !== nodeId),
-          groups: prev.groups.map(g => ({ ...g, nodeIds: g.nodeIds.filter(id => id !== nodeId) }))
+          ungrouped: ungrouped.filter(id => id !== nodeId),
+          groups: groups.map(g => ({ ...g, nodeIds: (Array.isArray(g.nodeIds) ? g.nodeIds : []).filter(id => id !== nodeId) }))
         };
       } else {
         // 加入：放到 ungrouped
-        return { ...prev, ungrouped: [...prev.ungrouped, nodeId] };
+        return { ...prev, ungrouped: [...ungrouped, nodeId] };
       }
     });
   }, [favoriteIdSet, saveFav]);
 
   const assignNodeToGroup = useCallback((nodeId: string, groupId: 'ungrouped' | string) => {
     saveFav(prev => {
+      const groups = Array.isArray(prev?.groups) ? prev.groups : [];
+      const ungrouped = Array.isArray(prev?.ungrouped) ? prev.ungrouped : [];
       // 先從所有組和 ungrouped 移除
-      const cleanGroups = prev.groups.map(g => ({ ...g, nodeIds: g.nodeIds.filter(id => id !== nodeId) }));
-      const cleanUngrouped = prev.ungrouped.filter(id => id !== nodeId);
+      const cleanGroups = groups.map(g => ({ ...g, nodeIds: (Array.isArray(g.nodeIds) ? g.nodeIds : []).filter(id => id !== nodeId) }));
+      const cleanUngrouped = ungrouped.filter(id => id !== nodeId);
       if (groupId === 'ungrouped') {
         return { ...prev, groups: cleanGroups, ungrouped: [...cleanUngrouped, nodeId] };
       }
       return {
         ...prev,
         ungrouped: cleanUngrouped,
-        groups: cleanGroups.map(g => g.id === groupId ? { ...g, nodeIds: [...g.nodeIds, nodeId] } : g)
+        groups: cleanGroups.map(g => g.id === groupId ? { ...g, nodeIds: [...(Array.isArray(g.nodeIds) ? g.nodeIds : []), nodeId] } : g)
       };
     });
     setGroupDropdownNodeId(null);
@@ -569,17 +593,19 @@ function App() {
   const addGroup = useCallback((name: string, color: string) => {
     if (!name.trim()) return;
     const id = `grp_${Date.now()}`;
-    saveFav(prev => ({ ...prev, groups: [...prev.groups, { id, name: name.trim(), color, nodeIds: [] }] }));
+    saveFav(prev => ({ ...prev, groups: [...(Array.isArray(prev?.groups) ? prev.groups : []), { id, name: name.trim(), color, nodeIds: [] }] }));
     setNewGroupName('');
   }, [saveFav]);
 
   const deleteGroup = useCallback((groupId: string) => {
     saveFav(prev => {
-      const g = prev.groups.find(g => g.id === groupId);
+      const groups = Array.isArray(prev?.groups) ? prev.groups : [];
+      const ungrouped = Array.isArray(prev?.ungrouped) ? prev.ungrouped : [];
+      const g = groups.find(g => g.id === groupId);
       return {
         ...prev,
-        groups: prev.groups.filter(g => g.id !== groupId),
-        ungrouped: [...prev.ungrouped, ...(g?.nodeIds || [])]
+        groups: groups.filter(g => g.id !== groupId),
+        ungrouped: [...ungrouped, ...(g?.nodeIds || [])]
       };
     });
     if (activeFavGroupId === groupId) setActiveFavGroupId('all');
@@ -589,14 +615,15 @@ function App() {
     if (!newName.trim()) return;
     saveFav(prev => ({
       ...prev,
-      groups: prev.groups.map(g => g.id === groupId ? { ...g, name: newName.trim() } : g)
+      groups: (Array.isArray(prev?.groups) ? prev.groups : []).map(g => g.id === groupId ? { ...g, name: newName.trim() } : g)
     }));
     setEditingGroupId(null);
   }, [saveFav]);
 
   // 匹出指定節點屬於哪個群組
   const getNodeGroupId = useCallback((nodeId: string): 'ungrouped' | string => {
-    const g = favConfig.groups.find(g => g.nodeIds.includes(nodeId));
+    if (!favConfig || !Array.isArray(favConfig.groups)) return 'ungrouped';
+    const g = favConfig.groups.find(g => Array.isArray(g?.nodeIds) && g.nodeIds.includes(nodeId));
     return g ? g.id : 'ungrouped';
   }, [favConfig]);
 
@@ -869,7 +896,7 @@ function App() {
       // Ensure SQLite UTC timestamps are parsed correctly in local timezone by appending 'Z'
       const formattedNodes = data.map((n: any) => ({
         ...n,
-        last_seen: n.last_seen && n.last_seen.includes(' ') && !n.last_seen.endsWith('Z') 
+        last_seen: n.last_seen && typeof n.last_seen === 'string' && n.last_seen.includes(' ') && !n.last_seen.endsWith('Z') 
           ? n.last_seen.replace(' ', 'T') + 'Z' 
           : n.last_seen
       }));
@@ -947,7 +974,8 @@ function App() {
         portnum: p.portnum,
         topic: p.topic,
         time: (() => {
-          const dateStr = p.timestamp.includes(' ') ? p.timestamp.replace(' ', 'T') + 'Z' : p.timestamp;
+          const rawTs = p.timestamp ? String(p.timestamp) : '';
+          const dateStr = rawTs.includes(' ') ? rawTs.replace(' ', 'T') + 'Z' : rawTs;
           const d = new Date(dateStr);
           const datePart = `${d.getFullYear()}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getDate().toString().padStart(2, '0')}`;
           const timePart = d.toLocaleTimeString('zh-TW', { hour12: false });
@@ -1119,7 +1147,7 @@ function App() {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs">
               {Object.entries(metrics).map(([key, val]: [string, any]) => (
                 <div key={key} className="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-1">
-                  <span className="text-slate-400 font-medium uppercase tracking-tighter text-[9px]">{key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ')}</span>
+                  <span className="text-slate-400 font-medium uppercase tracking-tighter text-[9px]">{String(key).replace(/([A-Z])/g, ' $1').replace(/_/g, ' ')}</span>
                   <span className={`font-mono font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
                     {typeof val === 'number' ? (val % 1 === 0 ? val : val.toFixed(2)) : String(val)}
                   </span>
@@ -1478,15 +1506,22 @@ function App() {
     // 抓取網格化聚合數據
     fetchCoverageGridData(coverageStartTime, coverageEndTime);
 
-    // 抓取 Traceroute 數據
+    // 抓取 Traceroute 數據（多路徑版）
+    const fetchTraceroutePaths = () => fetch('/api/traceroute/paths')
+      .then(res => res.json())
+      .then(data => setTraceroutePaths(Array.isArray(data) ? data : []))
+      .catch(() => {});
+    // 同時保留 latest 以作 fallback
     const fetchTraceroute = () => fetch('/api/traceroute/latest').then(res => res.json()).then(setTraceroutePath);
+    fetchTraceroutePaths();
     fetchTraceroute();
 
     const sysInterval = setInterval(refreshDashboardData, 30000);
     const coverageInterval = setInterval(() => {
       fetchCoverageGridData(coverageStartTime, coverageEndTime);
     }, 120000); // 每 2 分鐘更新一次地圖背景點位
-    const tracerouteInterval = setInterval(fetchTraceroute, 60000); // 每分鐘更新最新路徑
+    const tracerouteInterval = setInterval(fetchTraceroute, 60000);
+    const traceroutePathsInterval = setInterval(fetchTraceroutePaths, 30000); // 每 30 秒更新多路徑
 
     return () => {
       socket.off('mqtt_status');
@@ -1496,6 +1531,7 @@ function App() {
       clearInterval(sysInterval);
       clearInterval(coverageInterval);
       clearInterval(tracerouteInterval);
+      clearInterval(traceroutePathsInterval);
     };
   }, [fetchGlobalPackets, fetchFavoritePackets, loadNetworkStats, refreshDashboardData, globalPacketsCurrentPage, globalFilter, favPacketsCurrentPage, favLogFilter]);
 
@@ -1649,7 +1685,7 @@ function App() {
             onClick={() => setActiveTab('analytics')}
             className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'analytics' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
           >
-            <BarChart3 size={16} /> 全網戰情分析
+            <BarChart3 size={16} /> 全網分析
           </button>
           <button
             onClick={() => setActiveTab('favorites')}
@@ -1814,16 +1850,24 @@ function App() {
                           <td className="px-6 py-4 font-mono font-bold text-cyan-600 text-xs">
                             {node.node_id}
                           </td>
-                          <td className="px-6 py-4">
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${node.role?.includes('ROUTER') ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' :
-                              node.role?.includes('BASE') ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
-                                node.role?.includes('REPEATER') ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
-                                  node.role?.includes('TRACKER') ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
-                                    darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'
-                              }`}>
-                              {node.role?.replace('_', ' ') || 'CLIENT'}
-                            </span>
-                          </td>
+                            {(() => {
+                              const roleStr = String(node.role || '');
+                              const isRouter = roleStr.includes('ROUTER');
+                              const isBase = roleStr.includes('BASE');
+                              const isRepeater = roleStr.includes('REPEATER');
+                              const isTracker = roleStr.includes('TRACKER');
+                              return (
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                  isRouter ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' :
+                                  isBase ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
+                                  isRepeater ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
+                                  isTracker ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
+                                  darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'
+                                }`}>
+                                  {typeof node.role === 'string' ? node.role.replace('_', ' ') : String(node.role || 'CLIENT')}
+                                </span>
+                              );
+                            })()}
                           <td className="px-6 py-4 text-xs">
                             <div className="flex items-center gap-1.5">
                               <span className={`font-black truncate max-w-[120px] ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{node.long_name || 'Unknown'}</span>
@@ -1832,7 +1876,7 @@ function App() {
                           </td>
                           <td className="px-6 py-4">
                             <span className={`px-2 py-0.5 rounded text-[9px] font-mono border uppercase tracking-tighter ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>
-                              {node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}
+                              {typeof node.hw_model === 'string' ? node.hw_model.replace(/_/g, ' ') : String(node.hw_model || 'UNKNOWN')}
                             </span>
                           </td>
                           <td className="px-6 py-4 text-xs">
@@ -2033,7 +2077,8 @@ function App() {
                               </button>
                               <span className="text-[9px] text-slate-500 font-mono">
                                 {(() => {
-                                  const dateStr = msg.timestamp.includes(' ') ? msg.timestamp.replace(' ', 'T') + 'Z' : msg.timestamp;
+                                  const rawTs = msg.timestamp ? String(msg.timestamp) : '';
+                                  const dateStr = (typeof rawTs === 'string' && rawTs.includes(' ')) ? rawTs.replace(' ', 'T') + 'Z' : rawTs;
                                   return new Date(dateStr).toLocaleString('zh-TW', { hour12: false });
                                 })()}
                               </span>
@@ -2172,7 +2217,7 @@ function App() {
                             <div className="flex items-center gap-2 mb-1">
                               <span className="px-1.5 py-0.5 bg-yellow-500 text-white text-[9px] font-black rounded uppercase tracking-wider shadow-sm">{node.node_id}</span>
                               <span className={`text-[9px] font-mono border rounded px-1.5 py-0.5 uppercase tracking-tighter ${darkMode ? 'bg-slate-950 border-slate-700 text-slate-500' : 'bg-slate-50 border-slate-200 text-slate-400'}`}>
-                                {node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}
+                                {typeof node.hw_model === 'string' ? node.hw_model.replace(/_/g, ' ') : String(node.hw_model || 'UNKNOWN')}
                               </span>
                             </div>
                             <h3 className={`text-lg font-black truncate leading-tight ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{node.long_name || 'Unknown'}</h3>
@@ -2344,7 +2389,7 @@ function App() {
                             <th className="p-3 text-right">詳情</th>
                           </tr>
                         </thead>
-                        <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'} text-xs`}>
+                        <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`} >
                           {favoritePackets.map((p, i) => {
                             const senderNode = nodeMap.get(p.from);
                             const gwNode = nodeMap.get(p.gateway_id!);
@@ -2828,14 +2873,6 @@ function App() {
                       >
                         <MapPin size={12} /> 節點地圖
                       </button>
-                      {/* 暫時隱藏邏輯拓撲圖層開關
-                      <button
-                        onClick={() => setShowLogicGraph(!showLogicGraph)}
-                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showLogicGraph ? 'bg-cyan-500 border-cyan-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
-                      >
-                        <Share2 size={12} /> 邏輯拓撲
-                      </button>
-                      */}
                       <button
                         onClick={() => setShowTraceroute(!showTraceroute)}
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showTraceroute ? 'bg-amber-500 border-amber-400 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
@@ -2854,17 +2891,14 @@ function App() {
                       >
                         <Activity size={12} /> 歷史軌跡
                       </button>
-                      {/* 暫時隱藏 2.2 版不成熟的覆蓋模擬功能
                       <button
-                        onClick={() => setShowSimulator(!showSimulator)}
-                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showSimulator ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                        onClick={() => setShowLogicGraph(!showLogicGraph)}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showLogicGraph ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-500/20' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
                       >
-                        <Signal size={12} /> 覆蓋模擬
+                        <Share2 size={12} /> 拓撲邏輯連線
                       </button>
-                      */}
                     </div>
                     <div className="flex items-center gap-3">
-                      {/* 搜尋節點 */}
                       <div className="relative flex items-center">
                         <Search className="absolute left-2.5 text-slate-500 pointer-events-none" size={12} />
                         <input
@@ -2892,7 +2926,6 @@ function App() {
                           </button>
                         )}
                         
-                        {/* 搜尋結果選單 */}
                         {mapSearchText && (() => {
                           const searchLower = mapSearchText.toLowerCase();
                           const matched = nodes
@@ -2979,7 +3012,6 @@ function App() {
                   </div>
                 </div>
 
-                {/* 覆蓋圖日期篩選 */}
                 {(showTraceroute || showHopGrid) && (
                   <div className={`p-3 rounded-xl border flex flex-wrap items-center gap-3 text-xs mb-3 ${darkMode ? 'bg-slate-900/50 border-slate-800 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
                     <span className="font-black text-[10px] uppercase tracking-wider text-cyan-500 flex items-center gap-1">
@@ -3034,7 +3066,6 @@ function App() {
                     ? 'fixed inset-0 z-[2000] h-screen w-screen rounded-none' 
                     : 'h-[70vh]'
                 } ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
-                  {/* Floating Fullscreen / Minimize Button */}
                   <button
                     onClick={() => setIsMapFullScreen(!isMapFullScreen)}
                     className={`absolute top-4 right-4 z-[1000] p-2.5 rounded-xl shadow-lg border transition-all duration-200 hover:scale-105 ${
@@ -3067,12 +3098,12 @@ function App() {
                     simState={simState}
                     showLogicGraph={showLogicGraph}
                     fusionEdges={fusionEdges}
+                    traceroutePaths={traceroutePaths}
                     isMapFullScreen={isMapFullScreen}
                     mapCenter={mapCenterCoords}
                   />
                 </div>
 
-                {/* 邏輯拓撲圖層 */}
                 {showLogicGraph && (
                   <div className={`mt-6 w-full h-[75vh] rounded-2xl overflow-hidden border shadow-sm relative transition-colors ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
                     <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />

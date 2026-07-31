@@ -92,7 +92,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
 
   const labels = (Array.isArray(history) ? history : []).map(h => {
     const rawTs = h?.timestamp || new Date().toISOString();
-    const dateStr = rawTs.includes(' ') ? rawTs.replace(' ', 'T') + 'Z' : rawTs;
+    const dateStr = typeof rawTs === 'string' && rawTs.includes(' ') ? rawTs.replace(' ', 'T') + 'Z' : String(rawTs);
     const d = new Date(dateStr);
     if (isNaN(d.getTime())) return '--:--';
     if (days > 1) {
@@ -234,7 +234,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
               </div>
               <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
                 <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span>
-                <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
+                <span className="font-bold truncate text-slate-500" title={String(node.hw_model || '')}>{typeof node.hw_model === 'string' ? node.hw_model.replace(/_/g, ' ') : String(node.hw_model || 'UNKNOWN')}</span>
               </div>
               <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
                 <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span>
