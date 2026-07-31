@@ -41,13 +41,15 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     // 抓取歷史數據
     fetch(`/api/telemetry?node_id=${encodeURIComponent(nodeId)}&days=${days}&limit=${limit}`)
       .then(res => res.json())
-      .then(data => setHistory(data.reverse()));
+      .then(data => setHistory(Array.isArray(data) ? data.reverse() : []))
+      .catch(() => setHistory([]));
 
     // 監聽即時更新
     const handleUpdate = (data: any) => {
       if (data.node_id === nodeId) {
         setHistory(prev => {
-          const newHistory = [...prev, { 
+          const safePrev = Array.isArray(prev) ? prev : [];
+          const newHistory = [...safePrev, { 
             ...data, 
             voltage: data.voltage || 0,
             current: data.current || 0,
@@ -63,7 +65,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
 
     socket.on('telemetry_update', handleUpdate);
     return () => socket.off('telemetry_update', handleUpdate);
-  }, [nodeId, socket, days]);
+  }, [nodeId, days, socket]);
 
   const commonOptions = {
     responsive: true,
@@ -72,7 +74,8 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
       legend: { 
         position: 'top' as const,
         labels: { boxWidth: 10, font: { size: 10 } }
-      }
+      },
+      tooltip: { mode: 'index' as const, intersect: false }
     },
     scales: {
       x: { 
@@ -87,9 +90,11 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
     }
   };
 
-  const labels = history.map(h => {
-    const dateStr = h.timestamp.includes(' ') ? h.timestamp.replace(' ', 'T') + 'Z' : h.timestamp;
+  const labels = (Array.isArray(history) ? history : []).map(h => {
+    const rawTs = h?.timestamp || new Date().toISOString();
+    const dateStr = typeof rawTs === 'string' && rawTs.includes(' ') ? rawTs.replace(' ', 'T') + 'Z' : String(rawTs);
     const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return '--:--';
     if (days > 1) {
       return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}`;
     }
@@ -229,7 +234,7 @@ export default function TelemetryCharts({ nodeId, socket, node, darkMode }: { no
               </div>
               <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
                 <span className="text-slate-400 text-[9px] uppercase font-bold">Hardware</span>
-                <span className="font-bold truncate text-slate-500" title={node.hw_model}>{node.hw_model?.replace(/_/g, ' ') || 'UNKNOWN'}</span>
+                <span className="font-bold truncate text-slate-500" title={String(node.hw_model || '')}>{typeof node.hw_model === 'string' ? node.hw_model.replace(/_/g, ' ') : String(node.hw_model || 'UNKNOWN')}</span>
               </div>
               <div className="flex flex-col border-b border-slate-100 dark:border-slate-800 pb-1">
                 <span className="text-slate-400 text-[9px] uppercase font-bold">Firmware</span>
