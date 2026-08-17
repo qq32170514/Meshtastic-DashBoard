@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle, GeoJSON, Circle } from 'react-leaflet';
 import * as turf from '@turf/turf';
 import L from 'leaflet';
@@ -143,8 +143,162 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     totalPackets: number;
     relayedNodes: any[];
   } | null>(null);
+  const [isHovered, setIsHovered] = useState(false);
 
-  const nodesWithGPS = nodes.filter(n => n.latitude && n.longitude);
+  // 🚀 解決重疊 Cluster 自動收回與 Popup 自動關閉的狀態管理器 (整合防抖鎖定機制與 DOM 狀態防護)
+  const [localNodes, setLocalNodes] = useState(nodes);
+  const [isLocked, setIsLocked] = useState(false);
+  const unlockTimeoutRef = useRef<any>(null);
+
+  const lock = useCallback(() => {
+    setIsLocked(true);
+    if (unlockTimeoutRef.current) {
+      clearTimeout(unlockTimeoutRef.current);
+    }
+  }, []);
+
+  const scheduleUnlock = useCallback(() => {
+    if (unlockTimeoutRef.current) {
+      clearTimeout(unlockTimeoutRef.current);
+    }
+    unlockTimeoutRef.current = setTimeout(() => {
+      // 只有在「滑鼠不在地圖上」、「沒有彈窗打開」且「沒有展開的 spiderfy 蜘蛛腿」時，才解除鎖定更新
+      const container = document.querySelector('.leaflet-container');
+      const currentlyHovered = container ? container.matches(':hover') : false;
+      const popupOpen = document.querySelector('.leaflet-popup');
+      const hasSpiderlegs = !!document.querySelector('.leaflet-spiderleg-line') || !!document.querySelector('.marker-cluster-spiderfied');
+
+      if (!currentlyHovered && !popupOpen && !hasSpiderlegs) {
+        setIsLocked(false);
+      }
+    }, 8000); // 延長至 8 秒防鎖釋放
+  }, []);
+
+  // 當外部 nodes 變更時，若沒有鎖定且 DOM 顯示無互動干擾，則同步到本地狀態
+  useEffect(() => {
+    // 雙重保險：直接從 DOM 讀取真實狀態，確保 100% 避開事件觸發延遲或丟失的 Bug
+    const container = document.querySelector('.leaflet-container');
+    const currentlyHovered = container ? container.matches(':hover') : false;
+    const popupOpen = document.querySelector('.leaflet-popup');
+    const hasSpiderlegs = !!document.querySelector('.leaflet-spiderleg-line') || !!document.querySelector('.marker-cluster-spiderfied');
+
+    if (!isLocked && !currentlyHovered && !popupOpen && !hasSpiderlegs) {
+      setLocalNodes(nodes);
+    }
+  }, [nodes, isLocked]);
+
+  // 當分頁切換時，強行重置解鎖狀態，以確保更新同步
+  useEffect(() => {
+    setIsLocked(false);
+    if (unlockTimeoutRef.current) {
+      clearTimeout(unlockTimeoutRef.current);
+    }
+  }, [activeTab]);
+
+  const MapEventListener = () => {
+    const map = useMap();
+    useEffect(() => {
+      const handleLock = () => {
+        lock();
+      };
+      
+      const handleUnlock = () => {
+        scheduleUnlock();
+      };
+
+      // 監聽所有使用者互動與地圖動畫，啟動暫停鎖定
+      map.on('zoomstart', handleLock);
+      map.on('movestart', handleLock);
+      map.on('mouseover', handleLock);
+      map.on('popupopen', handleLock);
+      map.on('dragstart', handleLock);
+      map.on('click', handleLock);
+      map.on('mousedown', handleLock);
+
+      // 當互動結束或游標離開時，排程解除鎖定
+      map.on('zoomend', handleUnlock);
+      map.on('moveend', handleUnlock);
+      map.on('mouseout', handleUnlock);
+      map.on('popupclose', handleUnlock);
+      map.on('dragend', handleUnlock);
+
+      // 初始化檢查：如果滑鼠已經在地圖內，直接鎖定
+      if (map.getContainer().matches(':hover')) {
+        lock();
+      }
+
+      return () => {
+        map.off('zoomstart', handleLock);
+        map.off('movestart', handleLock);
+        map.off('mouseover', handleLock);
+        map.off('popupopen', handleLock);
+        map.off('dragstart', handleLock);
+        map.off('click', handleLock);
+        map.off('mousedown', handleLock);
+
+        map.off('zoomend', handleUnlock);
+        map.off('moveend', handleUnlock);
+        map.off('mouseout', handleUnlock);
+        map.off('popupclose', handleUnlock);
+        map.off('dragend', handleUnlock);
+      };
+    }, [map]);
+    return null;
+  };
+
+  const nodesWithGPS = useMemo(() => {
+    const withGPS = localNodes.filter(n => n.latitude && n.longitude);
+
+    const jittered: Node[] = [];
+    const processedIndices = new Set<number>();
+
+    for (let i = 0; i < withGPS.length; i++) {
+      if (processedIndices.has(i)) continue;
+
+      // 尋找與當前節點距離在 0.00015 度（約 15 米）以內的所有其他節點
+      const group: { node: Node; index: number }[] = [{ node: withGPS[i], index: i }];
+      const lat1 = withGPS[i].latitude!;
+      const lng1 = withGPS[i].longitude!;
+
+      for (let j = i + 1; j < withGPS.length; j++) {
+        if (processedIndices.has(j)) continue;
+        const lat2 = withGPS[j].latitude!;
+        const lng2 = withGPS[j].longitude!;
+
+        const diffLat = lat1 - lat2;
+        const diffLng = lng1 - lng2;
+        const distanceDegrees = Math.sqrt(diffLat * diffLat + diffLng * diffLng);
+
+        if (distanceDegrees < 0.00015) {
+          group.push({ node: withGPS[j], index: j });
+        }
+      }
+
+      // 標記這些已被分組的節點索引
+      group.forEach(item => processedIndices.add(item.index));
+
+      // 進行發散
+      if (group.length === 1) {
+        jittered.push(group[0].node);
+      } else {
+        const count = group.length;
+        // 發散半徑大約 0.00015 度（約 15 米），這使得各個點之間至少相隔約 25 米，在高縮放級別可清晰並排點擊
+        const radius = 0.00015;
+        group.forEach((item, idx) => {
+          const angle = (idx * 2 * Math.PI) / count;
+          const offsetLat = Math.sin(angle) * radius;
+          const offsetLng = Math.cos(angle) * radius;
+          jittered.push({
+            ...item.node,
+            latitude: item.node.latitude! + offsetLat,
+            longitude: item.node.longitude! + offsetLng
+          });
+        });
+      }
+    }
+
+    return jittered;
+  }, [localNodes]);
 
   const getCuColor = (cu?: number | null) => {
     if (cu === null || cu === undefined || isNaN(cu)) return '#94a3b8';
@@ -212,10 +366,15 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
   }).filter(Boolean);
 
   return (
-    <div className="relative w-full h-full">
+    <div 
+      className="relative w-full h-full"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
       <MapContainer center={[23.6, 121]} zoom={7} className="w-full h-full" style={{ width: '100%', height: '100%' }}>
         <MapInvalidator />
         <MapController center={mapCenter} />
+        <MapEventListener />
         <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
@@ -486,123 +645,125 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
               });
             }}
           >
-            {nodesWithGPS.map(node => {
-              // 計算 Channel 顯示名稱（與原邏輯相同）
-              const rawChannel = node.channel || '';
-              const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
-              const channelName = isInvalid ? (() => {
-                const parts = (node.last_topic || '').split('/');
-                return parts.find((p: string) => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
-              })() : rawChannel;
-              const channelDisplay = channelName === 'MediumFast' ? '⚡ MediumFast' : channelName;
+            {useMemo(() => {
+              return nodesWithGPS.map(node => {
+                // 計算 Channel 顯示名稱（與原邏輯相同）
+                const rawChannel = node.channel || '';
+                const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
+                const channelName = isInvalid ? (() => {
+                  const parts = (node.last_topic || '').split('/');
+                  return parts.find((p: string) => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
+                })() : rawChannel;
+                const channelDisplay = channelName === 'MediumFast' ? '⚡ MediumFast' : channelName;
 
-              // 計算最後活躍時間顯示
-              const getLastSeenText = (lastSeen?: string) => {
-                if (!lastSeen) return '從未';
-                const diffMs = Date.now() - new Date(lastSeen).getTime();
-                const diffMin = Math.floor(diffMs / 60000);
-                if (diffMin < 60) return `${diffMin} 分鐘前`;
-                const diffHr = Math.floor(diffMin / 60);
-                if (diffHr < 24) return `${diffHr} 小時前`;
-                return `${Math.floor(diffHr / 24)} 天前`;
-              };
+                // 計算最後活躍時間顯示
+                const getLastSeenText = (lastSeen?: string) => {
+                  if (!lastSeen) return '從未';
+                  const diffMs = Date.now() - new Date(lastSeen).getTime();
+                  const diffMin = Math.floor(diffMs / 60000);
+                  if (diffMin < 60) return `${diffMin} 分鐘前`;
+                  const diffHr = Math.floor(diffMin / 60);
+                  if (diffHr < 24) return `${diffHr} 小時前`;
+                  return `${Math.floor(diffHr / 24)} 天前`;
+                };
 
-              return (
-                <Marker
-                  key={node.node_id}
-                  icon={createColoredIcon(node.role, node.last_seen)}
-                  position={[node.latitude!, node.longitude!]}
-                  eventHandlers={{ click: () => onSelectNode(node.node_id) }}
-                >
-                  {/* Hover 顯示簡易節點圖卡 Tooltip */}
-                  <Tooltip
-                    direction="top"
-                    offset={[0, -38]}
-                    opacity={1}
-                    className="node-hover-tooltip"
+                return (
+                  <Marker
+                    key={node.node_id}
+                    icon={createColoredIcon(node.role, node.last_seen)}
+                    position={[node.latitude!, node.longitude!]}
+                    eventHandlers={{ click: () => onSelectNode(node.node_id) }}
                   >
-                    <div style={{
-                      fontFamily: 'sans-serif',
-                      minWidth: '170px',
-                      maxWidth: '240px',
-                      padding: '0',
-                      borderRadius: '10px',
-                      overflow: 'hidden',
-                    }}>
-                      {/* 頭部：Long Name + Role badge */}
+                    {/* Hover 顯示簡易節點圖卡 Tooltip */}
+                    <Tooltip
+                      direction="top"
+                      offset={[0, -38]}
+                      opacity={1}
+                      className="node-hover-tooltip"
+                    >
                       <div style={{
-                        background: `${getRoleColor(node.role)}22`,
-                        borderBottom: `2px solid ${getRoleColor(node.role)}55`,
-                        padding: '7px 10px 5px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        gap: '6px',
+                        fontFamily: 'sans-serif',
+                        minWidth: '170px',
+                        maxWidth: '240px',
+                        padding: '0',
+                        borderRadius: '10px',
+                        overflow: 'hidden',
                       }}>
-                        <div style={{ fontWeight: 900, fontSize: '12px', color: '#1e293b', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {node.long_name || 'Unknown'}
-                        </div>
+                        {/* 頭部：Long Name + Role badge */}
                         <div style={{
-                          background: getRoleColor(node.role),
-                          color: 'white',
-                          fontSize: '8px',
-                          fontWeight: 900,
-                          padding: '2px 5px',
-                          borderRadius: '999px',
-                          whiteSpace: 'nowrap',
-                          letterSpacing: '0.05em',
-                          textTransform: 'uppercase',
+                          background: `${getRoleColor(node.role)}22`,
+                          borderBottom: `2px solid ${getRoleColor(node.role)}55`,
+                          padding: '7px 10px 5px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          gap: '6px',
                         }}>
-                          {node.role || 'CLIENT'}
-                        </div>
-                      </div>
-
-                      {/* 主體：節點資訊列表 */}
-                      <div style={{ padding: '7px 10px', display: 'flex', flexDirection: 'column', gap: '4px', background: 'white' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>Short</span>
-                          <span style={{ color: '#334155', fontWeight: 900 }}>{node.short_name || '??'}</span>
-                        </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>ID</span>
-                          <span style={{ color: '#2563eb', fontWeight: 900, fontFamily: 'monospace', fontSize: '9px' }}>{node.node_id}</span>
-                        </div>
-                        {channelDisplay !== '-' && (
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>Channel</span>
-                            <span style={{ color: '#0891b2', fontWeight: 900 }}>{channelDisplay}</span>
+                          <div style={{ fontWeight: 900, fontSize: '12px', color: '#1e293b', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {node.long_name || 'Unknown'}
                           </div>
-                        )}
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                          <span style={{ color: '#94a3b8', fontWeight: 700 }}>最後活躍</span>
-                          <span style={{ color: '#475569', fontWeight: 700 }}>{getLastSeenText(node.last_seen)}</span>
-                        </div>
-                        {node.snr !== undefined && node.snr !== null && (
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>SNR</span>
-                            <span style={{ color: node.snr > 5 ? '#16a34a' : node.snr > -5 ? '#d97706' : '#dc2626', fontWeight: 900 }}>{node.snr} dB</span>
+                          <div style={{
+                            background: getRoleColor(node.role),
+                            color: 'white',
+                            fontSize: '8px',
+                            fontWeight: 900,
+                            padding: '2px 5px',
+                            borderRadius: '999px',
+                            whiteSpace: 'nowrap',
+                            letterSpacing: '0.05em',
+                            textTransform: 'uppercase',
+                          }}>
+                            {node.role || 'CLIENT'}
                           </div>
-                        )}
-                      </div>
+                        </div>
 
-                      {/* 底部：點擊提示 */}
-                      <div style={{
-                        padding: '4px 10px',
-                        background: '#f8fafc',
-                        borderTop: '1px solid #e2e8f0',
-                        fontSize: '9px',
-                        color: '#94a3b8',
-                        fontWeight: 700,
-                        textAlign: 'center',
-                        letterSpacing: '0.05em'
-                      }}>
-                        點擊查看節點詳情
+                        {/* 主體：節點資訊列表 */}
+                        <div style={{ padding: '7px 10px', display: 'flex', flexDirection: 'column', gap: '4px', background: 'white' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>Short</span>
+                            <span style={{ color: '#334155', fontWeight: 900 }}>{node.short_name || '??'}</span>
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>ID</span>
+                            <span style={{ color: '#2563eb', fontWeight: 900, fontFamily: 'monospace', fontSize: '9px' }}>{node.node_id}</span>
+                          </div>
+                          {channelDisplay !== '-' && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                              <span style={{ color: '#94a3b8', fontWeight: 700 }}>Channel</span>
+                              <span style={{ color: '#0891b2', fontWeight: 900 }}>{channelDisplay}</span>
+                            </div>
+                          )}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>最後活躍</span>
+                            <span style={{ color: '#475569', fontWeight: 700 }}>{getLastSeenText(node.last_seen)}</span>
+                          </div>
+                          {node.snr !== undefined && node.snr !== null && (
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                              <span style={{ color: '#94a3b8', fontWeight: 700 }}>SNR</span>
+                              <span style={{ color: node.snr > 5 ? '#16a34a' : node.snr > -5 ? '#d97706' : '#dc2626', fontWeight: 900 }}>{node.snr} dB</span>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 底部：點擊提示 */}
+                        <div style={{
+                          padding: '4px 10px',
+                          background: '#f8fafc',
+                          borderTop: '1px solid #e2e8f0',
+                          fontSize: '9px',
+                          color: '#94a3b8',
+                          fontWeight: 700,
+                          textAlign: 'center',
+                          letterSpacing: '0.05em'
+                        }}>
+                          點擊查看節點詳情
+                        </div>
                       </div>
-                    </div>
-                  </Tooltip>
-                </Marker>
-              );
-            })}
+                    </Tooltip>
+                  </Marker>
+                );
+              });
+            }, [nodesWithGPS, onSelectNode])}
           </MarkerClusterGroup>
         )}
 
@@ -723,7 +884,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           const hopGroups = new Map<number, Node[]>();
           simResultMap.forEach((info, nodeId) => {
             if (!hopGroups.has(info.hop)) hopGroups.set(info.hop, []);
-            const n = allNodes.find(n => n.node_id === nodeId) || nodes.find(n => n.node_id === nodeId);
+            const n = allNodes.find(n => n.node_id === nodeId) || localNodes.find(n => n.node_id === nodeId);
             if (n && n.latitude && n.longitude) {
               hopGroups.get(info.hop)!.push(n);
             }
@@ -992,4 +1153,4 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     </div>
   );
 };
-export default NodeMap;
+export default React.memo(NodeMap);

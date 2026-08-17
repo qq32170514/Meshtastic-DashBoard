@@ -5,6 +5,7 @@ const { createClient } = require('@libsql/client');
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const compression = require('compression');
 const { Server } = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
@@ -19,6 +20,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 const PORT = process.env.PORT || 3000;
 
+app.use(compression());
 app.use(cors());
 app.use(express.json());
 
@@ -28,6 +30,7 @@ app.set('trust proxy', true);
 const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
 
 let isMqttConnected = false; // 紀錄 MQTT 連線狀態
+let mqttClient = null; // 🚀 Expose MQTT client globally
 
 // ==========================================
 // 🚀 WebSocket 批量推播緩衝（減少高峰期 re-render）
@@ -371,19 +374,19 @@ db.serialize(() => {
     });
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)`);
-    
+
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
     // 🚀 效能優化：為 packet_logs 的 timestamp 加上索引，加速 ORDER BY timestamp DESC 的查詢
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_source_timestamp ON packet_logs (source, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
-    
+
     // 🚀 複合索引：大幅提升 NOC 戰情中心 Top Gateways 與重複率查詢速度 (從 5000ms 降至 100ms)
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_rawhex_ts ON packet_logs (raw_hex, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)`);
-    
+
     // 聊天紀錄效能優化
     db.run(`CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)`);
 });
@@ -502,13 +505,25 @@ const buildPacketQuery = (req, baseSql, opts = {}) => {
 app.get('/api/telemetry', (req, res) => {
     const nodeId = req.query.node_id;
     const limit = parseInt(req.query.limit) || 50;
+    const days = parseInt(req.query.days);
 
-    let sql = `SELECT * FROM telemetry_data`;
+    // 🚀 Payload reduction: Select only fields required by the frontend telemetry chart
+    let sql = `SELECT node_id, timestamp, battery_level, voltage, snr, temperature, humidity, channel_utilization, air_util_tx, current, adc_voltage FROM telemetry_data`;
+    let conditions = [];
     let params = [];
 
     if (nodeId) {
-        sql += ` WHERE node_id = ?`;
+        conditions.push(`node_id = ?`);
         params.push(nodeId);
+    }
+
+    if (days && !isNaN(days)) {
+        conditions.push(`timestamp >= datetime('now', '-' || ? || ' days')`);
+        params.push(days);
+    }
+
+    if (conditions.length > 0) {
+        sql += ` WHERE ` + conditions.join(` AND `);
     }
 
     sql += ` ORDER BY timestamp DESC LIMIT ?`;
@@ -522,6 +537,7 @@ app.get('/api/telemetry', (req, res) => {
         res.json(rows);
     });
 });
+
 
 // 取得目前所有已知的節點清單
 app.get('/api/nodes', (req, res) => {
@@ -586,6 +602,100 @@ app.get('/api/packets/count', withCache(), (req, res) => {
     });
 });
 
+// 📱 任務七：取得節點的真實公鑰與機型資訊
+app.get('/api/node/:nodeId/contact-info', (req, res) => {
+    const nodeId = req.params.nodeId;
+    if (!nodeId) {
+        return res.status(400).json({ error: 'Missing nodeId parameter' });
+    }
+
+    const sql = `
+        SELECT payload_json FROM packet_logs 
+        WHERE node_id = ? AND (portnum = 'NODEINFO_APP' OR portnum = '4' OR portnum = 4)
+        ORDER BY timestamp DESC LIMIT 1
+    `;
+
+    db.get(sql, [nodeId], (err, row) => {
+        if (err) {
+            console.error(`❌ API /api/node/${nodeId}/contact-info Error:`, err.message);
+            return res.status(500).json({ error: err.message });
+        }
+
+        if (!row || !row.payload_json) {
+            return res.json({
+                longName: '',
+                shortName: '',
+                hwModel: 0,
+                publicKey: ''
+            });
+        }
+
+        try {
+            const payload = JSON.parse(row.payload_json);
+            const user = payload.user || payload;
+            
+            const longName = user.longName || user.long_name || '';
+            const shortName = user.shortName || user.short_name || '';
+            const rawHwModel = user.hwModel || user.hw_model;
+            const rawPubKey = user.publicKey || user.public_key;
+
+            let hwModelInt = 0;
+            if (rawHwModel) {
+                if (typeof rawHwModel === 'number') {
+                    hwModelInt = rawHwModel;
+                } else if (typeof rawHwModel === 'string') {
+                    const modelUpper = rawHwModel.toUpperCase();
+                    if (modelUpper.includes('TBEAM') || modelUpper.includes('T-BEAM')) {
+                        hwModelInt = 4;
+                    } else if (modelUpper.includes('T_ECHO') || modelUpper.includes('TECHO')) {
+                        hwModelInt = 15;
+                    } else if (modelUpper.includes('HELIOT')) {
+                        hwModelInt = 29;
+                    } else if (modelUpper.includes('NANO_G1')) {
+                        hwModelInt = 35;
+                    } else if (modelUpper.includes('STATION')) {
+                        hwModelInt = 25;
+                    } else if (modelUpper.includes('TRACKER_T1000')) {
+                        hwModelInt = 53;
+                    } else {
+                        hwModelInt = 4;
+                    }
+                }
+            }
+
+            let publicKeyBase64 = '';
+            if (rawPubKey) {
+                if (typeof rawPubKey === 'string') {
+                    publicKeyBase64 = rawPubKey;
+                } else if (rawPubKey.type === 'Buffer' && Array.isArray(rawPubKey.data)) {
+                    publicKeyBase64 = Buffer.from(rawPubKey.data).toString('base64');
+                } else if (rawPubKey.data && Array.isArray(rawPubKey.data)) {
+                    publicKeyBase64 = Buffer.from(rawPubKey.data).toString('base64');
+                } else if (Buffer.isBuffer(rawPubKey)) {
+                    publicKeyBase64 = rawPubKey.toString('base64');
+                } else if (Array.isArray(rawPubKey)) {
+                    publicKeyBase64 = Buffer.from(rawPubKey).toString('base64');
+                }
+            }
+
+            res.json({
+                longName,
+                shortName,
+                hwModel: hwModelInt,
+                publicKey: publicKeyBase64
+            });
+        } catch (parseErr) {
+            console.error('❌ Failed to parse payload_json:', parseErr);
+            res.json({
+                longName: '',
+                shortName: '',
+                hwModel: 0,
+                publicKey: ''
+            });
+        }
+    });
+});
+
 // 🚀 新增：單一封包詳情（懶加載），包含 payload_json 和 raw_hex
 app.get('/api/packets/:id', (req, res) => {
     db.get(`SELECT * FROM packet_logs WHERE id = ?`, [req.params.id], (err, row) => {
@@ -593,7 +703,7 @@ app.get('/api/packets/:id', (req, res) => {
         if (!row) return res.status(404).json({ error: 'Not found' });
         // 如果 payload_json 是字串先解析再回傳
         if (row.payload_json && typeof row.payload_json === 'string') {
-            try { row.payload_json = JSON.parse(row.payload_json); } catch (_) {}
+            try { row.payload_json = JSON.parse(row.payload_json); } catch (_) { }
         }
         res.json(row);
     });
@@ -707,7 +817,7 @@ app.get('/api/chat-analytics/:channel', (req, res) => {
         GROUP BY from_id 
         ORDER BY message_count DESC 
         LIMIT 10`;
-    
+
     // 取得文字內容準備進行文字雲拆解
     const wordsSql = `
         SELECT message 
@@ -717,10 +827,10 @@ app.get('/api/chat-analytics/:channel', (req, res) => {
 
     db.all(talkersSql, [channel], (err, talkers) => {
         if (err) return res.status(500).json({ error: err.message });
-        
+
         db.all(wordsSql, [channel], (err, messages) => {
             if (err) return res.status(500).json({ error: err.message });
-            
+
             // 簡單的空格拆詞法 (適合英數夾雜或有斷詞的中文)
             const wordCounts = {};
             messages.forEach(row => {
@@ -1070,6 +1180,37 @@ app.get('/api/node/:nodeId/packets/count', withCache(), (req, res) => {
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json({ count: row?.count || 0 });
+    });
+});
+
+// 📡 單一節點 RF 硬體衰退與健康度診斷 API (直連 0-Hop 封包過濾與時段聚合)
+app.get('/api/node/:nodeId/rf-health', withCache(30 * 1000), (req, res) => {
+    const nodeId = req.params.nodeId;
+    const days = parseInt(req.query.days) || 7;
+
+    const sql = `
+        SELECT 
+            STRFTIME('%m/%d %H:00', timestamp) AS time_label,
+            ROUND(AVG(snr), 2) AS avg_snr,
+            ROUND(AVG(rssi), 2) AS avg_rssi,
+            COUNT(*) AS packet_count,
+            MIN(timestamp) AS raw_time
+        FROM packet_logs
+        WHERE node_id = ?
+          AND (
+              (hop_start IS NOT NULL AND hop_limit IS NOT NULL AND (hop_start - hop_limit) = 0)
+              OR hops_away = 0
+          )
+          AND snr IS NOT NULL AND snr BETWEEN -35 AND 35
+          AND rssi IS NOT NULL AND rssi BETWEEN -150 AND 0
+          AND timestamp >= datetime('now', '-${days} days')
+        GROUP BY time_label
+        ORDER BY raw_time ASC
+    `;
+
+    db.all(sql, [nodeId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows || []);
     });
 });
 
@@ -1495,8 +1636,8 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
     const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
 }
@@ -1665,7 +1806,7 @@ app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
         GROUP BY hop
         ORDER BY hop ASC
     `;
-    
+
     const sqlConfigured = `
         SELECT 
             hop_limit as hop,
@@ -1730,7 +1871,7 @@ app.get('/api/analytics/hourly-peak-stacked', withCache(60 * 1000), (req, res) =
 
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
-        
+
         const hoursMap = {};
         for (let i = 0; i < 24; i++) {
             const h = i.toString().padStart(2, '0');
@@ -2585,7 +2726,7 @@ server.listen(PORT, () => {
     const warmCache = () => {
         const portToUse = server.address()?.port || PORT;
         ['7d', '24h', '30d'].forEach(r => {
-            fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => {});
+            fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => { });
         });
     };
     setTimeout(warmCache, 2000);
@@ -2708,7 +2849,7 @@ if (!fs.existsSync(checkPath)) {
     console.error(`你可以從 https://github.com/meshtastic/protobufs 下載檔案並放入該目錄。\n`);
 }
 
-let ServiceEnvelope, Telemetry, User, Position, MapReport, Data, Routing, RouteDiscovery, NeighborInfo;
+let ServiceEnvelope, Telemetry, User, Position, MapReport, Data, Routing, RouteDiscovery, NeighborInfo, MeshPacket;
 
 root.load([
     "meshtastic/mqtt.proto",
@@ -2731,6 +2872,7 @@ root.load([
     Routing = root.lookupType("meshtastic.Routing");
     RouteDiscovery = root.lookupType("meshtastic.RouteDiscovery");
     NeighborInfo = root.lookupType("meshtastic.NeighborInfo");
+    MeshPacket = root.lookupType("meshtastic.MeshPacket"); // 🚀 Load MeshPacket type
     console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
     startMqttClient(); // 修正為 startMqttClient
 });
@@ -2745,6 +2887,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
         clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10),
         connectTimeout: 5000
     });
+    mqttClient = client; // 🚀 Expose client instance
 
     client.on('connect', () => {
         console.log('✅ 已成功連線到 MQTT 伺服器！');

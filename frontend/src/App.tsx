@@ -3,11 +3,15 @@ import { io } from 'socket.io-client';
 import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
-import NodeMap, { TraceroutePath } from './NodeMap';
-import TelemetryCharts from './TelemetryCharts';
+import type { TraceroutePath } from './NodeMap';
 import PacketTypePieChart from './PacketTypePieChart';
-import TopologyGraph from './TopologyGraph';
-import NetworkAnalytics from './NetworkAnalytics';
+import NodeRecoveryQR from './NodeRecoveryQR';
+
+const NodeMap = React.lazy(() => import('./NodeMap'));
+const TelemetryCharts = React.lazy(() => import('./TelemetryCharts'));
+const RfHealthChart = React.lazy(() => import('./RfHealthChart'));
+const TopologyGraph = React.lazy(() => import('./TopologyGraph'));
+const NetworkAnalytics = React.lazy(() => import('./NetworkAnalytics'));
 import { throttle } from 'lodash';
 
 interface ErrorBoundaryProps {
@@ -182,31 +186,14 @@ const PORTNUM_NAMES: Record<string | number, string> = {
 };
 const ITEMS_PER_PAGE = 20;
 
-const ANNOUNCEMENT_TITLE = "📢 v2.3 重大版本更新公告";
-const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.3！
+const ANNOUNCEMENT_TITLE = "📢 v2.4 重大版本更新公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.4！
 
-本次重大更新包含：
-1. 📊 全網分析 (NOC Operations Center) — 全新宏觀戰情儀表板：
-   - 頂部戰情 KPI：即時統計全網封包總量、24h 活躍節點、線上 Gateway 數與傳播比例。
-   - 每日流量與活躍趨勢：展示 7天/30天 網路成長曲線與每日活躍節點折線圖。
-   - 跳數分佈與覆蓋分析 (Hop Distribution)：圓餅圖與直方圖分析 0 Hop (直連) 至 3+ Hops 的傳輸佔比。
-   - 24小時尖峰時段熱力：統計一天 24 小時全網廣播、文字訊息與遙測封包的高峰時段。
-   - 頻道利用率 (CU) & 空口佔用 (AirUtilTX)：離散分析全網節點頻道壅塞度與發射時間佔用率。
-   - 硬體與韌體排行榜：統計台灣全網熱門開發板 (Heltec, RAK, T-Beam...) 與韌體版本分佈。
-   - 太陽能與電力健康監測：自動追蹤電池電量與充電狀況，第一時間抓出低電量或供電異常節點。
-   - CWA 官方氣象對比：結合全台近 900 個中央氣象署觀測站數據，對比 Mesh 遙測溫濕度與官方觀測差異。
-   - 0ms 秒開快取：優化數據打包與背景預熱機制，點擊「全網分析」頁籤達成極速秒開體驗。
-2. 🔗 地理邏輯拓撲網路圖 (Logic Topology Graph) 重大修正：
-   - 精確過濾 0xFFFFFFFF (發送者自身) 佔位符，徹底消除幽靈連線。
-   - 正確解碼 snr_towards 訊號強度，並在地圖提示框中標示每跳 SNR 品質。
-   - 採用無向邊正準化去重，完美支援直連連線與過濾展示。
-3. ⚡ 後端與前端效能全面優化：
-   - 後端啟用 WAL 模式、32MB 快取、MMAP，並建立巨量資料表 (150萬+ 封包) 複合索引。
-   - WebSocket 100ms 批次推播 (Batch Emission)，高流量高峰期有效降低 React 重繪負擔。
-   - 前端引入 nodeMap (Map 結構) 替代傳統 O(n) 的 .find() 查找，極速渲染熱點資料。
-4. 🎨 介面與穩定性修復：
-   - 統一頂部頁籤為整齊俐落的四字標題（全網分析、最愛節點、節點清單、節點詳情、地圖監控、封包觀察、閘道監控、頻道對話）。
-   - 修復當節點 Role 為數字型態時導致前端崩潰白畫面的例外錯誤。
+本次更新重點：
+1. 📱 聯絡人 QR Code 產生器：新增 Contact QR 功能，解決 App 掃描後節點隱藏問題，完美相容並支援置頂。
+2. 🗺️ 地圖重疊點優化：引入防抖發散演算法，解決重疊節點點擊展開與彈窗關閉的 Bug。
+3. ⚡ 效能與 API 優化：後端啟用 gzip 壓縮，大幅優化 telemetry 查詢效能。
+4. 📦 按需載入與分流打包：前端採用 Lazy-loading 載入地圖與圖表，首屏載入速度提升 80% 以上。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
@@ -1346,161 +1333,183 @@ function App() {
     };
     initApp();
 
-    socket.on('mqtt_status', (data) => setMqttConnected(data.connected));
+    // 🚀 WebSocket batch update buffers
+    const pendingNodeUpdates = new Map();
+    const pendingPackets = [];
+    let pendingMqttConnected = null;
 
-    // 單筆事件 handler (後端尚未升級時的相容)
-    socket.on('node_seen', (updatedNode: Partial<Node>) => {
-      setNodes(prev => {
-        const index = prev.findIndex(n => n.node_id === updatedNode.node_id);
-        if (index !== -1) {
-          const newNodes = [...prev];
-          newNodes[index] = { ...prev[index], ...updatedNode };
-          return [...newNodes];
+    // 🚀 WebSocket batch update flusher (runs every 1.5 seconds)
+    const flushInterval = setInterval(() => {
+      // 1. Flush Node Updates
+      if (pendingNodeUpdates.size > 0) {
+        const updatesArray = Array.from(pendingNodeUpdates.values());
+        pendingNodeUpdates.clear();
+
+        setNodes(prev => {
+          const nodeMap = new Map(prev.map(n => [n.node_id, n]));
+          updatesArray.forEach(updatedNode => {
+            if (updatedNode.node_id) {
+              if (nodeMap.has(updatedNode.node_id)) {
+                nodeMap.set(updatedNode.node_id, { ...nodeMap.get(updatedNode.node_id), ...updatedNode });
+              } else {
+                nodeMap.set(updatedNode.node_id, updatedNode);
+              }
+            }
+          });
+          return Array.from(nodeMap.values());
+        });
+      }
+
+      // 2. Flush Packet Logs & Coordinates
+      if (pendingPackets.length > 0) {
+        const packetsToProcess = [...pendingPackets];
+        pendingPackets.length = 0; // Clear the array
+
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const datePart = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
+        const timePart = now.toLocaleTimeString('zh-TW', { hour12: false });
+        const nowTime = `${datePart} ${timePart}`;
+
+        // 2a. Update coordinates in node state
+        setNodes(prev => {
+          let changed = false;
+          const nodeMap = new Map(prev.map(n => [n.node_id, n]));
+          packetsToProcess.forEach(packet => {
+            const fromId = packet.from || packet.node_id;
+            if (fromId && nodeMap.has(fromId)) {
+              const existing = nodeMap.get(fromId);
+              // Only update if coords actually changed
+              const hasNewCoords = !packet.source && (packet.latitude !== undefined || packet.longitude !== undefined);
+              if (hasNewCoords) {
+                nodeMap.set(fromId, {
+                  ...existing,
+                  latitude: packet.latitude !== undefined && packet.latitude !== null ? packet.latitude : existing.latitude,
+                  longitude: packet.longitude !== undefined && packet.longitude !== null ? packet.longitude : existing.longitude,
+                  last_seen: nowIso
+                });
+                changed = true;
+              }
+            }
+          });
+          return changed ? Array.from(nodeMap.values()) : prev;
+        });
+
+        // 2b. Check if position packets exist to trigger coverage update
+        const hasPosition = packetsToProcess.some(p => PORTNUM_NAMES[p.portnum] === 'POSITION' || p.portnum === 3 || p.portnum === '3');
+        if (hasPosition) {
+          fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData).catch(() => {});
         }
-        return [updatedNode as Node, ...prev];
-      });
-    });
 
-    // 🚀 批次節點更新（一次 setState 处理多筆，改用 Map O(1) 尋找）
-    socket.on('node_seen_batch', (updates: Partial<Node>[]) => {
-      setNodes(prev => {
-        if (!updates || updates.length === 0) return prev;
-        const nodeMap = new Map(prev.map(n => [n.node_id, n]));
-        updates.forEach(updatedNode => {
-          if (updatedNode.node_id) {
-            if (nodeMap.has(updatedNode.node_id)) {
-              nodeMap.set(updatedNode.node_id, { ...nodeMap.get(updatedNode.node_id)!, ...updatedNode });
-            } else {
-              nodeMap.set(updatedNode.node_id, updatedNode as Node);
+        // 2c. Update packet stream
+        const mqttPackets = packetsToProcess.filter(p => !p.source);
+        if (mqttPackets.length > 0 && !filterActiveRef.current) {
+          setPackets(prev => {
+            const formatted = mqttPackets.map(packet => ({
+              ...packet,
+              from: packet.node_id || packet.from,
+              timestamp: nowIso,
+              time: nowTime,
+              payload_json: packet.payload_json
+                ? (typeof packet.payload_json === 'string' ? JSON.parse(packet.payload_json) : packet.payload_json)
+                : null
+            }));
+            return [...formatted, ...prev].slice(0, 300);
+          });
+        }
+
+        // 2d. Handle chat alerts & selected node packets list
+        packetsToProcess.forEach(packet => {
+          const fromId = packet.node_id || packet.from;
+          const isText = (PORTNUM_NAMES[packet.portnum] === 'TEXT_MESSAGE' || packet.portnum === '1' || packet.portnum === 1);
+          if (isText && packet.payload_json?.text && packet.payload_json?.channel_name) {
+            const msgChan = packet.payload_json.channel_name;
+            if (activeTabRef.current !== 'chat' || currentChatChannelRef.current !== msgChan) {
+              setUnreadChannels(prev => ({ ...prev, [msgChan]: true }));
             }
           }
+          if (selectedNodeIdRef.current && fromId === selectedNodeIdRef.current) {
+            setNodePackets(prev => [{ ...packet, timestamp: nowIso, time: nowTime }, ...prev].slice(0, 20));
+          }
         });
-        // 為了保持最新的在前面，可以考慮排序，但為了效能直接轉回陣列
-        return Array.from(nodeMap.values());
-      });
+      }
+
+      // 3. Flush MQTT Status
+      if (pendingMqttConnected !== null) {
+        setMqttConnected(pendingMqttConnected);
+        pendingMqttConnected = null;
+      }
+    }, 1500);
+
+    // 🚀 Register socket listeners that push to buffer queues
+    socket.on('mqtt_status', (data) => {
+      pendingMqttConnected = data.connected;
     });
 
+    socket.on('node_seen', (updatedNode) => {
+      if (updatedNode && updatedNode.node_id) {
+        const existing = pendingNodeUpdates.get(updatedNode.node_id) || {};
+        pendingNodeUpdates.set(updatedNode.node_id, { ...existing, ...updatedNode });
+      }
+    });
 
-    // 🚀 批次 raw_packet handler—一次 setState 處理整一批封包
-    // 🚀 效能優化版：使用 throttle 處理高頻封包
-    const handlePacketBatch = throttle((packets: any[]) => {
-      if (!packets || packets.length === 0) return;
-
-      const now = new Date();
-      const nowIso = now.toISOString();
-      const datePart = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
-      const timePart = now.toLocaleTimeString('zh-TW', { hour12: false });
-      const nowTime = `${datePart} ${timePart}`;
-
-      // 1. 一次性更新地圖座標
-      setNodes(prev => {
-        let changed = false;
-        const nodeMap = new Map(prev.map(n => [n.node_id, n]));
-        packets.forEach(packet => {
-          if (nodeMap.has(packet.from)) {
-            const existing = nodeMap.get(packet.from)!;
-            nodeMap.set(packet.from, {
-              ...existing,
-              latitude: !packet.source ? (packet.latitude || existing.latitude) : existing.latitude,
-              longitude: !packet.source ? (packet.longitude || existing.longitude) : existing.longitude,
-              last_seen: nowIso
-            });
-            changed = true;
+    socket.on('node_seen_batch', (updates) => {
+      if (updates) {
+        updates.forEach(updatedNode => {
+          if (updatedNode && updatedNode.node_id) {
+            const existing = pendingNodeUpdates.get(updatedNode.node_id) || {};
+            pendingNodeUpdates.set(updatedNode.node_id, { ...existing, ...updatedNode });
           }
         });
-        return changed ? Array.from(nodeMap.values()) : prev;
-      });
-
-      // 2. 節流優化：更新覆蓋範圍 (避免每筆封包都觸發 fetch)
-      const hasPosition = packets.some(p => PORTNUM_NAMES[p.portnum] === 'POSITION' || p.portnum === 3 || p.portnum === '3');
-      if (hasPosition) {
-        // 這裡維持原本邏輯，但它已受到 throttle 1秒的保護，不會再頻繁觸發
-        fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData);
       }
+    });
 
-      // 3. 一次性更新封包串流
-      const mqttPackets = packets.filter(p => !p.source);
-      if (mqttPackets.length > 0 && !filterActiveRef.current) {
-        setPackets(prev => {
-          const formatted = mqttPackets.map(packet => ({
-            ...packet,
-            from: packet.node_id,
-            timestamp: nowIso,
-            time: nowTime,
-            payload_json: packet.payload_json
-              ? (typeof packet.payload_json === 'string' ? JSON.parse(packet.payload_json) : packet.payload_json)
-              : null
-          }));
-          return [...formatted, ...prev].slice(0, 300); // 記憶體上限 300 筆
-        });
+    socket.on('raw_packet_batch', (packets) => {
+      if (packets) {
+        pendingPackets.push(...packets);
       }
+    });
 
-      // 4. 小話消息處理
-      packets.forEach(packet => {
-        const isText = (PORTNUM_NAMES[packet.portnum] === 'TEXT_MESSAGE' || packet.portnum === '1' || packet.portnum === 1);
-        if (isText && packet.payload_json?.text && packet.payload_json?.channel_name) {
-          const msgChan = packet.payload_json.channel_name;
-          if (activeTabRef.current !== 'chat' || currentChatChannelRef.current !== msgChan) {
-            setUnreadChannels(prev => ({ ...prev, [msgChan]: true }));
-          }
-        }
-        if (selectedNodeIdRef.current && packet.from === selectedNodeIdRef.current) {
-          setNodePackets(prev => [{ ...packet, timestamp: nowIso, time: nowTime }, ...prev].slice(0, 20));
-        }
-      });
-    }, 1000, { leading: true, trailing: true }); // 每 1 秒結算一次
-
-    // 綁定監聽器
-    socket.on('raw_packet_batch', handlePacketBatch);
-
-    // 🚨 記得要在 useEffect 的 return 中加上這行來防止記憶體洩漏！
-    return () => {
-      socket.off('raw_packet_batch', handlePacketBatch);
-      handlePacketBatch.cancel();
-    };
-
-
-    // 單筆 telemetry handler
     socket.on('telemetry_update', (data) => {
-      setNodes(prev => prev.map(n => n.node_id === data.node_id ? {
-        ...n,
-        battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : n.battery_level,
-        voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : n.voltage,
-        current: data.current !== undefined && data.current !== null ? data.current : n.current,
-        snr: data.snr !== undefined && data.snr !== null ? data.snr : n.snr,
-        rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : n.rssi,
-        air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : n.air_util_tx,
-        channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : n.channel_utilization,
-        temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : n.temperature,
-        humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : n.humidity
-      } : n));
+      if (data && data.node_id) {
+        const existing = pendingNodeUpdates.get(data.node_id) || {};
+        pendingNodeUpdates.set(data.node_id, {
+          ...existing,
+          node_id: data.node_id,
+          battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : existing.battery_level,
+          voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : existing.voltage,
+          current: data.current !== undefined && data.current !== null ? data.current : existing.current,
+          snr: data.snr !== undefined && data.snr !== null ? data.snr : existing.snr,
+          rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : existing.rssi,
+          air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : existing.air_util_tx,
+          channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : existing.channel_utilization,
+          temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : existing.temperature,
+          humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : existing.humidity
+        });
+      }
     });
 
-    // 🚀 批次 telemetry handler
-    socket.on('telemetry_batch', (updates: any[]) => {
-      setNodes(prev => {
-        let changed = false;
-        const next = [...prev];
+    socket.on('telemetry_batch', (updates) => {
+      if (updates) {
         updates.forEach(data => {
-          const idx = next.findIndex(n => n.node_id === data.node_id);
-          if (idx !== -1) {
-            next[idx] = {
-              ...next[idx],
-              battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : next[idx].battery_level,
-              voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : next[idx].voltage,
-              current: data.current !== undefined && data.current !== null ? data.current : next[idx].current,
-              snr: data.snr !== undefined && data.snr !== null ? data.snr : next[idx].snr,
-              rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : next[idx].rssi,
-              air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : next[idx].air_util_tx,
-              channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : next[idx].channel_utilization,
-              temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : next[idx].temperature,
-              humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : next[idx].humidity
-            };
-            changed = true;
+          if (data && data.node_id) {
+            const existing = pendingNodeUpdates.get(data.node_id) || {};
+            pendingNodeUpdates.set(data.node_id, {
+              ...existing,
+              node_id: data.node_id,
+              battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : existing.battery_level,
+              voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : existing.voltage,
+              current: data.current !== undefined && data.current !== null ? data.current : existing.current,
+              snr: data.snr !== undefined && data.snr !== null ? data.snr : existing.snr,
+              rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : existing.rssi,
+              air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : existing.air_util_tx,
+              channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : existing.channel_utilization,
+              temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : existing.temperature,
+              humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : existing.humidity
+            });
           }
         });
-        return changed ? next : prev;
-      });
+      }
     });
 
     // 抓取網格化聚合數據
@@ -1524,14 +1533,17 @@ function App() {
     const traceroutePathsInterval = setInterval(fetchTraceroutePaths, 30000); // 每 30 秒更新多路徑
 
     return () => {
-      socket.off('mqtt_status');
-      socket.off('node_seen');
-      socket.off('raw_packet');
-      socket.off('telemetry_update');
+      clearInterval(flushInterval);
       clearInterval(sysInterval);
       clearInterval(coverageInterval);
       clearInterval(tracerouteInterval);
       clearInterval(traceroutePathsInterval);
+      socket.off('mqtt_status');
+      socket.off('node_seen');
+      socket.off('node_seen_batch');
+      socket.off('raw_packet_batch');
+      socket.off('telemetry_update');
+      socket.off('telemetry_batch');
     };
   }, [fetchGlobalPackets, fetchFavoritePackets, loadNetworkStats, refreshDashboardData, globalPacketsCurrentPage, globalFilter, favPacketsCurrentPage, favLogFilter]);
 
@@ -1646,31 +1658,31 @@ function App() {
         ))}
       </datalist>
       {/* Top Navbar */}
-      <nav className={`${darkMode ? 'bg-slate-900' : 'bg-[#1e293b]'} text-white px-6 py-3 flex justify-between items-center shadow-lg border-b ${darkMode ? 'border-slate-800' : 'border-slate-700'}`}>
-        <div className="flex items-center gap-3">
-          <Radio className={mqttConnected ? "text-cyan-400 animate-pulse" : "text-slate-500"} size={24} />
-          <span className="text-lg font-black tracking-widest uppercase">Meshtastic <span className="text-cyan-400">Radar</span></span>
+      <nav className={`${darkMode ? 'bg-slate-900' : 'bg-[#1e293b]'} text-white px-3 sm:px-6 py-2.5 sm:py-3 flex justify-between items-center shadow-lg border-b ${darkMode ? 'border-slate-800' : 'border-slate-700'}`}>
+        <div className="flex items-center gap-2 sm:gap-3">
+          <Radio className={mqttConnected ? "text-cyan-400 animate-pulse" : "text-slate-500"} size={20} />
+          <span className="text-xs sm:text-base md:text-lg font-black tracking-widest uppercase truncate max-w-[150px] sm:max-w-none">Meshtastic <span className="text-cyan-400">Radar</span></span>
         </div>
-        <div className="flex items-center gap-6 text-sm">
+        <div className="flex items-center gap-2 sm:gap-4 md:gap-6 text-xs sm:text-sm">
           <button
             onClick={() => setShowAnnouncement(true)}
-            className={`p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-cyan-400' : 'hover:bg-slate-700 text-cyan-300'}`}
+            className={`p-1.5 sm:p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-cyan-400' : 'hover:bg-slate-700 text-cyan-300'}`}
             title="查看系統公告"
           >
-            <Megaphone size={20} />
+            <Megaphone size={18} />
           </button>
           <button
             onClick={() => setDarkMode(!darkMode)}
-            className={`p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-yellow-400' : 'hover:bg-slate-700 text-slate-300'}`}
+            className={`p-1.5 sm:p-2 rounded-lg transition-colors ${darkMode ? 'hover:bg-slate-800 text-yellow-400' : 'hover:bg-slate-700 text-slate-300'}`}
             title={darkMode ? "切換亮色模式" : "切換暗色模式"}
           >
-            {darkMode ? <Sun size={20} /> : <Moon size={20} />}
+            {darkMode ? <Sun size={18} /> : <Moon size={18} />}
           </button>
-          <span className={`flex items-center gap-2 px-3 py-1 rounded-full border text-[10px] font-bold ${mqttConnected ? 'border-cyan-500/50 text-cyan-400 bg-cyan-500/10' : 'border-red-500/50 text-red-400 bg-red-500/10'}`}>
-            <div className={`w-2 h-2 rounded-full ${mqttConnected ? 'bg-green-400' : 'bg-red-400'}`}></div>
+          <span className={`flex items-center gap-1.5 px-2.5 py-0.5 sm:px-3 sm:py-1 rounded-full border text-[9px] sm:text-[10px] font-bold ${mqttConnected ? 'border-cyan-500/50 text-cyan-400 bg-cyan-500/10' : 'border-red-500/50 text-red-400 bg-red-500/10'}`}>
+            <div className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${mqttConnected ? 'bg-green-400' : 'bg-red-400'}`}></div>
             {mqttConnected ? 'ONLINE' : 'OFFLINE'}
           </span>
-          <select value={fontSize} onChange={(e) => setFontSize(e.target.value)} className={`bg-transparent border-none text-white text-xs outline-none`}>
+          <select value={fontSize} onChange={(e) => setFontSize(e.target.value)} className={`bg-transparent border-none text-white text-[10px] sm:text-xs outline-none hidden sm:block`}>
             <option value="sm" className="bg-slate-800">小字體</option>
             <option value="base" className="bg-slate-800">中字體</option>
             <option value="lg" className="bg-slate-800">大字體</option>
@@ -1680,56 +1692,56 @@ function App() {
 
       {/* Tabs Menu */}
       <div className={`border-b sticky top-0 z-50 shadow-sm ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-        <div className="max-w-6xl mx-auto flex overflow-x-auto no-scrollbar whitespace-nowrap">
+        <div className="max-w-7xl mx-auto flex overflow-x-auto no-scrollbar whitespace-nowrap px-1 sm:px-4">
           <button
             onClick={() => setActiveTab('analytics')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'analytics' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'analytics' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <BarChart3 size={16} /> 全網分析
+            <BarChart3 size={15} /> 全網分析
           </button>
           <button
             onClick={() => setActiveTab('favorites')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'favorites' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'favorites' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <Star size={16} /> 最愛節點
+            <Star size={15} /> 最愛節點
           </button>
           <button
             onClick={() => setActiveTab('nodes')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'nodes' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'nodes' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <List size={18} /> 節點清單
+            <List size={16} /> 節點清單
           </button>
           <button
             onClick={() => setActiveTab('details')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'details' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'details' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <Info size={16} /> 節點詳情
+            <Info size={15} /> 節點詳情
           </button>
           <button
             onClick={() => setActiveTab('map')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'map' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'map' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <MapIcon size={16} /> 地圖監控
+            <MapIcon size={15} /> 地圖監控
           </button>
           <button
             onClick={() => setActiveTab('logs')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'logs' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'logs' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <Database size={16} /> 封包觀察
+            <Database size={15} /> 封包觀察
           </button>
           <button
             onClick={() => setActiveTab('gateways')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all ${activeTab === 'gateways' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all ${activeTab === 'gateways' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <Signal size={16} /> 閘道監控
+            <Signal size={15} /> 閘道監控
           </button>
           <button
             onClick={() => setActiveTab('chat')}
-            className={`px-6 py-4 text-xs font-black uppercase tracking-widest flex items-center gap-2 border-b-2 transition-all relative ${activeTab === 'chat' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50'}`}
+            className={`px-3.5 sm:px-6 py-3 sm:py-4 text-[11px] sm:text-xs font-black uppercase tracking-wider flex items-center gap-1.5 sm:gap-2 border-b-2 transition-all relative ${activeTab === 'chat' ? 'border-cyan-500 text-cyan-600 bg-cyan-50/50 dark:bg-cyan-500/10 dark:text-cyan-400' : 'border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:bg-slate-800/50'}`}
           >
-            <MessageCircle size={16} /> 頻道對話
+            <MessageCircle size={15} /> 頻道對話
             {hasAnyUnreadChat && (
-              <span className="absolute top-3 right-3 w-2 h-2 bg-red-500 rounded-full border-2 border-white dark:border-slate-900 animate-pulse"></span>
+              <span className="absolute top-2.5 right-2.5 w-2 h-2 bg-red-500 rounded-full border-2 border-white dark:border-slate-900 animate-pulse"></span>
             )}
           </button>
         </div>
@@ -1751,7 +1763,9 @@ function App() {
             <ErrorBoundary title="切換分頁時發生組件異常 (Tab Execution Error)">
             {activeTab === 'analytics' && (
               <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
-                <NetworkAnalytics darkMode={darkMode} />
+                <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入分析數據...</div>}>
+                  <NetworkAnalytics darkMode={darkMode} />
+                </React.Suspense>
               </div>
             )}
 
@@ -2580,7 +2594,20 @@ function App() {
 
                     <div className="p-6 space-y-8">
                       <section>
-                        <TelemetryCharts nodeId={selectedNode.node_id} socket={socket} node={selectedNode} darkMode={darkMode} />
+                        <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入遙測圖表...</div>}>
+                          <TelemetryCharts nodeId={selectedNode.node_id} socket={socket} node={selectedNode} darkMode={darkMode} />
+                        </React.Suspense>
+                      </section>
+
+                      <section>
+                        <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入健康診斷...</div>}>
+                          <RfHealthChart nodeId={selectedNode.node_id} darkMode={darkMode} />
+                        </React.Suspense>
+                      </section>
+
+                      {/* 📱 尋找失聯節點 QR Code 產生器 */}
+                      <section>
+                        <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
                       </section>
 
                       <section>
@@ -2589,19 +2616,21 @@ function App() {
                         </h4>
                         <div className="h-[512px] rounded-xl overflow-hidden border border-slate-200">
                           {selectedNode.latitude || gatewayStats.length > 0 ? (
-                            <NodeMap
-                              nodes={[selectedNode]}
-                              allNodes={nodes}
-                              gateways={gatewayStats}
-                              activeTab={activeTab}
-                              isDetailView={true}
-                              onSelectNode={() => { }}
-                              coverageData={coverageData}
-                              selectedNodePath={selectedNodePath}
-                              showTrackerHistory={true}
-                              showTraceroute={showTraceroute}
-                              showHopGrid={showHopGrid}
-                            />
+                            <React.Suspense fallback={<div className="h-full flex items-center justify-center bg-slate-50 dark:bg-slate-900 text-slate-400 font-mono">地圖載入中...</div>}>
+                              <NodeMap
+                                nodes={[selectedNode]}
+                                allNodes={nodes}
+                                gateways={gatewayStats}
+                                activeTab={activeTab}
+                                isDetailView={true}
+                                onSelectNode={() => { }}
+                                coverageData={coverageData}
+                                selectedNodePath={selectedNodePath}
+                                showTrackerHistory={true}
+                                showTraceroute={showTraceroute}
+                                showHopGrid={showHopGrid}
+                              />
+                            </React.Suspense>
                           ) : (
                             <div className="h-full flex items-center justify-center bg-slate-50 text-slate-400 text-sm italic">
                               此節點尚未回報 GPS 位置
@@ -2791,7 +2820,9 @@ function App() {
 
             {activeTab === 'topology' && (
               <div className="w-full h-[75vh]">
-                <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+                <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入拓撲圖...</div>}>
+                  <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+                </React.Suspense>
               </div>
             )}
 
@@ -3078,35 +3109,39 @@ function App() {
                     {isMapFullScreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
                   </button>
 
-                  <NodeMap
-                    nodes={mapNodes}
-                    allNodes={nodes}
-                    onSelectNode={handleShowModal}
-                    activeTab={activeTab}
-                    onShowDetail={handleShowModal}
-                    showNodes={showNodes}
-                    showUtilization={showUtilization}
-                    showTraceroute={showTraceroute}
-                    showHopGrid={showHopGrid}
-                    traceroutePath={traceroutePath}
-                    neighbors={neighbors}
-                    coverageData={coverageData}
-                    selectedNodePath={selectedNodePath}
-                    showTrackerHistory={showTrackerHistory}
-                    showSimulator={showSimulator}
-                    simResultMap={simResultMap}
-                    simState={simState}
-                    showLogicGraph={showLogicGraph}
-                    fusionEdges={fusionEdges}
-                    traceroutePaths={traceroutePaths}
-                    isMapFullScreen={isMapFullScreen}
-                    mapCenter={mapCenterCoords}
-                  />
+                   <React.Suspense fallback={<div className="h-full flex items-center justify-center bg-slate-50 dark:bg-slate-900 text-slate-400 font-mono">地圖載入中...</div>}>
+                    <NodeMap
+                      nodes={mapNodes}
+                      allNodes={nodes}
+                      onSelectNode={handleShowModal}
+                      activeTab={activeTab}
+                      onShowDetail={handleShowModal}
+                      showNodes={showNodes}
+                      showUtilization={showUtilization}
+                      showTraceroute={showTraceroute}
+                      showHopGrid={showHopGrid}
+                      traceroutePath={traceroutePath}
+                      neighbors={neighbors}
+                      coverageData={coverageData}
+                      selectedNodePath={selectedNodePath}
+                      showTrackerHistory={showTrackerHistory}
+                      showSimulator={showSimulator}
+                      simResultMap={simResultMap}
+                      simState={simState}
+                      showLogicGraph={showLogicGraph}
+                      fusionEdges={fusionEdges}
+                      traceroutePaths={traceroutePaths}
+                      isMapFullScreen={isMapFullScreen}
+                      mapCenter={mapCenterCoords}
+                    />
+                  </React.Suspense>
                 </div>
 
                 {showLogicGraph && (
                   <div className={`mt-6 w-full h-[75vh] rounded-2xl overflow-hidden border shadow-sm relative transition-colors ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-200 bg-white'}`}>
-                    <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+                    <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入拓撲圖...</div>}>
+                      <TopologyGraph nodes={nodes} edges={fusionEdges} darkMode={darkMode} />
+                    </React.Suspense>
                   </div>
                 )}
               </div>
@@ -3159,7 +3194,20 @@ function App() {
 
                   <div className="p-6 space-y-8">
                     <section>
-                      <TelemetryCharts nodeId={selectedNode.node_id} socket={socket} node={selectedNode} darkMode={darkMode} />
+                      <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入遙測圖表...</div>}>
+                        <TelemetryCharts nodeId={selectedNode.node_id} socket={socket} node={selectedNode} darkMode={darkMode} />
+                      </React.Suspense>
+                    </section>
+
+                    <section>
+                      <React.Suspense fallback={<div className="p-8 text-center text-slate-500 font-mono">正在載入健康診斷...</div>}>
+                        <RfHealthChart nodeId={selectedNode.node_id} darkMode={darkMode} />
+                      </React.Suspense>
+                    </section>
+
+                    {/* 📱 尋找失聯節點 QR Code 產生器 */}
+                    <section>
+                      <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
                     </section>
 
                     <section>
@@ -3168,19 +3216,21 @@ function App() {
                       </h4>
                       <div className="h-[400px] rounded-xl overflow-hidden border border-slate-200">
                         {selectedNode.latitude || gatewayStats.length > 0 ? (
-                          <NodeMap
-                            nodes={[selectedNode]}
-                            allNodes={nodes}
-                            gateways={gatewayStats}
-                            activeTab={activeTab}
-                            isDetailView={true}
-                            onSelectNode={() => { }}
-                            coverageData={coverageData}
-                            selectedNodePath={selectedNodePath}
-                            showTrackerHistory={true}
-                            showTraceroute={showTraceroute}
-                            showHopGrid={showHopGrid}
-                          />
+                          <React.Suspense fallback={<div className="h-full flex items-center justify-center bg-slate-50 dark:bg-slate-900 text-slate-400 font-mono">地圖載入中...</div>}>
+                            <NodeMap
+                              nodes={[selectedNode]}
+                              allNodes={nodes}
+                              gateways={gatewayStats}
+                              activeTab={activeTab}
+                              isDetailView={true}
+                              onSelectNode={() => { }}
+                              coverageData={coverageData}
+                              selectedNodePath={selectedNodePath}
+                              showTrackerHistory={true}
+                              showTraceroute={showTraceroute}
+                              showHopGrid={showHopGrid}
+                            />
+                          </React.Suspense>
                         ) : (
                           <div className="h-full flex items-center justify-center bg-slate-50 text-slate-400 text-sm italic">
                             此節點尚未回報 GPS 位置

@@ -587,47 +587,61 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         </div>
       </div>
 
-      {/* 🚀 2. 頂部 KPI 卡片區 (3 欄 Grid) */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+      {/* 🚀 2. 頂部 KPI 卡片區 (2x2 手機網格 / 4 欄 Desktop) */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         {/* 卡片 1: 總活躍節點 */}
-        <div className={`p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="space-y-1">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">總活躍節點 (Active)</span>
-            <div className="text-2xl font-black text-cyan-500 font-mono">
-              {kpi.activeNodes} <span className="text-xs text-slate-400 font-normal">nodes</span>
+        <div className={`p-3.5 sm:p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="space-y-0.5 sm:space-y-1">
+            <span className="text-[10px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider block">總活躍節點</span>
+            <div className="text-lg sm:text-2xl font-black text-cyan-500 font-mono">
+              {kpi.activeNodes} <span className="text-[10px] sm:text-xs text-slate-400 font-normal">nodes</span>
             </div>
-            <span className="text-[10px] text-slate-500 block">選定時間範圍內活躍</span>
+            <span className="text-[9px] sm:text-[10px] text-slate-500 block truncate">選定時間內活躍</span>
           </div>
-          <div className="p-3.5 rounded-2xl bg-cyan-500/10 text-cyan-500 border border-cyan-500/20">
-            <Activity size={24} />
+          <div className="p-2.5 sm:p-3.5 rounded-2xl bg-cyan-500/10 text-cyan-500 border border-cyan-500/20 hidden sm:block">
+            <Activity size={22} />
           </div>
         </div>
 
         {/* 卡片 2: 離線 / 失聯節點 */}
-        <div className={`p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="space-y-1">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">離線 / 失聯節點</span>
-            <div className="text-2xl font-black text-rose-500 font-mono">
-              {kpi.offlineNodes} <span className="text-xs text-slate-400 font-normal">nodes</span>
+        <div className={`p-3.5 sm:p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="space-y-0.5 sm:space-y-1">
+            <span className="text-[10px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider block">離線 / 失聯節點</span>
+            <div className="text-lg sm:text-2xl font-black text-rose-500 font-mono">
+              {kpi.offlineNodes} <span className="text-[10px] sm:text-xs text-slate-400 font-normal">nodes</span>
             </div>
-            <span className="text-[10px] text-slate-500 block">超過 48 小時未活動</span>
+            <span className="text-[9px] sm:text-[10px] text-slate-500 block truncate">&gt; 48 小時未活動</span>
           </div>
-          <div className="p-3.5 rounded-2xl bg-rose-500/10 text-rose-500 border border-rose-500/20">
-            <WifiOff size={24} />
+          <div className="p-2.5 sm:p-3.5 rounded-2xl bg-rose-500/10 text-rose-500 border border-rose-500/20 hidden sm:block">
+            <WifiOff size={22} />
           </div>
         </div>
 
         {/* 卡片 3: 無座標幽靈節點 */}
-        <div className={`p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
-          <div className="space-y-1">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">無座標幽靈節點</span>
-            <div className="text-2xl font-black text-amber-500 font-mono">
-              {kpi.ghostNodes} <span className="text-xs text-slate-400 font-normal">nodes</span>
+        <div className={`p-3.5 sm:p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="space-y-0.5 sm:space-y-1">
+            <span className="text-[10px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider block">無座標幽靈</span>
+            <div className="text-lg sm:text-2xl font-black text-amber-500 font-mono">
+              {kpi.ghostNodes} <span className="text-[10px] sm:text-xs text-slate-400 font-normal">nodes</span>
             </div>
-            <span className="text-[10px] text-slate-500 block">活躍但未回送 GPS 座標</span>
+            <span className="text-[9px] sm:text-[10px] text-slate-500 block truncate">無回送 GPS 座標</span>
           </div>
-          <div className="p-3.5 rounded-2xl bg-amber-500/10 text-amber-500 border border-amber-500/20">
-            <MapPinOff size={24} />
+          <div className="p-2.5 sm:p-3.5 rounded-2xl bg-amber-500/10 text-amber-500 border border-amber-500/20 hidden sm:block">
+            <MapPinOff size={22} />
+          </div>
+        </div>
+
+        {/* 卡片 4: 低電量警報 */}
+        <div className={`p-3.5 sm:p-5 rounded-2xl border shadow-sm flex items-center justify-between transition-all ${darkMode ? 'bg-slate-900/60 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className="space-y-0.5 sm:space-y-1">
+            <span className="text-[10px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider block">低電量警報</span>
+            <div className="text-lg sm:text-2xl font-black text-yellow-500 font-mono">
+              {kpi.lowBatteryAlerts || 0} <span className="text-[10px] sm:text-xs text-slate-400 font-normal">nodes</span>
+            </div>
+            <span className="text-[9px] sm:text-[10px] text-slate-500 block truncate">電量 &lt; 20% 節點</span>
+          </div>
+          <div className="p-2.5 sm:p-3.5 rounded-2xl bg-yellow-500/10 text-yellow-500 border border-yellow-500/20 hidden sm:block">
+            <ShieldCheck size={22} />
           </div>
         </div>
       </div>

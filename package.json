@@ -1,6 +1,6 @@
 {
   "name": "meshtastic-dashboard",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Meshtastic network monitor dashboard",
   "main": "index.js",
   "scripts": {
@@ -11,6 +11,7 @@
   "dependencies": {
     "@libsql/client": "^0.14.0",
     "@meshtastic/meshtasticjs": "^2.2.4",
+    "compression": "^1.7.4",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
