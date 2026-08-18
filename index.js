@@ -3272,7 +3272,7 @@ function startMqttClient() { // 修正函數名稱為 startMqttClient
 // ==========================================
 // 💾 4. 每 12 小時自動備份資料庫至雲端
 // ==========================================
-cron.schedule('0 */12 * * *', () => {
+cron.schedule('0 0 * * 0', () => {
     // 原始資料庫路徑
     const sourceDbPath = path.join(__dirname, 'meshtastic.db');
 
@@ -3295,6 +3295,32 @@ cron.schedule('0 */12 * * *', () => {
         // 執行檔案複製 (靜態副本)
         fs.copyFileSync(sourceDbPath, targetBackupPath);
         console.log(`\n📦 [雲端備份成功] ${new Date().toLocaleString()} - 資料庫已安全複製至: ${backupFileName}`);
+
+        // 🧹 清理 30 天以前的舊備份
+        try {
+            const files = fs.readdirSync(googleDrivePath);
+            const now = new Date();
+            const maxAgeMs = 30 * 24 * 60 * 60 * 1000; // 30 天的毫秒數
+
+            files.forEach(file => {
+                const match = file.match(/^meshtastic_backup_(\d{4}-\d{2}-\d{2})\.db$/);
+                if (match) {
+                    const fileDateStr = match[1];
+                    const fileDate = new Date(fileDateStr);
+                    if (!isNaN(fileDate.getTime())) {
+                        const ageMs = now - fileDate;
+                        if (ageMs > maxAgeMs) {
+                            const oldFilePath = path.join(googleDrivePath, file);
+                            fs.unlinkSync(oldFilePath);
+                            console.log(`🧹 [備份清理] 已刪除 30 天前舊備份: ${file}`);
+                        }
+                    }
+                }
+            });
+        } catch (cleanErr) {
+            console.error('❌ [備份清理失敗] 發生錯誤:', cleanErr);
+        }
+
     } catch (err) {
         console.error('\n❌ [雲端備份失敗] 發生錯誤:', err);
     }
