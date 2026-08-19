@@ -300,6 +300,126 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     return jittered;
   }, [localNodes]);
 
+  const nodeMarkers = useMemo(() => {
+    return nodesWithGPS.map(node => {
+      // 計算 Channel 顯示名稱（與原邏輯相同）
+      const rawChannel = node.channel || '';
+      const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
+      const channelName = isInvalid ? (() => {
+        const parts = (node.last_topic || '').split('/');
+        return parts.find((p: string) => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
+      })() : rawChannel;
+      const channelDisplay = channelName === 'MediumFast' ? '⚡ MediumFast' : channelName;
+
+      // 計算最後活躍時間顯示
+      const getLastSeenText = (lastSeen?: string) => {
+        if (!lastSeen) return '從未';
+        const diffMs = Date.now() - new Date(lastSeen).getTime();
+        const diffMin = Math.floor(diffMs / 60000);
+        if (diffMin < 60) return `${diffMin} 分鐘前`;
+        const diffHr = Math.floor(diffMin / 60);
+        if (diffHr < 24) return `${diffHr} 小時前`;
+        return `${Math.floor(diffHr / 24)} 天前`;
+      };
+
+      return (
+        <Marker
+          key={node.node_id}
+          icon={createColoredIcon(node.role, node.last_seen)}
+          position={[node.latitude!, node.longitude!]}
+          eventHandlers={{ click: () => onSelectNode(node.node_id) }}
+        >
+          {/* Hover 顯示簡易節點圖卡 Tooltip */}
+          <Tooltip
+            direction="top"
+            offset={[0, -38]}
+            opacity={1}
+            className="node-hover-tooltip"
+          >
+            <div style={{
+              fontFamily: 'sans-serif',
+              minWidth: '170px',
+              maxWidth: '240px',
+              padding: '0',
+              borderRadius: '10px',
+              overflow: 'hidden',
+            }}>
+              {/* 頭部：Long Name + Role badge */}
+              <div style={{
+                background: `${getRoleColor(node.role)}22`,
+                borderBottom: `2px solid ${getRoleColor(node.role)}55`,
+                padding: '7px 10px 5px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '6px',
+              }}>
+                <div style={{ fontWeight: 900, fontSize: '12px', color: '#1e293b', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {node.long_name || 'Unknown'}
+                </div>
+                <div style={{
+                  background: getRoleColor(node.role),
+                  color: 'white',
+                  fontSize: '8px',
+                  fontWeight: 900,
+                  padding: '2px 5px',
+                  borderRadius: '999px',
+                  whiteSpace: 'nowrap',
+                  letterSpacing: '0.05em',
+                  textTransform: 'uppercase',
+                }}>
+                  {node.role || 'CLIENT'}
+                </div>
+              </div>
+
+              {/* 主體：節點資訊列表 */}
+              <div style={{ padding: '7px 10px', display: 'flex', flexDirection: 'column', gap: '4px', background: 'white' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                  <span style={{ color: '#94a3b8', fontWeight: 700 }}>Short</span>
+                  <span style={{ color: '#334155', fontWeight: 900 }}>{node.short_name || '??'}</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                  <span style={{ color: '#94a3b8', fontWeight: 700 }}>ID</span>
+                  <span style={{ color: '#2563eb', fontWeight: 900, fontFamily: 'monospace', fontSize: '9px' }}>{node.node_id}</span>
+                </div>
+                {channelDisplay !== '-' && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                    <span style={{ color: '#94a3b8', fontWeight: 700 }}>Channel</span>
+                    <span style={{ color: '#0891b2', fontWeight: 900 }}>{channelDisplay}</span>
+                  </div>
+                )}
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                  <span style={{ color: '#94a3b8', fontWeight: 700 }}>最後活躍</span>
+                  <span style={{ color: '#475569', fontWeight: 700 }}>{getLastSeenText(node.last_seen)}</span>
+                </div>
+                {node.snr !== undefined && node.snr !== null && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
+                    <span style={{ color: '#94a3b8', fontWeight: 700 }}>SNR</span>
+                    <span style={{ color: node.snr > 5 ? '#16a34a' : node.snr > -5 ? '#d97706' : '#dc2626', fontWeight: 900 }}>{node.snr} dB</span>
+                  </div>
+                )}
+              </div>
+
+              {/* 底部：點擊提示 */}
+              <div style={{
+                padding: '4px 10px',
+                background: '#f8fafc',
+                borderTop: '1px solid #e2e8f0',
+                fontSize: '9px',
+                color: '#94a3b8',
+                fontWeight: 700,
+                textAlign: 'center',
+                letterSpacing: '0.05em'
+              }}>
+                點擊查看節點詳情
+              </div>
+            </div>
+          </Tooltip>
+        </Marker>
+      );
+    });
+  }, [nodesWithGPS, onSelectNode]);
+
   const getCuColor = (cu?: number | null) => {
     if (cu === null || cu === undefined || isNaN(cu)) return '#94a3b8';
     if (cu >= 25) return '#ef4444'; // 🚨 危險
@@ -645,125 +765,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
               });
             }}
           >
-            {useMemo(() => {
-              return nodesWithGPS.map(node => {
-                // 計算 Channel 顯示名稱（與原邏輯相同）
-                const rawChannel = node.channel || '';
-                const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
-                const channelName = isInvalid ? (() => {
-                  const parts = (node.last_topic || '').split('/');
-                  return parts.find((p: string) => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
-                })() : rawChannel;
-                const channelDisplay = channelName === 'MediumFast' ? '⚡ MediumFast' : channelName;
-
-                // 計算最後活躍時間顯示
-                const getLastSeenText = (lastSeen?: string) => {
-                  if (!lastSeen) return '從未';
-                  const diffMs = Date.now() - new Date(lastSeen).getTime();
-                  const diffMin = Math.floor(diffMs / 60000);
-                  if (diffMin < 60) return `${diffMin} 分鐘前`;
-                  const diffHr = Math.floor(diffMin / 60);
-                  if (diffHr < 24) return `${diffHr} 小時前`;
-                  return `${Math.floor(diffHr / 24)} 天前`;
-                };
-
-                return (
-                  <Marker
-                    key={node.node_id}
-                    icon={createColoredIcon(node.role, node.last_seen)}
-                    position={[node.latitude!, node.longitude!]}
-                    eventHandlers={{ click: () => onSelectNode(node.node_id) }}
-                  >
-                    {/* Hover 顯示簡易節點圖卡 Tooltip */}
-                    <Tooltip
-                      direction="top"
-                      offset={[0, -38]}
-                      opacity={1}
-                      className="node-hover-tooltip"
-                    >
-                      <div style={{
-                        fontFamily: 'sans-serif',
-                        minWidth: '170px',
-                        maxWidth: '240px',
-                        padding: '0',
-                        borderRadius: '10px',
-                        overflow: 'hidden',
-                      }}>
-                        {/* 頭部：Long Name + Role badge */}
-                        <div style={{
-                          background: `${getRoleColor(node.role)}22`,
-                          borderBottom: `2px solid ${getRoleColor(node.role)}55`,
-                          padding: '7px 10px 5px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: '6px',
-                        }}>
-                          <div style={{ fontWeight: 900, fontSize: '12px', color: '#1e293b', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {node.long_name || 'Unknown'}
-                          </div>
-                          <div style={{
-                            background: getRoleColor(node.role),
-                            color: 'white',
-                            fontSize: '8px',
-                            fontWeight: 900,
-                            padding: '2px 5px',
-                            borderRadius: '999px',
-                            whiteSpace: 'nowrap',
-                            letterSpacing: '0.05em',
-                            textTransform: 'uppercase',
-                          }}>
-                            {node.role || 'CLIENT'}
-                          </div>
-                        </div>
-
-                        {/* 主體：節點資訊列表 */}
-                        <div style={{ padding: '7px 10px', display: 'flex', flexDirection: 'column', gap: '4px', background: 'white' }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>Short</span>
-                            <span style={{ color: '#334155', fontWeight: 900 }}>{node.short_name || '??'}</span>
-                          </div>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>ID</span>
-                            <span style={{ color: '#2563eb', fontWeight: 900, fontFamily: 'monospace', fontSize: '9px' }}>{node.node_id}</span>
-                          </div>
-                          {channelDisplay !== '-' && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                              <span style={{ color: '#94a3b8', fontWeight: 700 }}>Channel</span>
-                              <span style={{ color: '#0891b2', fontWeight: 900 }}>{channelDisplay}</span>
-                            </div>
-                          )}
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                            <span style={{ color: '#94a3b8', fontWeight: 700 }}>最後活躍</span>
-                            <span style={{ color: '#475569', fontWeight: 700 }}>{getLastSeenText(node.last_seen)}</span>
-                          </div>
-                          {node.snr !== undefined && node.snr !== null && (
-                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px' }}>
-                              <span style={{ color: '#94a3b8', fontWeight: 700 }}>SNR</span>
-                              <span style={{ color: node.snr > 5 ? '#16a34a' : node.snr > -5 ? '#d97706' : '#dc2626', fontWeight: 900 }}>{node.snr} dB</span>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* 底部：點擊提示 */}
-                        <div style={{
-                          padding: '4px 10px',
-                          background: '#f8fafc',
-                          borderTop: '1px solid #e2e8f0',
-                          fontSize: '9px',
-                          color: '#94a3b8',
-                          fontWeight: 700,
-                          textAlign: 'center',
-                          letterSpacing: '0.05em'
-                        }}>
-                          點擊查看節點詳情
-                        </div>
-                      </div>
-                    </Tooltip>
-                  </Marker>
-                );
-              });
-            }, [nodesWithGPS, onSelectNode])}
+            {nodeMarkers}
           </MarkerClusterGroup>
         )}
 
