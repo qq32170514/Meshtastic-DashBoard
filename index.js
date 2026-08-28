@@ -15,6 +15,71 @@ const os = require('os');
 const net = require('net'); // 🚀 引入 Node.js 原生 TCP 模組
 require('dotenv').config(); // 讀取 .env 檔案
 
+// ==========================================
+// 📝 系統事件記錄簿 (Local Event Log Book)
+// ==========================================
+const EVENT_LOG_PATH = path.join(__dirname, 'system_events.json');
+
+function logSystemEvent(eventType, details = {}) {
+    const event = {
+        timestamp: new Date().toISOString(),
+        event: eventType,
+        ...details
+    };
+
+    let events = [];
+    try {
+        if (fs.existsSync(EVENT_LOG_PATH)) {
+            const fileData = fs.readFileSync(EVENT_LOG_PATH, 'utf8');
+            events = JSON.parse(fileData);
+        }
+    } catch (err) {
+        console.error('Failed to read system events file:', err);
+    }
+
+    events.push(event);
+
+    try {
+        fs.writeFileSync(EVENT_LOG_PATH, JSON.stringify(events, null, 2), 'utf8');
+    } catch (err) {
+        console.error('Failed to write system event:', err);
+    }
+}
+
+// 啟動檢測邏輯
+try {
+    const pkg = require('./package.json');
+    const currentVersion = pkg.version || 'unknown';
+    let lastVersion = null;
+
+    if (fs.existsSync(EVENT_LOG_PATH)) {
+        const fileData = fs.readFileSync(EVENT_LOG_PATH, 'utf8');
+        const events = JSON.parse(fileData);
+        const startupEvents = events.filter(e => e.event === 'SYSTEM_STARTUP');
+        if (startupEvents.length > 0) {
+            lastVersion = startupEvents[startupEvents.length - 1].version;
+        }
+    }
+
+    if (lastVersion && lastVersion !== currentVersion) {
+        logSystemEvent('PROJECT_UPDATE', {
+            old_version: lastVersion,
+            new_version: currentVersion,
+            description: `專案更新：版本從 v${lastVersion} 變更為 v${currentVersion}`
+        });
+    }
+
+    logSystemEvent('SYSTEM_STARTUP', {
+        version: currentVersion,
+        platform: process.platform,
+        arch: process.arch,
+        node_version: process.version,
+        os_uptime: Math.floor(os.uptime())
+    });
+} catch (err) {
+    console.error('Failed to initialize event log book:', err);
+}
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -3323,5 +3388,34 @@ cron.schedule('0 0 * * 0', () => {
 
     } catch (err) {
         console.error('\n❌ [雲端備份失敗] 發生錯誤:', err);
+    }
+});
+
+// ==========================================
+// 🔌 系統關閉訊號監聽
+// ==========================================
+let isShuttingDown = false;
+function handleShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`\nReceived ${signal}. Logging shutdown and exiting...`);
+    try {
+        logSystemEvent('SYSTEM_SHUTDOWN', {
+            signal: signal,
+            reason: '服務正常終止或系統重啟關機'
+        });
+    } catch (err) {
+        console.error('Failed to log shutdown event:', err);
+    }
+    setTimeout(() => {
+        process.exit(0);
+    }, 500);
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('message', (msg) => {
+    if (msg === 'shutdown') {
+        handleShutdown('PM2_SHUTDOWN');
     }
 });
