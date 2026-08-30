@@ -495,7 +495,10 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         <MapInvalidator />
         <MapController center={mapCenter} />
         <MapEventListener />
-        <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+        <TileLayer 
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
+        />
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
         {(showTraceroute || showHopGrid) && coverageData.map((grid, i) => {

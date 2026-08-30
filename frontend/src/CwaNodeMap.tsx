@@ -1,4 +1,4 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { MapContainer, TileLayer, CircleMarker, Polyline, Tooltip as LeafletTooltip } from 'react-leaflet';
 
 export interface NodeComparison {
@@ -278,8 +278,8 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
           style={{ height: '100%', width: '100%' }}
         >
           <TileLayer
-            attribution='&copy; OSM &copy; CARTO'
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
           {/* 連線：Mesh 節點 → 配對 CWA 站 */}
