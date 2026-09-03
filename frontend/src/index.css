@@ -24,4 +24,16 @@
 .leaflet-cluster-anim .leaflet-marker-icon,
 .leaflet-cluster-anim .leaflet-marker-shadow {
   transition: transform 0.15s ease-in-out, opacity 0.15s ease-in-out;
+}
+
+/* ====================================================
+   Leaflet OSM 地圖樣式調整 (免金鑰 Grayscale / Dark 濾鏡)
+   ==================================================== */
+.leaflet-tile-container {
+  filter: grayscale(40%) brightness(1.05) contrast(0.95);
+}
+
+/* 當全域擁有 .dark Class 時，自動轉換為暗色系地圖 */
+.dark .leaflet-tile-container {
+  filter: grayscale(100%) invert(100%) hue-rotate(180deg) brightness(0.85) contrast(0.9);
 }

@@ -1,19 +1,56 @@
+# Environment & Secrets (NEVER COMMIT SENSITIVE DATA)
+.env
+.env.*
+!.env.example
+*.env
+*.env.txt
+*.pem
+*.key
+*.cert
+*.crt
+
 # Dependencies
 node_modules/
 frontend/node_modules/
 
 # Build output
+dist/
+build/
 frontend/dist/
+*.tsbuildinfo
 
 # Database files (never commit these)
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+*.backup
+*.bak
 
-# IDE & OS
-.vscode/
-.DS_Store
-
-# Local System Events Log
+# Logs & System Events
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 system_events.json
+
+# IDE, OS & Editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch, Dumps & Temp files
+scratch/
+scratch_*
+test_*.js
+*.tmp

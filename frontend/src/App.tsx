@@ -1155,7 +1155,10 @@ function App() {
             </h5>
             <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
               <MapContainer key={`pos-map-${lat}-${lon}`} center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                <TileLayer 
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
+                />
                 <CircleMarker center={[lat, lon]} radius={8} pathOptions={{ fillColor: '#22c55e', color: 'white', weight: 2, fillOpacity: 0.9 }} />
               </MapContainer>
             </div>
@@ -1219,7 +1222,10 @@ function App() {
             {points.length >= 2 ? (
               <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
                 <MapContainer key={`route-map-${points.map(p=>p.join(',')).join('|')}`} center={points[0]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                  <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                  <TileLayer 
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
+                  />
                   {points.map((p, idx) => (
                     <CircleMarker
                       key={idx}
@@ -1651,7 +1657,7 @@ function App() {
 
   return (
     <ErrorBoundary title="全域網頁畫面異常 (Global Application Error)">
-      <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900'} font-sans text-${fontSize}`}>
+      <div className={`min-h-screen flex flex-col transition-colors duration-300 ${darkMode ? 'bg-slate-950 text-slate-100 dark' : 'bg-slate-50 text-slate-900'} font-sans text-${fontSize}`}>
       <datalist id="node-list">
         {nodes.map(n => (
           <option key={n.node_id} value={n.node_id}>{n.long_name || n.node_id} ({n.short_name || '?'})</option>
@@ -3636,7 +3642,10 @@ function App() {
                               style={{ height: '100%', width: '100%' }} 
                               zoomControl={false}
                             >
-                              <TileLayer url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png" />
+                              <TileLayer 
+                                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
+                              />
                               {hasGwGps && (
                                 <CircleMarker 
                                   center={[gwLat, gwLng]} 
