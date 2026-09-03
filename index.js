@@ -4,6 +4,8 @@ const sqlite3 = require('sqlite3').verbose();
 const { createClient } = require('@libsql/client');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const http = require('http');
 const compression = require('compression');
 const { Server } = require('socket.io');
@@ -14,6 +16,14 @@ const cron = require('node-cron');
 const os = require('os');
 const net = require('net'); // 🚀 引入 Node.js 原生 TCP 模組
 require('dotenv').config(); // 讀取 .env 檔案
+
+// 🛡️ 必要環境變數驗證 (Fail Fast - 缺漏直接終止啟動)
+const requiredEnv = ['MQTT_BROKER', 'MQTT_USER', 'MQTT_PASSWORD'];
+const missingEnv = requiredEnv.filter(name => !process.env[name]);
+if (missingEnv.length > 0) {
+    console.error(`❌ [FATAL] 缺少必要的環境變數: ${missingEnv.join(', ')}。系統終止啟動。`);
+    throw new Error(`Missing required environment variables: ${missingEnv.join(', ')}`);
+}
 
 // ==========================================
 // 📝 系統事件記錄簿 (Local Event Log Book)
@@ -82,15 +92,97 @@ try {
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 const PORT = process.env.PORT || 3000;
 
-app.use(compression());
-app.use(cors());
-app.use(express.json());
+// 🛡️ CORS 與 Origin 白名單處理 (預設優先同源存取)
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
 
-// 讓 Express 信任 Cloudflare 轉發的標頭 (這對於取得真實訪客 IP 很重要)
-app.set('trust proxy', true);
+const io = new Server(server, {
+    cors: {
+        origin: allowedOrigins.length > 0 ? allowedOrigins : (origin, callback) => callback(null, true),
+        methods: ['GET', 'POST']
+    }
+});
+
+// 🛡️ HTTP 安全標頭防護 (Helmet)
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+            fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+            imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org"],
+            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org"],
+            objectSrc: ["'none'"],
+            upgradeInsecureRequests: null
+        }
+    },
+    crossOriginEmbedderPolicy: false
+}));
+
+app.use(compression());
+
+// 🛡️ 嚴格限制 CORS (若未指定 ALLOWED_ORIGINS 則允許同源)
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error('Not allowed by CORS policy'));
+    },
+    methods: ['GET', 'HEAD']
+}));
+
+// 🛡️ 限制 JSON Request Body 大小，防止大封包 DoS
+app.use(express.json({ limit: '256kb' }));
+
+// 🛡️ 受約束的代理信任 (僅信任第一層反向代理如 Cloudflare)
+app.set('trust proxy', 1);
+
+// 🛡️ Rate Limiting (公開 API 頻率限制防護)
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 分鐘
+    max: 500, // 每 IP 最多 500 次請求
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' }
+});
+
+const expensiveLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100, // 針對昂貴查詢更嚴格限制 (每 IP 最多 100 次)
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many analytics requests, please try again later.' }
+});
+
+app.use('/api/', apiLimiter);
+app.use('/api/analytics/', expensiveLimiter);
+app.use('/api/coverage/', expensiveLimiter);
+
+// 🛡️ 分析查詢 range 參數校驗中介軟體 (避免任意超大跨度查詢)
+app.use('/api/analytics', (req, res, next) => {
+    if (req.query.range && !['24h', '7d', '30d'].includes(req.query.range)) {
+        req.query.range = '7d'; // fallback 到安全預設值
+    }
+    next();
+});
+
+// 🛡️ 生產環境內部錯誤遮蔽中介軟體 (避免 SQL 或堆疊洩漏給訪客)
+app.use((req, res, next) => {
+    const originalJson = res.json;
+    res.json = function (body) {
+        if (res.statusCode >= 500 && body && body.error && process.env.NODE_ENV === 'production') {
+            console.error(`[API 500 Error on ${req.method} ${req.path}]:`, body.error);
+            body = { error: 'Internal server error' };
+        }
+        return originalJson.call(this, body);
+    };
+    next();
+});
 
 const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
 
@@ -211,16 +303,53 @@ io.on('connection', (socket) => {
 
 // 🛡️ 解密引擎預處理
 const safeBase64 = (str) => str.replace(/-/g, '+').replace(/_/g, '/');
-const knownKeys = [
-    { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") },
-    { name: "MeshTW", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") },
-    { name: "SignalTest", key: Buffer.from(safeBase64("y1HciVgpl5Hzh05KJUe/umWUH8XhG3UjR1rvZHfUHFU="), "base64") },
-    { name: "Emergency!", key: Buffer.from(safeBase64("isDhHrNpJPlGX3GBJBX6kjuK7KQNp4Z0M7OTDpnX5N4"), "base64") }
+
+// PUBLIC TEST KEY — NOT SECRET (Standard Meshtastic default public channel key)
+const defaultPublicKeys = [
+    { name: "MediumFast", key: Buffer.from("1PG7OiApB1nwvP+rz05pAQ==", "base64") } // PUBLIC TEST KEY — NOT SECRET
 ];
 
-// 捕捉全域未處理錯誤，防止程式無預警結束
+// 動態載入使用者自訂/社群頻道金鑰 (自環境變數 MESHTASTIC_CHANNEL_KEYS_JSON 解析，絕不寫死於原始碼)
+function loadCustomChannelKeys() {
+    if (!process.env.MESHTASTIC_CHANNEL_KEYS_JSON) {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(process.env.MESHTASTIC_CHANNEL_KEYS_JSON);
+        if (Array.isArray(parsed)) {
+            return parsed
+                .filter(item => item && item.name && item.key)
+                .map(item => ({
+                    name: String(item.name),
+                    key: Buffer.from(safeBase64(String(item.key)), 'base64')
+                }));
+        }
+    } catch (err) {
+        console.error('❌ Failed to parse MESHTASTIC_CHANNEL_KEYS_JSON from environment:', err.message);
+    }
+    return [];
+}
+
+const knownKeys = [
+    ...defaultPublicKeys,
+    ...loadCustomChannelKeys()
+];
+
+// 🛡️ 捕捉全域未處理的 Promise 拒絕
+process.on('unhandledRejection', (reason) => {
+    console.error('⚠️ [PROCESS] 未處理的 Promise 拒絕 (Unhandled Rejection):', reason?.message || reason);
+});
+
+// 🛡️ 捕捉全域未處理異常 (Fatal Uncaught Exception)，安全記錄並觸發重啟
 process.on('uncaughtException', (err) => {
-    console.error('💥 偵測到未捕獲的異常 (Uncaught Exception):', err);
+    console.error('💥 [FATAL] 偵測到不可恢復的未捕獲異常 (Uncaught Exception):', err?.message || err);
+    try {
+        logSystemEvent('SYSTEM_FATAL_ERROR', { error: err?.message || 'Unknown fatal error' });
+    } catch (_) { }
+    // 留緩衝時間讓 PM2 或 systemd 接手重新啟動乾淨的程序
+    setTimeout(() => {
+        process.exit(1);
+    }, 1000);
 });
 
 // 你的專屬節點 ID
@@ -569,8 +698,10 @@ const buildPacketQuery = (req, baseSql, opts = {}) => {
 // 取得所有或特定節點的最新遙測資料
 app.get('/api/telemetry', (req, res) => {
     const nodeId = req.query.node_id;
-    const limit = parseInt(req.query.limit) || 50;
-    const days = parseInt(req.query.days);
+    // 🛡️ 強制設定上限，防止惡意請求過大資料量
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const rawDays = parseInt(req.query.days, 10);
+    const days = (!isNaN(rawDays) && rawDays > 0) ? Math.min(rawDays, 30) : null;
 
     // 🚀 Payload reduction: Select only fields required by the frontend telemetry chart
     let sql = `SELECT node_id, timestamp, battery_level, voltage, snr, temperature, humidity, channel_utilization, air_util_tx, current, adc_voltage FROM telemetry_data`;
@@ -582,7 +713,7 @@ app.get('/api/telemetry', (req, res) => {
         params.push(nodeId);
     }
 
-    if (days && !isNaN(days)) {
+    if (days) {
         conditions.push(`timestamp >= datetime('now', '-' || ? || ' days')`);
         params.push(days);
     }
@@ -639,11 +770,9 @@ app.get('/api/node/:nodeId', (req, res) => {
 const PACKET_LIST_COLS = `id, node_id, timestamp, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, hops_away, latitude, longitude, source`;
 
 app.get('/api/packets', withCache(), (req, res) => {
-    // 1. 強制設定安全上限，防止有人惡意或無意間請求過大資料量
-    const rawLimit = parseInt(req.query.limit) || 50;
-    const limit = Math.min(rawLimit, 100);
-
-    const page = parseInt(req.query.page) || 1;
+    // 🛡️ 強制設定安全上限，防止惡意請求過大資料量
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const offset = (page - 1) * limit;
 
     const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`, { excludeTunnelPackets: true });
@@ -1228,8 +1357,9 @@ app.get('/api/topology/fusion-edges', (req, res) => {
 // 🚀 效能優化：只取列表需要欄位，加快取
 app.get('/api/node/:nodeId/packets', withCache(), (req, res) => {
     const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
-    const limit = parseInt(req.query.limit) || 20;
-    const page = parseInt(req.query.page) || 1;
+    // 🛡️ 強制設定安全上限，防止有人請求過大資料量
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const offset = (page - 1) * limit;
 
     const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
@@ -1251,7 +1381,8 @@ app.get('/api/node/:nodeId/packets/count', withCache(), (req, res) => {
 // 📡 單一節點 RF 硬體衰退與健康度診斷 API (直連 0-Hop 封包過濾與時段聚合)
 app.get('/api/node/:nodeId/rf-health', withCache(30 * 1000), (req, res) => {
     const nodeId = req.params.nodeId;
-    const days = parseInt(req.query.days) || 7;
+    // 🛡️ 限制天數最大為 30 天
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 30);
 
     const sql = `
         SELECT 
@@ -1708,8 +1839,11 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 function fetchAndSaveCWAData() {
-    const cwaKey = process.env.CWA_API_KEY || 'CWA-818C7517-6EFB-46AA-8A28-F1648DFDB332';
-    if (!cwaKey) return;
+    const cwaKey = process.env.CWA_API_KEY;
+    if (!cwaKey) {
+        console.warn('⚠️ [CWA] 未配置 CWA_API_KEY 環境變數，跳過中央氣象署觀測站資料抓取');
+        return;
+    }
 
     const url = `https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization=${cwaKey}`;
     https.get(url, (res) => {
@@ -2945,10 +3079,18 @@ root.load([
 // ==========================================
 // 3. 啟動 MQTT 監聽與資料寫入
 // ==========================================
-function startMqttClient() { // 修正函數名稱為 startMqttClient
-    const client = mqtt.connect(process.env.MQTT_BROKER || 'mqtt://mqtt.meshtastic.org', {
-        username: process.env.MQTT_USER || 'meshdev',
-        password: process.env.MQTT_PASSWORD || 'large4cats',
+function startMqttClient() {
+    const broker = process.env.MQTT_BROKER;
+    const username = process.env.MQTT_USER;
+    const password = process.env.MQTT_PASSWORD;
+
+    if (!broker || !username || !password) {
+        throw new Error('❌ Missing required MQTT environment variables (MQTT_BROKER, MQTT_USER, MQTT_PASSWORD)');
+    }
+
+    const client = mqtt.connect(broker, {
+        username: username,
+        password: password,
         clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10),
         connectTimeout: 5000
     });
