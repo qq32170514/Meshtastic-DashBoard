@@ -574,16 +574,18 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
               </Rectangle>
             );
           } else if (showTraceroute) {
-            // 覆蓋範圍模式：顯示訊號密度 (單色青色漸層)
-            const opacity = Math.min(0.8, 0.2 + (grid.packet_count / 20));
+            // 覆蓋範圍模式：顯示訊號密度 (白底高對比湛藍漸層，點位清晰分明)
+            const opacity = Math.min(0.85, 0.38 + (grid.packet_count / 15));
             return (
               <Rectangle
                 key={`cov-grid-${i}`}
                 bounds={bounds as any}
                 pathOptions={{
-                  fillColor: '#06b6d4',
+                  fillColor: '#0284c7',
                   fillOpacity: opacity,
-                  stroke: false
+                  stroke: true,
+                  color: '#0369a1',
+                  weight: 1
                 }}
               >
                 <Tooltip sticky>

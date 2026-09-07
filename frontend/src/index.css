@@ -27,15 +27,19 @@
 }
 
 /* ====================================================
-   Leaflet OSM 地圖樣式調整 (淺色柔和 / 暗色系濾鏡)
+   Leaflet OSM 地圖樣式 (清爽白底地圖風格，確保覆蓋點位高對比辨識)
    ==================================================== */
 .leaflet-tile-container {
-  filter: brightness(1.12) saturate(0.38) contrast(0.88);
-  opacity: 0.94;
+  filter: brightness(1.25) saturate(0.08) contrast(0.85);
+}
+.leaflet-container {
+  background: #ffffff !important;
 }
 
-/* 當全域擁有 .dark Class 時，自動轉換為暗色系地圖 */
+/* 即使在 Dark Mode 下，地圖底圖亦維持清爽純白底，避免黑底吞噬藍色覆蓋點位 */
 .dark .leaflet-tile-container {
-  filter: grayscale(100%) invert(100%) hue-rotate(180deg) brightness(0.85) contrast(0.9);
-  opacity: 1;
+  filter: brightness(1.22) saturate(0.08) contrast(0.85);
+}
+.dark .leaflet-container {
+  background: #ffffff !important;
 }
