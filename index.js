@@ -114,8 +114,8 @@ app.use(helmet({
             scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-            imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org"],
-            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org"],
+            imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com"],
+            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com"],
             objectSrc: ["'none'"],
             upgradeInsecureRequests: null
         }
