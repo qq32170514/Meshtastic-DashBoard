@@ -102,10 +102,179 @@ interface Packet {
   snr?: number;
   rssi?: number;
   gateway_id?: string;
+  gateways?: Array<{ gateway_id: string; snr?: number; rssi?: number }>; // 🚀 聚合多 Gateway 接收
+  hops_away?: number;
+  hop_limit?: number;
+  hop_start?: number;
   rawData?: string;
   payload_json?: any;
   source?: string;       // 🚀 新增來源站點
   sourceLabel?: string;  // 🚀 新增來源標籤
+}
+
+// 🚀 多 Gateway 封包聚合函數：同一封包在短時間內被多個 Gateway 收到時，合併為單一項目並保留所有接收 Gateway
+function groupPacketsByBroadcast(packetList: Packet[]): Packet[] {
+  const result: Packet[] = [];
+  for (const p of packetList) {
+    const pTs = p.timestamp
+      ? new Date(String(p.timestamp).includes(' ') ? String(p.timestamp).replace(' ', 'T') + 'Z' : String(p.timestamp)).getTime()
+      : 0;
+
+    const match = result.find(existing => {
+      if (existing.from !== p.from || existing.portnum !== p.portnum) return false;
+      const exTs = existing.timestamp
+        ? new Date(String(existing.timestamp).includes(' ') ? String(existing.timestamp).replace(' ', 'T') + 'Z' : String(existing.timestamp)).getTime()
+        : 0;
+      return Math.abs(pTs - exTs) <= 15000;
+    });
+
+    if (match) {
+      if (!match.gateways) {
+        match.gateways = match.gateway_id ? [{ gateway_id: match.gateway_id, snr: match.snr, rssi: match.rssi }] : [];
+      }
+      if (p.gateway_id && !match.gateways.some(g => g.gateway_id === p.gateway_id)) {
+        match.gateways.push({ gateway_id: p.gateway_id, snr: p.snr, rssi: p.rssi });
+      }
+      if (p.snr !== null && p.snr !== undefined && (match.snr === null || match.snr === undefined || p.snr > match.snr)) {
+        match.snr = p.snr;
+        match.rssi = p.rssi;
+      }
+    } else {
+      result.push({
+        ...p,
+        gateways: p.gateway_id ? [{ gateway_id: p.gateway_id, snr: p.snr, rssi: p.rssi }] : []
+      });
+    }
+  }
+  return result;
+}
+
+// 🚀 封包列表 Gateway 標籤元件：最多顯示前 3 個 Gateway，超過以 +N 標記 (寫前三個就好)
+function renderGatewayBadges(
+  p: Packet,
+  darkMode: boolean,
+  nodes: Node[],
+  onShowNode: (id: string) => void
+) {
+  const gws: string[] = [];
+  if (p.gateways && p.gateways.length > 0) {
+    p.gateways.forEach(g => {
+      if (g.gateway_id && !gws.includes(g.gateway_id)) gws.push(g.gateway_id);
+    });
+  } else if (p.gateway_id) {
+    gws.push(p.gateway_id);
+  }
+
+  if (gws.length === 0) {
+    return <span className="text-slate-500 italic">Unknown</span>;
+  }
+
+  // 寫前三個就好
+  const top3 = gws.slice(0, 3);
+  const remaining = gws.length - 3;
+
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {top3.map((gwId) => {
+        const gwNode = nodes.find(n => n.node_id === gwId);
+        return (
+          <button
+            key={gwId}
+            onClick={() => onShowNode(gwId)}
+            className={`font-mono text-[10px] font-bold px-1.5 py-0.5 rounded border transition-colors hover:underline text-left ${
+              darkMode
+                ? 'bg-slate-800 text-slate-300 border-slate-700 hover:text-cyan-400 hover:border-cyan-500'
+                : 'bg-slate-100 text-slate-700 border-slate-200 hover:text-blue-600 hover:border-blue-300'
+            }`}
+            title={`查看 Gateway: ${gwId} ${gwNode ? `(${gwNode.long_name || gwNode.short_name})` : ''}`}
+          >
+            {gwId}{gwNode ? ` (${gwNode.short_name || gwNode.long_name})` : ''}
+          </button>
+        );
+      })}
+      {remaining > 0 && (
+        <span
+          className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-800/50"
+          title={`其餘 Gateway: ${gws.slice(3).join(', ')}`}
+        >
+          +{remaining}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// 🚀 解析多跳封包的最後一個傳跳中繼節點
+function findLastHopNode(
+  packet: Packet,
+  allNodes: Node[],
+  tracePaths: TraceroutePath[],
+  neighborList: any[]
+): Node | null {
+  const hops = packet.hops_away ?? (
+    (packet.hop_start && packet.hop_limit !== undefined)
+      ? Math.max(0, packet.hop_start - packet.hop_limit)
+      : 0
+  );
+  if (hops <= 0) return null;
+
+  // 1. 優先從封包 Payload 的 route / route_towards 解析 (TRACEROUTE 或 ROUTING)
+  const route = packet.payload_json?.route || packet.payload_json?.route_towards;
+  if (Array.isArray(route) && route.length > 0) {
+    const rawLast = route[route.length - 1];
+    const lastId = typeof rawLast === 'number' ? `!${rawLast.toString(16).padStart(8, '0')}` : String(rawLast);
+    if (lastId !== packet.from && lastId !== packet.gateway_id) {
+      const found = allNodes.find(n => n.node_id.toLowerCase() === lastId.toLowerCase());
+      if (found) return found;
+    }
+  }
+
+  // 2. 從全局多路徑 traceroutePaths 尋找吻合此發送源與閘道的路徑
+  const matchingTrace = tracePaths.find(p => {
+    if (!p.hops || p.hops.length < 2) return false;
+    const isSrc = p.hops[0].nodeId.toLowerCase() === packet.from.toLowerCase();
+    const isGw = packet.gateway_id && p.hops[p.hops.length - 1].nodeId.toLowerCase() === packet.gateway_id.toLowerCase();
+    return isSrc || isGw;
+  });
+  if (matchingTrace && matchingTrace.hops.length >= 3) {
+    const lastHop = matchingTrace.hops[matchingTrace.hops.length - 2];
+    const found = allNodes.find(n => n.node_id.toLowerCase() === lastHop.nodeId.toLowerCase());
+    if (found && found.node_id !== packet.from && found.node_id !== packet.gateway_id) {
+      return found;
+    }
+  }
+
+  // 3. 從 Gateway 的鄰居中，尋找最接近發送源的中繼節點
+  if (packet.gateway_id && Array.isArray(neighborList) && neighborList.length > 0) {
+    const sender = allNodes.find(n => n.node_id === packet.from);
+    const candidateIds = neighborList
+      .filter(nb => nb.node_id === packet.gateway_id || nb.neighbor_id === packet.gateway_id)
+      .map(nb => nb.node_id === packet.gateway_id ? nb.neighbor_id : nb.node_id)
+      .filter(id => id !== packet.from && id !== packet.gateway_id);
+
+    if (candidateIds.length > 0) {
+      if (sender && sender.latitude && sender.longitude) {
+        let bestCandidate: Node | null = null;
+        let minDist = Infinity;
+        for (const cId of candidateIds) {
+          const cNode = allNodes.find(n => n.node_id === cId && n.latitude && n.longitude);
+          if (cNode && cNode.latitude && cNode.longitude) {
+            const d = Math.hypot(cNode.latitude - sender.latitude, cNode.longitude - sender.longitude);
+            if (d < minDist) {
+              minDist = d;
+              bestCandidate = cNode;
+            }
+          }
+        }
+        if (bestCandidate) return bestCandidate;
+      } else {
+        const first = allNodes.find(n => n.node_id === candidateIds[0]);
+        if (first) return first;
+      }
+    }
+  }
+
+  return null;
 }
 
 interface GatewayStat {
@@ -400,6 +569,8 @@ function App() {
   const [loadingPacketDetail, setLoadingPacketDetail] = useState(false);
   const [selectedPacketGateways, setSelectedPacketGateways] = useState<any[]>([]);
   const [loadingPacketGateways, setLoadingPacketGateways] = useState(false);
+  const [showAllPacketGateways, setShowAllPacketGateways] = useState(false);
+  const [selectedDecoderGateway, setSelectedDecoderGateway] = useState<string | null>(null);
   const [chatFilter, setChatFilter] = useState({ favoritesOnly: false, nodeId: '', searchText: '' });
   const [showChatAnalytics, setShowChatAnalytics] = useState(false);
   const [chatAnalyticsData, setChatAnalyticsData] = useState<any>(null);
@@ -784,6 +955,11 @@ function App() {
   const filteredGlobalPackets = useMemo(() => packets, [packets]);
   const filteredNodePackets = useMemo(() => nodePackets, [nodePackets]);
 
+  // 🚀 多 Gateway 聚合展示清單 (同一封包多個 Gateway 接收時合併為單一列，最多展示前 3 個 Gateway)
+  const displayGlobalPackets = useMemo(() => groupPacketsByBroadcast(filteredGlobalPackets), [filteredGlobalPackets]);
+  const displayNodePackets = useMemo(() => groupPacketsByBroadcast(filteredNodePackets), [filteredNodePackets]);
+  const displayFavPackets = useMemo(() => groupPacketsByBroadcast(favoritePackets), [favoritePackets]);
+
   const filteredGateways = useMemo(() => {
     return gatewayLeaderboard.filter(gw => {
       if (gatewayFilter.search && !gw.gateway_id.toLowerCase().includes(gatewayFilter.search.toLowerCase())) return false;
@@ -972,6 +1148,9 @@ function App() {
         snr: p.snr,
         rssi: p.rssi,
         gateway_id: p.gateway_id,
+        hops_away: p.hops_away,
+        hop_limit: p.hop_limit,
+        hop_start: p.hop_start,
         source: p.source,
         // 🚀 不在列表解析 payload_json，改由點開詳情時懶加載
         rawData: undefined,
@@ -1016,6 +1195,8 @@ function App() {
     setSelectedPacket(packet);
     setSelectedPacketDetail(null);
     setSelectedPacketGateways([]);
+    setSelectedDecoderGateway(null);
+    setShowAllPacketGateways(false);
     // 如果封包是從 WebSocket 即時進來的（有 payload_json），直接用
     if (packet.payload_json !== undefined) {
       setSelectedPacketDetail({ payload_json: packet.payload_json, rawData: packet.rawData });
@@ -1401,11 +1582,7 @@ function App() {
           return changed ? Array.from(nodeMap.values()) : prev;
         });
 
-        // 2b. Check if position packets exist to trigger coverage update
-        const hasPosition = packetsToProcess.some(p => PORTNUM_NAMES[p.portnum] === 'POSITION' || p.portnum === 3 || p.portnum === '3');
-        if (hasPosition) {
-          fetch('/api/coverage/griddata').then(res => res.json()).then(setCoverageData).catch(() => {});
-        }
+        // 2b. 覆蓋網格由 coverageInterval 定期 2 分鐘刷新，避免每個位置封包均觸發高負載全網格重新計算
 
         // 2c. Update packet stream
         const mqttPackets = packetsToProcess.filter(p => !p.source);
@@ -2410,11 +2587,10 @@ function App() {
                           </tr>
                         </thead>
                         <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`} >
-                          {favoritePackets.map((p, i) => {
+                          {displayFavPackets.map((p, i) => {
                             const senderNode = nodeMap.get(p.from);
-                            const gwNode = nodeMap.get(p.gateway_id!);
                             return (
-                              <tr key={i} className={`transition-colors ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}>
+                              <tr key={p.id || i} className={`transition-colors ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}>
                                 <td className="p-3 text-slate-400">{p.time}</td>
                                 <td className="p-3">
                                   <button onClick={() => handleShowModal(p.from)} className="text-yellow-500 font-bold hover:underline text-left">
@@ -2427,9 +2603,7 @@ function App() {
                                   </span>
                                 </td>
                                 <td className="p-3">
-                                  <button onClick={() => p.gateway_id && handleShowModal(p.gateway_id)} className={`font-bold hover:underline ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
-                                    {p.gateway_id || 'Unknown'} {gwNode ? `(${gwNode.short_name})` : ''}
-                                  </button>
+                                  {renderGatewayBadges(p, darkMode, nodes, handleShowModal)}
                                 </td>
                                 <td className="p-3 text-center text-slate-500">{p.snr ?? '-'}/{p.rssi ?? '-'}</td>
                                 <td className="p-3 text-right">
@@ -2440,7 +2614,7 @@ function App() {
                           })}
                         </tbody>
                       </table>
-                      {favoritePackets.length === 0 && (
+                      {displayFavPackets.length === 0 && (
                         <div className="p-10 text-center text-slate-400 italic text-sm">{loadingPackets ? "載入中..." : "無符合條件的成員封包"}</div>
                       )}
                     </div>
@@ -2743,13 +2917,13 @@ function App() {
                                 <th className="p-3">種類</th>
                                 <th className="p-3">Gateway (最後轉傳)</th>
                                 <th className="p-3 text-center">SNR/RSSI</th>
+                                <th className="p-3 text-right">詳情</th>
                               </tr>
                             </thead>
                             <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                              {filteredNodePackets.map((p, i) => {
-                                const gwNode = nodes.find(n => n.node_id === p.gateway_id);
+                              {displayNodePackets.map((p, i) => {
                                 return (
-                                  <tr key={i} className={`border-b last:border-0 transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
+                                  <tr key={p.id || i} className={`border-b last:border-0 transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
                                     <td className="p-3 text-slate-400">{p.time}</td>
                                     <td className="p-3">
                                       <div className="flex items-center gap-2">
@@ -2777,12 +2951,7 @@ function App() {
                                       </div>
                                     </td>
                                     <td className="p-3">
-                                      <button
-                                        onClick={() => p.gateway_id && handleShowModal(p.gateway_id)}
-                                        className={`font-bold hover:underline ${darkMode ? 'text-slate-400 hover:text-cyan-400' : 'text-slate-600 hover:text-blue-500'}`}
-                                      >
-                                        {p.gateway_id || 'Unknown'} {gwNode ? `(${gwNode.long_name})` : ''}
-                                      </button>
+                                      {renderGatewayBadges(p, darkMode, nodes, handleShowModal)}
                                     </td>
                                     <td className="p-3 text-center text-slate-500">{p.snr ?? '-'}/{p.rssi ?? '-'}</td>
                                     <td className="p-3 text-right">
@@ -2798,7 +2967,7 @@ function App() {
                               })}
                             </tbody>
                           </table>
-                          {filteredNodePackets.length === 0 && <div className="p-10 text-center text-slate-300 italic">無符合過濾條件之紀錄</div>}
+                          {displayNodePackets.length === 0 && <div className="p-10 text-center text-slate-300 italic">無符合過濾條件之紀錄</div>}
                           <div className={`p-4 border-t flex justify-end items-center gap-4 ${darkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
                             <span className="text-xs text-slate-500">總計 {nodePacketsTotalCount} 筆</span>
                             <button onClick={() => setNodePacketsCurrentPage(prev => Math.max(1, prev - 1))} disabled={nodePacketsCurrentPage === 1 || loadingPackets} className={`px-3 py-1 rounded text-xs font-bold ${darkMode ? 'bg-slate-700 hover:bg-slate-600 text-slate-300' : 'bg-slate-200 hover:bg-slate-300 text-slate-700'} disabled:opacity-50`}>上一頁</button>
@@ -3318,45 +3487,65 @@ function App() {
                       </h4>
                       {renderFilterBar(nodeLogFilter, (newFilter: typeof nodeLogFilter) => { setNodeLogFilter(newFilter); setNodePacketsCurrentPage(1); })}
                       <div className={`border rounded-xl overflow-hidden mb-10 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                        <table className="w-full text-left text-[11px] font-mono">
+                        <table className="w-full text-left text-[11px] font-mono border-collapse">
+                          <thead className={`border-b ${darkMode ? 'bg-slate-800 text-slate-400 border-slate-700' : 'bg-slate-50 text-slate-500'}`}>
+                            <tr>
+                              <th className="p-3">收到時間</th>
+                              <th className="p-3">種類</th>
+                              <th className="p-3">Gateway (最後轉傳)</th>
+                              <th className="p-3 text-center">SNR/RSSI</th>
+                              <th className="p-3 text-right">詳情</th>
+                            </tr>
+                          </thead>
                           <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                            {filteredNodePackets.map((p, i) => {
-                              const senderNode = nodes.find(n => n.node_id === p.from);
+                            {displayNodePackets.map((p, i) => {
                               return (
-                                <tr key={i} className="border-b last:border-0 hover:bg-slate-50">
-                                  <td className="p-2 text-slate-400">{p.time}</td>
-                                  <td className="p-2">
-                                    <button onClick={() => handleShowModal(p.from)} className="text-blue-600 font-bold hover:underline">
-                                      {p.from} {senderNode ? `(${senderNode.short_name})` : ''}
+                                <tr key={p.id || i} className={`border-b last:border-0 transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
+                                  <td className="p-3 text-slate-400">{p.time}</td>
+                                  <td className="p-3">
+                                    <div className="flex items-center gap-2">
+                                      {p.portnum === 'ENCRYPTED' ? (
+                                        <span className={`px-1.5 py-0.5 rounded border font-bold flex items-center gap-1 ${darkMode ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-red-50 border-red-100 text-red-600'}`}>
+                                          <ZapOff size={10} /> PRIVATE
+                                        </span>
+                                      ) : (
+                                        <span className={`px-1.5 py-0.5 rounded border font-bold ${darkMode ? 'bg-slate-800 border-slate-700 text-cyan-400' : 'bg-blue-50 border-blue-100 text-blue-600'}`}>
+                                          {PORTNUM_NAMES[p.portnum] || p.portnum}
+                                        </span>
+                                      )}
+                                      {PORTNUM_NAMES[p.portnum] === 'TELEMETRY' && p.payload_json && (
+                                        <span className="text-[10px] text-slate-400 font-medium whitespace-nowrap">
+                                          {(() => {
+                                            const m = p.payload_json.device_metrics || p.payload_json.deviceMetrics;
+                                            const pwr = p.payload_json.power_metrics || p.payload_json.powerMetrics;
+                                            if (!m && !pwr) return '';
+                                            const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage;
+                                            const c = pwr?.ch1_current ?? pwr?.ch1Current;
+                                            return `${m?.battery_level ?? m?.batteryLevel ?? '?'}% ${v?.toFixed(2) || ''}V ${c ? `(${c.toFixed(0)}mA)` : ''} | AU:${(m?.air_util_tx ?? m?.airUtilTx ?? 0).toFixed(1)}% CU:${(m?.channel_utilization ?? m?.channelUtilization ?? 0).toFixed(1)}%`;
+                                          })()}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="p-3">
+                                    {renderGatewayBadges(p, darkMode, nodes, handleShowModal)}
+                                  </td>
+                                  <td className="p-3 text-center text-slate-500">{p.snr ?? '-'}/{p.rssi ?? '-'}</td>
+                                  <td className="p-3 text-right">
+                                    <button
+                                      onClick={() => openPacketDetail(p)}
+                                      className="p-1.5 hover:bg-blue-100 text-blue-500 rounded-md transition-colors"
+                                      title="查看詳情"
+                                    >
+                                      <Eye size={14} />
                                     </button>
                                   </td>
-                                  <td className="p-2 text-slate-700 font-bold">
-                                    {p.portnum === 'ENCRYPTED' ? (
-                                      <span className="text-red-500 font-bold flex items-center gap-1"><ZapOff size={12} /> 私有加密封包</span>
-                                    ) : (
-                                      <span className={darkMode ? 'text-slate-300' : 'text-slate-700'}>{PORTNUM_NAMES[p.portnum] || p.portnum}</span>
-                                    )}
-                                    {PORTNUM_NAMES[p.portnum] === 'TELEMETRY' && p.payload_json && (
-                                      <span className="ml-2 text-[10px] text-slate-400 font-normal">
-                                        {(() => {
-                                          const m = p.payload_json.device_metrics || p.payload_json.deviceMetrics;
-                                          const pwr = p.payload_json.power_metrics || p.payload_json.powerMetrics;
-                                          if (!m) return '';
-                                          const v = pwr?.ch1_voltage ?? pwr?.ch1Voltage;
-                                          return `${m.battery_level ?? m.batteryLevel ?? '?'}% ${v ? v.toFixed(2) + 'V' : ''} | AU:${(m.air_util_tx ?? m.airUtilTx ?? 0).toFixed(1)}% CU:${(m.channel_utilization ?? m.channelUtilization ?? 0).toFixed(1)}%`;
-                                        })()}
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="p-2 text-slate-500 truncate max-w-[200px]">{p.topic}</td>
-                                  <td className="p-2 text-right">
-                                    <button onClick={() => openPacketDetail(p)} className="text-blue-500 hover:underline text-[10px] font-bold">查看內容</button>
-                                  </td>
                                 </tr>
-                              )
+                              );
                             })}
                           </tbody>
                         </table>
+                        {displayNodePackets.length === 0 && <div className="p-10 text-center text-slate-300 italic">無符合過濾條件之紀錄</div>}
                         {/* Pagination for node-specific packets */}
                         <div className={`p-4 border-t flex justify-end items-center gap-4 ${darkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
                           <span className="text-xs text-slate-500">總計 {nodePacketsTotalCount} 筆</span>
@@ -3398,11 +3587,10 @@ function App() {
                         </tr>
                       </thead>
                       <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                        {filteredGlobalPackets.map((p, i) => {
+                        {displayGlobalPackets.map((p, i) => {
                           const senderNode = nodeMap.get(p.from);
-                          const gwNode = nodeMap.get(p.gateway_id);
                           return (
-                            <tr key={i} className={`transition-colors ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}>
+                            <tr key={p.id || i} className={`transition-colors ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}>
                               <td className="p-3 text-slate-400">{p.time}</td>
                               <td className="p-3">
                                 <button
@@ -3435,12 +3623,7 @@ function App() {
                                 </div>
                               </td>
                               <td className="p-3">
-                                <button
-                                  onClick={() => p.gateway_id && handleShowModal(p.gateway_id)}
-                                  className={`font-bold hover:underline ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}
-                                >
-                                  {p.gateway_id || 'Unknown'} {gwNode ? `(${gwNode.long_name})` : ''}
-                                </button>
+                                {renderGatewayBadges(p, darkMode, nodes, handleShowModal)}
                               </td>
                               <td className="p-3 text-center text-slate-500">{p.snr ?? '-'}/{p.rssi ?? '-'}</td>
                               <td className="p-3 text-right">
@@ -3456,7 +3639,7 @@ function App() {
                         })}
                       </tbody>
                     </table>
-                    {filteredGlobalPackets.length === 0 && <div className="p-20 text-center text-slate-400 italic">無符合過濾條件之封包...</div>}
+                    {displayGlobalPackets.length === 0 && <div className="p-20 text-center text-slate-400 italic">無符合過濾條件之封包...</div>}
                   </div>
                   <div className={`p-4 border-t flex justify-end items-center gap-4 ${darkMode ? 'bg-slate-800/50 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
                     <span className="text-xs text-slate-500">總計 {globalPacketsTotalCount} 筆</span>
@@ -3614,87 +3797,26 @@ function App() {
                       </div>
                     </div>
 
-                    {/* 📡 收到該封包的 Gateway 地圖視覺化 */}
-                    {(() => {
-                      const gwNode = nodes.find(n => n.node_id === selectedPacket.gateway_id);
-                      const senderNode = nodes.find(n => n.node_id === selectedPacket.from);
-                      const gwLat = gwNode?.latitude;
-                      const gwLng = gwNode?.longitude;
-                      const senderLat = senderNode?.latitude;
-                      const senderLng = senderNode?.longitude;
-
-                      const hasGwGps = gwLat && gwLng;
-                      const hasSenderGps = senderLat && senderLng;
-
-                      if (!hasGwGps && !hasSenderGps) return null;
-
-                      const mapCenter: [number, number] = hasGwGps ? [gwLat, gwLng] : [senderLat!, senderLng!];
-                      return (
-                        <div className="space-y-2">
-                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
-                            收發地理路徑 Map (Gateway: {selectedPacket.gateway_id || 'Unknown'})
-                          </span>
-                          <div className="h-44 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-                            <MapContainer 
-                              key={`pkt-map-${selectedPacket.id || selectedPacket.timestamp}`}
-                              center={mapCenter} 
-                              zoom={11} 
-                              style={{ height: '100%', width: '100%' }} 
-                              zoomControl={false}
-                            >
-                              <TileLayer 
-                                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
-                              />
-                              {hasGwGps && (
-                                <CircleMarker 
-                                  center={[gwLat, gwLng]} 
-                                  radius={6} 
-                                  pathOptions={{ fillColor: '#ef4444', color: 'white', weight: 1.5, fillOpacity: 0.9 }}
-                                >
-                                  <Popup>
-                                    <div className="text-[10px] font-sans">
-                                      接收閘道器 Gateway: <strong>{gwNode.short_name || gwNode.node_id}</strong>
-                                    </div>
-                                  </Popup>
-                                </CircleMarker>
-                              )}
-                              {hasSenderGps && (
-                                <CircleMarker 
-                                  center={[senderLat, senderLng]} 
-                                  radius={6} 
-                                  pathOptions={{ fillColor: '#3b82f6', color: 'white', weight: 1.5, fillOpacity: 0.9 }}
-                                >
-                                  <Popup>
-                                    <div className="text-[10px] font-sans">
-                                      發送節點 Sender: <strong>{senderNode.short_name || senderNode.node_id}</strong>
-                                    </div>
-                                  </Popup>
-                                </CircleMarker>
-                              )}
-                              {hasGwGps && hasSenderGps && (
-                                <Polyline 
-                                  positions={[[senderLat, senderLng], [gwLat, gwLng]]} 
-                                  color="#10b981" 
-                                  weight={2} 
-                                  dashArray="4, 4"
-                                />
-                              )}
-                            </MapContainer>
-                          </div>
-                        </div>
-                      );
-                    })()}
-
                     {/* 🚀 使用懶加載的 detail 資料渲染視覺化 */}
                     {selectedPacketDetail && renderPacketVisualizer({ ...selectedPacket, payload_json: selectedPacketDetail.payload_json, rawData: selectedPacketDetail.rawData })}
 
-                    {/* 📡 所有收到該封包的 Gateway 列表 */}
-                    <div>
-                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider mb-2 block flex items-center gap-1">
-                        <Signal size={12} className="text-cyan-500" /> 收到此封包的閘道器 (Received Gateways)
-                        {loadingPacketGateways && <span className="text-[9px] text-cyan-400 animate-pulse ml-1">載入中...</span>}
-                      </span>
+                    {/* 📡 收到該封包的 Gateway 列表與路徑地圖 */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block flex items-center gap-1">
+                          <Signal size={12} className="text-cyan-500" /> 收到此封包的閘道器 (Received Gateways)
+                          {loadingPacketGateways && <span className="text-[9px] text-cyan-400 animate-pulse ml-1">載入中...</span>}
+                        </span>
+                        {selectedPacketGateways.length > 3 && (
+                          <button
+                            onClick={() => setShowAllPacketGateways(!showAllPacketGateways)}
+                            className="text-[10px] font-bold text-cyan-500 hover:underline cursor-pointer"
+                          >
+                            {showAllPacketGateways ? '僅顯示前 3 個 Gateway' : `展開全部 (${selectedPacketGateways.length})`}
+                          </button>
+                        )}
+                      </div>
+
                       {selectedPacketGateways.length > 0 ? (
                         <div className={`rounded-xl overflow-hidden border ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
                           <table className="w-full text-[10px] font-mono">
@@ -3709,14 +3831,23 @@ function App() {
                               </tr>
                             </thead>
                             <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                              {selectedPacketGateways.map((gw, i) => {
+                              {(showAllPacketGateways ? selectedPacketGateways : selectedPacketGateways.slice(0, 3)).map((gw, i) => {
                                 const gwNode = nodes.find(n => n.node_id === gw.gateway_id);
-                                const isCurrent = gw.gateway_id === selectedPacket.gateway_id;
+                                const isCurrent = gw.gateway_id === (selectedDecoderGateway || selectedPacket.gateway_id);
                                 return (
-                                  <tr key={i} className={`${isCurrent ? (darkMode ? 'bg-cyan-900/30' : 'bg-cyan-50') : ''}`}>
+                                  <tr
+                                    key={i}
+                                    onClick={() => setSelectedDecoderGateway(gw.gateway_id)}
+                                    className={`cursor-pointer transition-colors ${
+                                      isCurrent
+                                        ? (darkMode ? 'bg-cyan-950/40 text-cyan-300' : 'bg-cyan-50 text-cyan-900')
+                                        : (darkMode ? 'hover:bg-slate-800/60' : 'hover:bg-slate-50')
+                                    }`}
+                                  >
                                     <td className="p-2">
                                       <button
-                                        onClick={() => {
+                                        onClick={(e) => {
+                                          e.stopPropagation();
                                           setSelectedPacket(null);
                                           setSelectedPacketDetail(null);
                                           setSelectedPacketGateways([]);
@@ -3731,7 +3862,7 @@ function App() {
                                         }`}
                                         title="查看此 Gateway 的節點詳情"
                                       >
-                                        {gw.gateway_id}{isCurrent && <span className="ml-1 text-[8px] text-cyan-500">(此筆)</span>}
+                                        {gw.gateway_id}{isCurrent && <span className="ml-1 text-[8px] text-cyan-500 font-bold">(地圖中)</span>}
                                       </button>
                                     </td>
                                     <td className="p-2 text-slate-400">{gwNode?.long_name || gwNode?.short_name || '--'}</td>
@@ -3754,10 +3885,205 @@ function App() {
                       ) : (
                         !loadingPacketGateways && (
                           <div className={`p-3 rounded-xl text-center text-[10px] italic ${darkMode ? 'bg-slate-800 text-slate-500' : 'bg-slate-50 text-slate-400'}`}>
-                            僅由單一 Gateway 收到，或無閘道器資訊
+                            僅由單一 Gateway ({selectedPacket.gateway_id || 'Unknown'}) 收到
                           </div>
                         )
                       )}
+
+                      {/* 📡 GATEWAY 附帶收發路徑與中繼拓撲地圖 */}
+                      {(() => {
+                        const activeGwId = selectedDecoderGateway || selectedPacket.gateway_id;
+                        const gwNode = nodes.find(n => n.node_id === activeGwId);
+                        const senderNode = nodes.find(n => n.node_id === selectedPacket.from);
+
+                        const mergedPacket = selectedPacketDetail ? { ...selectedPacket, payload_json: selectedPacketDetail.payload_json } : selectedPacket;
+                        const lastHopNode = findLastHopNode(mergedPacket, nodes, traceroutePaths, neighbors);
+
+                        const gwLat = gwNode?.latitude;
+                        const gwLng = gwNode?.longitude;
+                        const senderLat = senderNode?.latitude;
+                        const senderLng = senderNode?.longitude;
+                        const lastHopLat = lastHopNode?.latitude;
+                        const lastHopLng = lastHopNode?.longitude;
+
+                        const hasGwGps = !!(gwLat && gwLng);
+                        const hasSenderGps = !!(senderLat && senderLng);
+                        const hasLastHopGps = !!(lastHopLat && lastHopLng);
+
+                        const hops = selectedPacket.hops_away ?? (
+                          (selectedPacket.hop_start && selectedPacket.hop_limit !== undefined)
+                            ? Math.max(0, selectedPacket.hop_start - selectedPacket.hop_limit)
+                            : 0
+                        );
+                        const isMultiHop = hops > 0 || !!lastHopNode;
+
+                        const validCoords: [number, number][] = [];
+                        if (hasSenderGps) validCoords.push([senderLat!, senderLng!]);
+                        if (hasLastHopGps) validCoords.push([lastHopLat!, lastHopLng!]);
+                        if (hasGwGps) validCoords.push([gwLat!, gwLng!]);
+
+                        const mapCenter: [number, number] = validCoords.length > 0
+                          ? validCoords[0]
+                          : [23.8, 120.9];
+
+                        return (
+                          <div className={`p-3 rounded-xl border space-y-2.5 ${darkMode ? 'bg-slate-800/40 border-slate-700/80' : 'bg-slate-50 border-slate-200'}`}>
+                            <div className="flex items-center justify-between flex-wrap gap-2">
+                              <span className="text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 text-slate-400">
+                                <MapIcon size={12} className="text-cyan-500" />
+                                收發路徑與最後傳跳連線地圖 (Route Map: {activeGwId || 'Unknown'})
+                              </span>
+                              <div className="flex items-center gap-2 text-[10px]">
+                                <span className="flex items-center gap-1 text-blue-500 font-bold">
+                                  <span className="w-2 h-2 rounded-full bg-blue-500 inline-block"></span> 發送節點
+                                </span>
+                                {isMultiHop && (
+                                  <span className="flex items-center gap-1 text-amber-500 font-bold">
+                                    <span className="w-2 h-2 rounded-full bg-amber-500 inline-block"></span> 最後傳跳中繼
+                                  </span>
+                                )}
+                                <span className="flex items-center gap-1 text-emerald-500 font-bold">
+                                  <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span> 接收閘道
+                                </span>
+                              </div>
+                            </div>
+
+                            {validCoords.length > 0 ? (
+                              <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700 shadow-inner">
+                                <MapContainer
+                                  key={`route-map-${selectedPacket.id || selectedPacket.timestamp}-${activeGwId}-${showAllPacketGateways}`}
+                                  center={mapCenter}
+                                  zoom={11}
+                                  style={{ height: '100%', width: '100%' }}
+                                  zoomControl={false}
+                                >
+                                  <TileLayer
+                                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                                  />
+                                  {/* 發送節點 Sender (Blue) */}
+                                  {hasSenderGps && (
+                                    <CircleMarker
+                                      center={[senderLat!, senderLng!]}
+                                      radius={7}
+                                      pathOptions={{ fillColor: '#3b82f6', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
+                                    >
+                                      <Popup>
+                                        <div className="text-[11px] font-sans">
+                                          <span className="text-blue-500 font-bold block mb-0.5">發送節點 (Sender)</span>
+                                          <strong>{senderNode?.long_name || senderNode?.short_name || selectedPacket.from}</strong>
+                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {selectedPacket.from}</div>
+                                        </div>
+                                      </Popup>
+                                    </CircleMarker>
+                                  )}
+
+                                  {/* 最後傳跳節點 Last Relay Node (Amber) */}
+                                  {hasLastHopGps && lastHopNode && (
+                                    <CircleMarker
+                                      center={[lastHopLat!, lastHopLng!]}
+                                      radius={7}
+                                      pathOptions={{ fillColor: '#f59e0b', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
+                                    >
+                                      <Popup>
+                                        <div className="text-[11px] font-sans">
+                                          <span className="text-amber-500 font-bold block mb-0.5">最後傳跳節點 (Last Relay Hop)</span>
+                                          <strong>{lastHopNode.long_name || lastHopNode.short_name || lastHopNode.node_id}</strong>
+                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {lastHopNode.node_id}</div>
+                                          <div className="text-[9px] text-amber-600 font-bold mt-0.5">多跳傳輸 ({hops} 跳)</div>
+                                        </div>
+                                      </Popup>
+                                    </CircleMarker>
+                                  )}
+
+                                  {/* 接收閘道器 Gateway (Emerald) */}
+                                  {hasGwGps && (
+                                    <CircleMarker
+                                      center={[gwLat!, gwLng!]}
+                                      radius={7}
+                                      pathOptions={{ fillColor: '#10b981', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
+                                    >
+                                      <Popup>
+                                        <div className="text-[11px] font-sans">
+                                          <span className="text-emerald-500 font-bold block mb-0.5">接收閘道器 (Gateway)</span>
+                                          <strong>{gwNode?.long_name || gwNode?.short_name || activeGwId}</strong>
+                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {activeGwId}</div>
+                                        </div>
+                                      </Popup>
+                                    </CircleMarker>
+                                  )}
+
+                                  {/* 連線繪製 */}
+                                  {/* 情境 1: 多跳且有最後傳跳點 GPS */}
+                                  {hasLastHopGps && (
+                                    <>
+                                      {/* 發送點 -> 最後傳跳點 (虛線) */}
+                                      {hasSenderGps && (
+                                        <Polyline
+                                          positions={[[senderLat!, senderLng!], [lastHopLat!, lastHopLng!]]}
+                                          color="#f59e0b"
+                                          weight={2.5}
+                                          dashArray="4, 4"
+                                        />
+                                      )}
+                                      {/* 最後傳跳點 -> 閘道 (實線) */}
+                                      {hasGwGps && (
+                                        <Polyline
+                                          positions={[[lastHopLat!, lastHopLng!], [gwLat!, gwLng!]]}
+                                          color="#10b981"
+                                          weight={3}
+                                        />
+                                      )}
+                                    </>
+                                  )}
+
+                                  {/* 情境 2: 無最後傳跳點或單跳直接接收 */}
+                                  {!hasLastHopGps && hasSenderGps && hasGwGps && (
+                                    <Polyline
+                                      positions={[[senderLat!, senderLng!], [gwLat!, gwLng!]]}
+                                      color={isMultiHop ? '#f59e0b' : '#10b981'}
+                                      weight={2.5}
+                                      dashArray={isMultiHop ? "5, 5" : undefined}
+                                    />
+                                  )}
+                                </MapContainer>
+                              </div>
+                            ) : (
+                              <div className={`p-4 rounded-xl text-center text-[10px] italic border border-dashed ${darkMode ? 'border-slate-800 text-slate-500 bg-slate-900/50' : 'border-slate-300 text-slate-400 bg-slate-100/50'}`}>
+                                發送節點或 Gateway 尚未回報 GPS 定位座標，無法繪製地理路徑連線。
+                              </div>
+                            )}
+
+                            {/* 路徑文字摘要說明 */}
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400 pt-1 border-t border-slate-700/30">
+                              <div className="flex items-center gap-1.5 font-mono">
+                                <span className="text-blue-400 font-bold">{selectedPacket.from}</span>
+                                <span>&rarr;</span>
+                                {isMultiHop && (
+                                  <>
+                                    <span className="text-amber-400 font-bold">
+                                      {lastHopNode ? `${lastHopNode.short_name || lastHopNode.node_id}` : `[多跳 ${hops} 跳]`}
+                                    </span>
+                                    <span>&rarr;</span>
+                                  </>
+                                )}
+                                <span className="text-emerald-400 font-bold">{activeGwId}</span>
+                              </div>
+                              <div>
+                                {hops <= 0 ? (
+                                  <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-bold border border-emerald-500/20">
+                                    直接接收 (Direct Hop 0)
+                                  </span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 font-bold border border-amber-500/20">
+                                    多跳傳輸 ({hops} 跳{lastHopNode ? `，最後中繼: ${lastHopNode.short_name || lastHopNode.node_id}` : ''})
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
                     </div>
 
                     <div>

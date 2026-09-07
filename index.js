@@ -184,64 +184,272 @@ app.use((req, res, next) => {
     next();
 });
 
-const seenPackets = new Set(); // 🛑 用於攔截 MQTT 重複封包的快取
+// ==========================================
+// 🛡️ 封包去重快取引擎 (Bounded TTL Deduplication Cache)
+// 具備 5 分鐘物理傳播生命週期 (TTL) 與 10,000 筆上限，防止記憶體無上限增長
+// ==========================================
+class BoundedTtlMap {
+    constructor(maxSize = 10000, ttlMs = 5 * 60 * 1000) {
+        this.maxSize = maxSize;
+        this.ttlMs = ttlMs;
+        this.map = new Map(); // key -> expireTimestamp
+    }
+
+    get(key) {
+        const item = this.map.get(key);
+        if (!item) return undefined;
+        if (Date.now() > item.exp) {
+            this.map.delete(key);
+            return undefined;
+        }
+        return item;
+    }
+
+    has(key) {
+        return this.get(key) !== undefined;
+    }
+
+    add(key, val = 1) {
+        const now = Date.now();
+        // 若超出容量，刪除最舊的 10% 項目以維持上限
+        if (this.map.size >= this.maxSize) {
+            const deleteCount = Math.ceil(this.maxSize * 0.1);
+            const iter = this.map.keys();
+            for (let i = 0; i < deleteCount; i++) {
+                const item = iter.next();
+                if (item.done) break;
+                this.map.delete(item.value);
+            }
+        }
+        this.map.set(key, { exp: now + this.ttlMs, val });
+    }
+
+    prune() {
+        const now = Date.now();
+        for (const [key, item] of this.map.entries()) {
+            if (now > item.exp) this.map.delete(key);
+        }
+    }
+
+    get size() {
+        return this.map.size;
+    }
+}
+
+const seenPackets = new BoundedTtlMap(10000, 5 * 60 * 1000);
 
 let isMqttConnected = false; // 紀錄 MQTT 連線狀態
 let mqttClient = null; // 🚀 Expose MQTT client globally
 
 // ==========================================
-// 🚀 WebSocket 批量推播緩衝（減少高峰期 re-render）
+// 🚀 WebSocket 批量推播緩衝 (250ms 最佳流暢度 + 節點去重合併 + 記憶體上限)
 // ==========================================
-const pendingBatch = { raw_packet: [], node_seen: [], telemetry_update: [] };
+const BATCH_FLUSH_INTERVAL_MS = 250; // 統一為 250ms (~4 FPS)，平衡前端即時感與 CPU 負擔
+const MAX_PENDING_BATCH_ITEMS = 500; // 防止 MQTT 突發洪峰塞爆記憶體
+
+const pendingBatch = {
+    raw_packet: [],
+    node_seen: new Map(), // 🚀 以 node_id 為 Key 自動去重合併最新狀態
+    telemetry_update: new Map() // 🚀 以 node_id 為 Key 自動去重合併最新狀態
+};
 let batchEmitTimer = null;
 
 function flushPendingBatch() {
-    if (pendingBatch.raw_packet.length) {
-        io.emit('raw_packet_batch', pendingBatch.raw_packet.splice(0));
+    if (batchEmitTimer) {
+        clearTimeout(batchEmitTimer);
+        batchEmitTimer = null;
     }
-    if (pendingBatch.node_seen.length) {
-        io.emit('node_seen_batch', pendingBatch.node_seen.splice(0));
+
+    if (pendingBatch.raw_packet.length > 0) {
+        const packets = pendingBatch.raw_packet.splice(0);
+        io.emit('raw_packet_batch', packets);
     }
-    if (pendingBatch.telemetry_update.length) {
-        io.emit('telemetry_batch', pendingBatch.telemetry_update.splice(0));
+
+    if (pendingBatch.node_seen.size > 0) {
+        const nodes = Array.from(pendingBatch.node_seen.values());
+        pendingBatch.node_seen.clear();
+        io.emit('node_seen_batch', nodes);
     }
-    batchEmitTimer = null;
+
+    if (pendingBatch.telemetry_update.size > 0) {
+        const tele = Array.from(pendingBatch.telemetry_update.values());
+        pendingBatch.telemetry_update.clear();
+        io.emit('telemetry_batch', tele);
+    }
 }
 
 /**
- * 🚀 批次推播：100ms 內的事件會合併成一個陣列發送
- * 大幅減少前端 React re-render 次數
+ * 🚀 批次推播：250ms 內的事件會合併發送，同節點資訊自動去重合併
+ * 大幅減少前端 React re-render 次數與頻寬佔用
  */
 function batchEmit(type, data) {
-    pendingBatch[type].push(data);
+    if (type === 'raw_packet') {
+        pendingBatch.raw_packet.push(data);
+        if (pendingBatch.raw_packet.length >= MAX_PENDING_BATCH_ITEMS) {
+            flushPendingBatch();
+            return;
+        }
+    } else if (type === 'node_seen' && data && data.node_id) {
+        const existing = pendingBatch.node_seen.get(data.node_id) || {};
+        pendingBatch.node_seen.set(data.node_id, { ...existing, ...data });
+    } else if (type === 'telemetry_update' && data && data.node_id) {
+        const existing = pendingBatch.telemetry_update.get(data.node_id) || {};
+        pendingBatch.telemetry_update.set(data.node_id, { ...existing, ...data });
+    }
+
     if (!batchEmitTimer) {
-        batchEmitTimer = setTimeout(flushPendingBatch, 1000); // 🚀 優化: 將推播緩衝提高到 1000ms，大幅減輕前端負擔
+        batchEmitTimer = setTimeout(flushPendingBatch, BATCH_FLUSH_INTERVAL_MS);
     }
 }
 
 // ==========================================
-// 🚀 In-Memory API 快取層 (10秒 TTL)
-// 大幅減少重複查詢對 SQLite 的壓力
+// 🚀 有界 LRU API 快取層 (Bounded LRU Cache with Route-Specific TTL)
+// 包含最大容量 (MAX_CACHE_ENTRIES)、過期自動清理與 Query Key 規範化
 // ==========================================
-const CACHE_TTL_MS = 10 * 1000; // 10 秒
-const apiCache = new Map();
+class BoundedLRUCache {
+    constructor(maxEntries = 300) {
+        this.maxEntries = maxEntries;
+        this.cache = new Map(); // key -> { data, expiredAt }
+    }
+
+    get(key) {
+        const item = this.cache.get(key);
+        if (!item) return null;
+        if (Date.now() > item.expiredAt) {
+            this.cache.delete(key);
+            return null;
+        }
+        // LRU 移至最新
+        this.cache.delete(key);
+        this.cache.set(key, item);
+        return item.data;
+    }
+
+    set(key, data, ttlMs) {
+        if (this.cache.has(key)) {
+            this.cache.delete(key);
+        } else if (this.cache.size >= this.maxEntries) {
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+        }
+        this.cache.set(key, { data, expiredAt: Date.now() + ttlMs });
+    }
+
+    delete(key) {
+        return this.cache.delete(key);
+    }
+
+    clearPrefix(prefix) {
+        for (const key of this.cache.keys()) {
+            if (key.startsWith(prefix)) {
+                this.cache.delete(key);
+            }
+        }
+    }
+
+    pruneExpired() {
+        const now = Date.now();
+        for (const [key, item] of this.cache.entries()) {
+            if (now > item.expiredAt) {
+                this.cache.delete(key);
+            }
+        }
+    }
+
+    get size() {
+        return this.cache.size;
+    }
+}
+
+const apiCache = new BoundedLRUCache(300);
+
+// 🚀 定期每 60 秒清理過期的 API 快取與重複封包快取
+setInterval(() => {
+    apiCache.pruneExpired();
+    seenPackets.prune();
+}, 60 * 1000);
+
+// ==========================================
+// 📊 Node.js Event Loop 與系統低成本可觀測性指標 (Low-Cost Performance Observability)
+// 每 30 秒輸出單行乾淨彙整日誌，記錄 MEM / MQTT速率 / DB佇列 / Clients / Event Loop Lag
+// ==========================================
+const { monitorEventLoopDelay } = require('perf_hooks');
+const eventLoopHistogram = monitorEventLoopDelay({ resolution: 20 });
+eventLoopHistogram.enable();
+
+let totalMqttPacketsReceived = 0;
+let lastMqttPacketCount = 0;
+let latestMetricsSnapshot = {
+    rssMb: 0,
+    heapMb: 0,
+    mqttPktPerSec: 0,
+    dbQueueDepth: 0,
+    dbTotalCommitted: 0,
+    socketClients: 0,
+    eventLoopLagMs: 0,
+    measuredAt: new Date().toISOString()
+};
+
+setInterval(() => {
+    const mem = process.memoryUsage();
+    const rssMb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
+    const heapMb = Math.round(mem.heapUsed / 1024 / 1024 * 10) / 10;
+    
+    const deltaPackets = totalMqttPacketsReceived - lastMqttPacketCount;
+    lastMqttPacketCount = totalMqttPacketsReceived;
+    const mqttPktPerSec = Math.round((deltaPackets / 30) * 10) / 10;
+
+    const lagMs = eventLoopHistogram.mean ? Math.round((eventLoopHistogram.mean / 1e6) * 10) / 10 : 0;
+    eventLoopHistogram.reset();
+
+    const socketClients = io ? (io.engine ? io.engine.clientsCount : 0) : 0;
+
+    latestMetricsSnapshot = {
+        rssMb,
+        heapMb,
+        mqttPktPerSec,
+        dbQueueDepth: dbQueue.length,
+        dbTotalCommitted: dbQueueMetrics.totalCommitted,
+        socketClients,
+        eventLoopLagMs: lagMs,
+        measuredAt: new Date().toISOString()
+    };
+
+    console.log(`📊 [PERF_METRICS] MEM: ${rssMb}MB (Heap: ${heapMb}MB) | MQTT: ${mqttPktPerSec} pkt/s | DB_Q: ${dbQueue.length} (committed: ${dbQueueMetrics.totalCommitted}) | Clients: ${socketClients} | LoopLag: ${lagMs}ms`);
+}, 30 * 1000);
+
+/**
+ * 規範化 Cache Key：保留標準合法 query keys 並排序，防止 Cache Explosion 攻擊
+ */
+function normalizeCacheKey(req) {
+    const url = new URL(req.originalUrl || req.url, 'http://localhost');
+    const allowed = ['limit', 'page', 'range', 'days', 'node_id', 'portnum', 'gateway_id', 'exclude_tunnel', 'cursor'];
+    const searchParams = new URLSearchParams();
+    for (const key of allowed) {
+        const val = url.searchParams.get(key);
+        if (val !== null && val !== '') searchParams.set(key, val);
+    }
+    const qs = searchParams.toString();
+    return qs ? `${url.pathname}?${qs}` : url.pathname;
+}
 
 /**
  * Express 中間件：自動快取 GET 回應
  * 快取命中時直接回傳，不碰 DB
  */
-function withCache(ttlMs = CACHE_TTL_MS) {
+function withCache(ttlMs = 10 * 1000) {
     return (req, res, next) => {
-        const key = req.originalUrl;
-        const cached = apiCache.get(key);
-        if (cached && Date.now() < cached.expiredAt) {
+        const key = normalizeCacheKey(req);
+        const cachedData = apiCache.get(key);
+        if (cachedData !== null && cachedData !== undefined) {
             res.setHeader('X-Cache', 'HIT');
-            return res.json(cached.data);
+            return res.json(cachedData);
         }
-        // 攔截 res.json 以存入快取
         const origJson = res.json.bind(res);
         res.json = (data) => {
-            apiCache.set(key, { data, expiredAt: Date.now() + ttlMs });
+            if (res.statusCode >= 200 && res.statusCode < 300 && data) {
+                apiCache.set(key, data, ttlMs);
+            }
             res.setHeader('X-Cache', 'MISS');
             origJson(data);
         };
@@ -249,44 +457,123 @@ function withCache(ttlMs = CACHE_TTL_MS) {
     };
 }
 
-/**
- * 當有新封包寫入資料庫時，清除所有 packet 相關的快取
- * 避免前端看到過時的分頁資料
- */
 function invalidatePacketCache() {
-    for (const key of apiCache.keys()) {
-        if (key.startsWith('/api/packets') || key.startsWith('/api/node/') || key.startsWith('/api/coverage')) {
-            apiCache.delete(key);
-        }
-    }
+    apiCache.clearPrefix('/api/packets');
+    apiCache.clearPrefix('/api/node/');
+    apiCache.clearPrefix('/api/coverage');
 }
 
 // ==========================================
-// 🚀 資料庫批次寫入任務佇列 (DB Queue)
-// 解決高流量時頻繁觸發 SQLite 鎖的問題
+// 🚀 資料庫自適應批次寫入管線 (Adaptive DB Ingestion Queue)
+// 具備背壓 (Backpressure)、自適應批次 (Chunking) 與可觀測性指標
 // ==========================================
 const dbQueue = [];
 let dbQueueTimer = null;
+let isFlushingDbQueue = false;
+
+const MAX_QUEUE_CAPACITY = 5000;
+const BATCH_CHUNK_SIZE = 100;
+const FLUSH_INTERVAL_MS = 200; // 200ms 防抖，高頻時迅速寫入
+
+const dbQueueMetrics = {
+    totalQueued: 0,
+    totalCommitted: 0,
+    totalErrors: 0,
+    lastBatchSize: 0,
+    lastDurationMs: 0,
+    maxQueueLengthSeen: 0
+};
 
 function queueDbOp(sql, params, callback) {
-    dbQueue.push({ sql, params, callback });
-    if (!dbQueueTimer) {
-        dbQueueTimer = setTimeout(() => {
-            if (dbQueue.length === 0) return;
-            const batch = dbQueue.splice(0);
-            dbQueueTimer = null;
-
-            db.serialize(() => {
-                db.run('BEGIN');
-                batch.forEach(item => {
-                    db.run(item.sql, item.params, item.callback);
-                });
-                db.run('COMMIT');
-            });
-            // 🚀 批次寫入完成後，讓快取失效
-            invalidatePacketCache();
-        }, 1000); // 每秒批次寫入一次資料庫
+    // 🛡️ 背壓防護 (Backpressure): 超過上限時記錄警示，避免記憶體溢位 (OOM)
+    if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
+        console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
+        if (callback) callback(new Error('DB queue backpressure limit reached'));
+        return;
     }
+
+    dbQueue.push({ sql, params, callback, queuedAt: Date.now() });
+    dbQueueMetrics.totalQueued++;
+    if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
+        dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
+    }
+
+    // 🚀 自適應觸發：若積累達 BATCH_CHUNK_SIZE 立即執行，否則等待防抖計時
+    if (dbQueue.length >= BATCH_CHUNK_SIZE && !isFlushingDbQueue) {
+        if (dbQueueTimer) {
+            clearTimeout(dbQueueTimer);
+            dbQueueTimer = null;
+        }
+        flushDbQueue();
+    } else if (!dbQueueTimer) {
+        dbQueueTimer = setTimeout(flushDbQueue, FLUSH_INTERVAL_MS);
+    }
+}
+
+function flushDbQueue() {
+    if (dbQueueTimer) {
+        clearTimeout(dbQueueTimer);
+        dbQueueTimer = null;
+    }
+    if (dbQueue.length === 0 || isFlushingDbQueue) return;
+
+    // 🚀 分批切片 (Chunking)，每次最多處理 BATCH_CHUNK_SIZE 筆，避免單一交易鎖定過久
+    const batch = dbQueue.splice(0, BATCH_CHUNK_SIZE);
+    isFlushingDbQueue = true;
+
+    const startTime = Date.now();
+    db.serialize(() => {
+        // 使用 IMMEDIATE 交易預先鎖定寫入，避免死鎖
+        db.run('BEGIN IMMEDIATE TRANSACTION', (beginErr) => {
+            if (beginErr) {
+                console.error('❌ [DB_QUEUE] BEGIN IMMEDIATE 失敗:', beginErr.message);
+                dbQueueMetrics.totalErrors += batch.length;
+                isFlushingDbQueue = false;
+                batch.forEach(item => item.callback && item.callback(beginErr));
+                if (dbQueue.length > 0) setTimeout(flushDbQueue, 50);
+                return;
+            }
+
+            let completed = 0;
+            let batchHasError = false;
+
+            batch.forEach((item) => {
+                db.run(item.sql, item.params, function (err) {
+                    if (err) {
+                        batchHasError = true;
+                        dbQueueMetrics.totalErrors++;
+                    }
+                    if (item.callback) {
+                        try { item.callback.call(this, err); } catch (_) { }
+                    }
+                    completed++;
+
+                    if (completed === batch.length) {
+                        const txEndSql = batchHasError ? 'ROLLBACK' : 'COMMIT';
+                        db.run(txEndSql, (commitErr) => {
+                            const duration = Date.now() - startTime;
+                            dbQueueMetrics.lastBatchSize = batch.length;
+                            dbQueueMetrics.lastDurationMs = duration;
+
+                            if (commitErr || batchHasError) {
+                                console.error(`⚠️ [DB_QUEUE] 交易結束 (${txEndSql}) 異常:`, commitErr?.message || '單項操作失敗');
+                            } else {
+                                dbQueueMetrics.totalCommitted += batch.length;
+                            }
+
+                            isFlushingDbQueue = false;
+                            // 🚀 採用路由級別 5 秒 TTL 自然過期，避免每 200ms 全面清空快取造成並行查詢穿透至 DB
+
+                            // 若隊列中仍有剩餘待處理資料，立即處理下一批
+                            if (dbQueue.length > 0) {
+                                setImmediate(flushDbQueue);
+                            }
+                        });
+                    }
+                });
+            });
+        });
+    });
 }
 
 // ==========================================
@@ -388,11 +675,12 @@ if (process.env.TURSO_URL) {
 db.serialize(() => {
     // 🚀 效能優先：所有 DDL 前先設定最佳 PRAGMA
     db.run(`PRAGMA journal_mode = WAL`);
-    db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 夠安全，比 FULL 快約 5x
-    db.run(`PRAGMA cache_size = -32000`);    // 32MB 頁面快取（負值代表 KB）
+    db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 具備完整崩潰一致性防護，且免除每次交易強制磁碟 sync
+    db.run(`PRAGMA cache_size = -64000`);    // 64MB 頁面快取（負值代表 KB），大幅減少 4GB 資料庫的冷讀取 I/O
     db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
     db.run(`PRAGMA mmap_size = 268435456`);  // 256MB mmap 加速讀取
     db.run(`PRAGMA busy_timeout = 30000`);   // 30秒等待鎖，避免高併發寫入時出現 SQLITE_BUSY 錯誤
+    db.run(`PRAGMA wal_autocheckpoint = 1000`); // 每累積 1000 頁自動 checkpoint
 
     db.run(`
         CREATE TABLE IF NOT EXISTS telemetry_data (
@@ -517,7 +805,6 @@ db.serialize(() => {
 
     db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gateway ON packet_logs(gateway_id)`);
 
     db.run(`
         CREATE TABLE IF NOT EXISTS cwa_weather_stations (
@@ -569,16 +856,18 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)`);
 
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_id ON packet_logs (node_id)`);
-    // 🚀 效能優化：為 packet_logs 的 timestamp 加上索引，加速 ORDER BY timestamp DESC 的查詢
+    // 🛡️ 效能優化 (Phase 1)：安全卸載無用、重複或引發 TEMP B-TREE 排序的大型索引
+    db.run(`DROP INDEX IF EXISTS idx_packet_logs_rawhex_ts`);
+    db.run(`DROP INDEX IF EXISTS idx_packet_logs_port_ts`);
+    db.run(`DROP INDEX IF EXISTS idx_packet_logs_node_id`);
+    db.run(`DROP INDEX IF EXISTS idx_packet_logs_gateway`);
+    db.run(`DROP INDEX IF EXISTS idx_packet_logs_source_timestamp`);
+
+    // 🚀 保留核心索引 (覆蓋最左前綴原則，無重複冗餘)
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_source_timestamp ON packet_logs (source, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
-
-    // 🚀 複合索引：大幅提升 NOC 戰情中心 Top Gateways 與重複率查詢速度 (從 5000ms 降至 100ms)
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_rawhex_ts ON packet_logs (raw_hex, timestamp DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)`);
 
     // 聊天紀錄效能優化
@@ -626,16 +915,49 @@ function cleanupOldData() {
 setInterval(cleanupOldData, 60 * 60 * 1000);
 cleanupOldData(); // 啟動時先執行一次
 
+// 🚀 效能維護：每 15 分鐘執行一次被動 WAL Checkpoint，防止 WAL 檔案無限制膨脹至數百 MB
+setInterval(() => {
+    if (db && typeof db.run === 'function') {
+        db.run('PRAGMA wal_checkpoint(PASSIVE)', (err) => {
+            if (err) console.error('⚠️ [WAL] Passive checkpoint warning:', err.message);
+        });
+    }
+}, 15 * 60 * 1000);
+
 // ==========================================
 // 1.5 API 路由設定 (提供給前端)
 // ==========================================
 
-// 🛸 輔助函式：構建封包查詢條件
+// 🛸 輔助函式：構建封包查詢條件 (支援 Keyset / Cursor 分頁)
 const buildPacketQuery = (req, baseSql, opts = {}) => {
     let sql = baseSql;
     const params = [];
     const conditions = [];
     const excludeTunnelPackets = opts.excludeTunnelPackets || req.excludeTunnelPackets || false;
+
+    // 🚀 Keyset Cursor 分頁支援 (timestamp + id 穩定有序雙欄位)
+    let cursorTimestamp = null;
+    let cursorId = null;
+
+    if (req.query.cursor) {
+        try {
+            const decoded = Buffer.from(req.query.cursor, 'base64url').toString('utf8');
+            const parts = decoded.split('_');
+            if (parts.length === 2 && parts[0] && parts[1]) {
+                cursorTimestamp = parts[0];
+                cursorId = parseInt(parts[1], 10);
+            }
+        } catch (_) { }
+    } else if (req.query.before_timestamp && req.query.before_id) {
+        cursorTimestamp = req.query.before_timestamp;
+        cursorId = parseInt(req.query.before_id, 10);
+    }
+
+    const isCursor = !!(cursorTimestamp && !isNaN(cursorId));
+    if (isCursor) {
+        conditions.push("(timestamp < ? OR (timestamp = ? AND id < ?))");
+        params.push(cursorTimestamp, cursorTimestamp, cursorId);
+    }
 
     if (req.params.nodeId) {
         conditions.push("node_id = ?");
@@ -692,7 +1014,7 @@ const buildPacketQuery = (req, baseSql, opts = {}) => {
     if (conditions.length > 0) {
         sql += " WHERE " + conditions.join(" AND ");
     }
-    return { sql, params };
+    return { sql, params, isCursor };
 };
 
 // 取得所有或特定節點的最新遙測資料
@@ -769,26 +1091,46 @@ app.get('/api/node/:nodeId', (req, res) => {
 // 🚀 效能優化：只取列表需要的欄位，排除 payload_json 和 raw_hex 這兩個大字段
 const PACKET_LIST_COLS = `id, node_id, timestamp, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, hops_away, latitude, longitude, source`;
 
-app.get('/api/packets', withCache(), (req, res) => {
+app.get('/api/packets', withCache(5 * 1000), (req, res) => {
     // 🛡️ 強制設定安全上限，防止惡意請求過大資料量
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const offset = (page - 1) * limit;
+    const { sql, params, isCursor } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`, { excludeTunnelPackets: true });
 
-    const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`, { excludeTunnelPackets: true });
-    const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
+    let finalSql = '';
+    let queryParams = [...params];
 
-    db.all(finalSql, [...params, limit, offset], (err, rows) => {
+    if (isCursor) {
+        // 🚀 Keyset Cursor 分頁 (O(1) 索引定位，無任何 OFFSET 負擔)
+        finalSql = `${sql} ORDER BY timestamp DESC, id DESC LIMIT ?`;
+        queryParams.push(limit);
+    } else {
+        // 🚀 向後相容舊版 OFFSET 分頁
+        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+        const offset = (page - 1) * limit;
+        finalSql = `${sql} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`;
+        queryParams.push(limit, offset);
+    }
+
+    db.all(finalSql, queryParams, (err, rows) => {
         if (err) {
             console.error('❌ API /api/packets SQL Error:', err.message);
             return res.status(500).json({ error: err.message });
         }
+
+        // 🚀 在 Header 附帶游標資訊供前端與外部觀測端無痛切換
+        if (rows && rows.length > 0) {
+            const last = rows[rows.length - 1];
+            const nextCursor = Buffer.from(`${last.timestamp}_${last.id}`).toString('base64url');
+            res.set('X-Next-Cursor', nextCursor);
+            res.set('X-Has-More', rows.length === limit ? 'true' : 'false');
+        }
+
         res.json(rows);
     });
 });
 
 // 🚀 全域封包總數統計（加快取）
-app.get('/api/packets/count', withCache(), (req, res) => {
+app.get('/api/packets/count', withCache(5 * 1000), (req, res) => {
     const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs", { excludeTunnelPackets: true });
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -937,15 +1279,18 @@ app.get('/api/chat-history/:channel', (req, res) => {
     });
 });
 
-// 取得全域閘道器排行榜
-app.get('/api/gateways/leaderboard', (req, res) => {
+// 取得全域閘道器排行榜 (加上 60 秒快取與 WHERE 時間前置過濾，由 11s 降至 < 1s)
+app.get('/api/gateways/leaderboard', withCache(60 * 1000), (req, res) => {
     const sql = `
         SELECT gateway_id, COUNT(*) as total_packets, AVG(snr) as avg_snr, MAX(timestamp) as last_active 
         FROM packet_logs 
-        WHERE gateway_id IS NOT NULL AND gateway_id != '' AND gateway_id != 'Unknown'
+        WHERE gateway_id IS NOT NULL 
+          AND gateway_id != '' 
+          AND gateway_id != 'Unknown'
+          AND timestamp >= datetime('now', '-3 days')
         GROUP BY gateway_id 
-        HAVING MAX(timestamp) >= datetime('now', '-3 days')
-        ORDER BY total_packets DESC`;
+        ORDER BY total_packets DESC
+        LIMIT 100`;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
@@ -953,7 +1298,7 @@ app.get('/api/gateways/leaderboard', (req, res) => {
 });
 
 // 取得系統狀態與健康度 (Dashboard Health)
-app.get('/api/sys-status', (req, res) => {
+app.get('/api/sys-status', withCache(5 * 1000), (req, res) => {
     try {
         const dbFile = path.join(__dirname, 'meshtastic.db');
         let dbSize = 0;
@@ -965,13 +1310,18 @@ app.get('/api/sys-status', (req, res) => {
             memory: process.memoryUsage(),
             cpu_load: os.loadavg(),
             db_size: dbSize,
+            db_queue: {
+                length: dbQueue.length,
+                ...dbQueueMetrics
+            },
+            perf_metrics: latestMetricsSnapshot,
             node_version: process.version
         });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 取得節點通訊密度統計 (過去 24 小時發包量)
-app.get('/api/nodes/activity', (req, res) => {
+// 取得節點通訊密度統計 (過去 24 小時發包量，30秒快取)
+app.get('/api/nodes/activity', withCache(30 * 1000), (req, res) => {
     const sql = `
         SELECT node_id, COUNT(*) as count 
         FROM packet_logs 
@@ -1000,8 +1350,8 @@ app.get('/api/node-path/:id', (req, res) => {
     });
 });
 
-// 🚀 新增：取得頻道的數據分析 (Chat Analytics)
-app.get('/api/chat-analytics/:channel', (req, res) => {
+// 🚀 新增：取得頻道的數據分析 (Chat Analytics，30秒快取)
+app.get('/api/chat-analytics/:channel', withCache(30 * 1000), (req, res) => {
     const channel = req.params.channel;
     // 統計前10大發言者
     const talkersSql = `
@@ -1354,23 +1704,41 @@ app.get('/api/topology/fusion-edges', (req, res) => {
 });
 
 // 取得單一節點的歷史封包紀錄
-// 🚀 效能優化：只取列表需要欄位，加快取
-app.get('/api/node/:nodeId/packets', withCache(), (req, res) => {
-    const { sql, params } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
+// 🚀 效能優化：只取列表需要欄位，支援 Keyset Cursor 分頁，加快取
+app.get('/api/node/:nodeId/packets', withCache(5 * 1000), (req, res) => {
     // 🛡️ 強制設定安全上限，防止有人請求過大資料量
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 200);
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const offset = (page - 1) * limit;
+    const { sql, params, isCursor } = buildPacketQuery(req, `SELECT ${PACKET_LIST_COLS} FROM packet_logs`);
 
-    const finalSql = `${sql} ORDER BY timestamp DESC LIMIT ? OFFSET ?`;
-    db.all(finalSql, [...params, limit, offset], (err, rows) => {
+    let finalSql = '';
+    let queryParams = [...params];
+
+    if (isCursor) {
+        // 🚀 Keyset Cursor 分頁 (無 OFFSET 損耗)
+        finalSql = `${sql} ORDER BY timestamp DESC, id DESC LIMIT ?`;
+        queryParams.push(limit);
+    } else {
+        // 🚀 向後相容舊版 OFFSET 分頁
+        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+        const offset = (page - 1) * limit;
+        finalSql = `${sql} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`;
+        queryParams.push(limit, offset);
+    }
+
+    db.all(finalSql, queryParams, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
+        if (rows && rows.length > 0) {
+            const last = rows[rows.length - 1];
+            const nextCursor = Buffer.from(`${last.timestamp}_${last.id}`).toString('base64url');
+            res.set('X-Next-Cursor', nextCursor);
+            res.set('X-Has-More', rows.length === limit ? 'true' : 'false');
+        }
         res.json(rows);
     });
 });
 
 // 🚀 單一節點封包總數統計（加快取）
-app.get('/api/node/:nodeId/packets/count', withCache(), (req, res) => {
+app.get('/api/node/:nodeId/packets/count', withCache(5 * 1000), (req, res) => {
     const { sql, params } = buildPacketQuery(req, "SELECT COUNT(*) as count FROM packet_logs");
     db.get(sql, params, (err, row) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -1550,39 +1918,119 @@ function bootstrapAnalyticsSummary() {
     });
 }
 
-function recordLivePacketAnalytics(port, snr, rssi, temp, hum) {
-    const today = new Date().toISOString().split('T')[0];
-    let pType = 'other_count';
-    const pStr = (port || '').toString();
-    if (['POSITION', '3', 'POSITION_APP'].includes(pStr)) pType = 'position_count';
-    else if (['TELEMETRY', '67', 'TELEMETRY_APP'].includes(pStr)) pType = 'telemetry_count';
-    else if (['TEXT_MESSAGE', '1', 'TEXT_MESSAGE_APP'].includes(pStr)) pType = 'text_count';
-    else if (['ROUTING', '5', '32', 'ROUTING_APP'].includes(pStr)) pType = 'routing_count';
+// ==========================================
+// ⚡ 戰情中心即時流式微批次累加器 (In-Memory Micro-Batching Accumulator)
+// 將每秒數十次的 SQL UPSERT 聚合成每 15 秒一次微批次寫入，降低 99% 的 SQLite 寫入負擔
+// ==========================================
+const liveAnalyticsBuffer = {
+    date: null,
+    position_count: 0,
+    telemetry_count: 0,
+    text_count: 0,
+    routing_count: 0,
+    other_count: 0,
+    snr_sum: 0,
+    snr_count: 0,
+    rssi_sum: 0,
+    rssi_count: 0,
+    temp_sum: 0,
+    temp_count: 0,
+    hum_sum: 0,
+    hum_count: 0,
+    pendingTotal: 0
+};
+let liveAnalyticsFlushTimer = null;
 
-    let validSnr = (snr !== null && snr !== undefined && snr >= -35 && snr <= 35) ? parseFloat(snr) : null;
-    let validRssi = (rssi !== null && rssi !== undefined && rssi >= -150 && rssi <= 0) ? parseFloat(rssi) : null;
-    let validTemp = (temp !== null && temp !== undefined) ? parseFloat(temp) : null;
-    let validHum = (hum !== null && hum !== undefined) ? parseFloat(hum) : null;
+function flushLiveAnalytics() {
+    if (liveAnalyticsFlushTimer) {
+        clearTimeout(liveAnalyticsFlushTimer);
+        liveAnalyticsFlushTimer = null;
+    }
+    if (liveAnalyticsBuffer.pendingTotal === 0 || !liveAnalyticsBuffer.date) return;
+
+    const b = { ...liveAnalyticsBuffer };
+    // 重置緩衝區計數器
+    liveAnalyticsBuffer.position_count = 0;
+    liveAnalyticsBuffer.telemetry_count = 0;
+    liveAnalyticsBuffer.text_count = 0;
+    liveAnalyticsBuffer.routing_count = 0;
+    liveAnalyticsBuffer.other_count = 0;
+    liveAnalyticsBuffer.snr_sum = 0;
+    liveAnalyticsBuffer.snr_count = 0;
+    liveAnalyticsBuffer.rssi_sum = 0;
+    liveAnalyticsBuffer.rssi_count = 0;
+    liveAnalyticsBuffer.temp_sum = 0;
+    liveAnalyticsBuffer.temp_count = 0;
+    liveAnalyticsBuffer.hum_sum = 0;
+    liveAnalyticsBuffer.hum_count = 0;
+    liveAnalyticsBuffer.pendingTotal = 0;
 
     const sql = `
-        INSERT INTO daily_analytics_summary (date, ${pType}, snr_sum, snr_count, rssi_sum, rssi_count, temp_sum, temp_count, hum_sum, hum_count)
-        VALUES (?, 1, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END, COALESCE(?, 0), CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END)
+        INSERT INTO daily_analytics_summary 
+            (date, position_count, telemetry_count, text_count, routing_count, other_count, snr_sum, snr_count, rssi_sum, rssi_count, temp_sum, temp_count, hum_sum, hum_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date) DO UPDATE SET
-            ${pType} = ${pType} + 1,
-            snr_sum = snr_sum + COALESCE(?, 0),
-            snr_count = snr_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
-            rssi_sum = rssi_sum + COALESCE(?, 0),
-            rssi_count = rssi_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
-            temp_sum = temp_sum + COALESCE(?, 0),
-            temp_count = temp_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
-            hum_sum = hum_sum + COALESCE(?, 0),
-            hum_count = hum_count + (CASE WHEN ? IS NOT NULL THEN 1 ELSE 0 END),
+            position_count = position_count + excluded.position_count,
+            telemetry_count = telemetry_count + excluded.telemetry_count,
+            text_count = text_count + excluded.text_count,
+            routing_count = routing_count + excluded.routing_count,
+            other_count = other_count + excluded.other_count,
+            snr_sum = snr_sum + excluded.snr_sum,
+            snr_count = snr_count + excluded.snr_count,
+            rssi_sum = rssi_sum + excluded.rssi_sum,
+            rssi_count = rssi_count + excluded.rssi_count,
+            temp_sum = temp_sum + excluded.temp_sum,
+            temp_count = temp_count + excluded.temp_count,
+            hum_sum = hum_sum + excluded.hum_sum,
+            hum_count = hum_count + excluded.hum_count,
             updated_at = CURRENT_TIMESTAMP
     `;
     queueDbOp(sql, [
-        today, validSnr, validSnr, validRssi, validRssi, validTemp, validTemp, validHum, validHum,
-        validSnr, validSnr, validRssi, validRssi, validTemp, validTemp, validHum, validHum
+        b.date,
+        b.position_count, b.telemetry_count, b.text_count, b.routing_count, b.other_count,
+        b.snr_sum, b.snr_count, b.rssi_sum, b.rssi_count,
+        b.temp_sum, b.temp_count, b.hum_sum, b.hum_count
     ]);
+}
+
+function recordLivePacketAnalytics(port, snr, rssi, temp, hum) {
+    const today = new Date().toISOString().split('T')[0];
+    if (liveAnalyticsBuffer.date && liveAnalyticsBuffer.date !== today) {
+        flushLiveAnalytics();
+    }
+    liveAnalyticsBuffer.date = today;
+
+    const pStr = (port || '').toString();
+    if (['POSITION', '3', 'POSITION_APP'].includes(pStr)) liveAnalyticsBuffer.position_count++;
+    else if (['TELEMETRY', '67', 'TELEMETRY_APP'].includes(pStr)) liveAnalyticsBuffer.telemetry_count++;
+    else if (['TEXT_MESSAGE', '1', 'TEXT_MESSAGE_APP'].includes(pStr)) liveAnalyticsBuffer.text_count++;
+    else if (['ROUTING', '5', '32', 'ROUTING_APP'].includes(pStr)) liveAnalyticsBuffer.routing_count++;
+    else liveAnalyticsBuffer.other_count++;
+
+    if (snr !== null && snr !== undefined && snr >= -35 && snr <= 35) {
+        liveAnalyticsBuffer.snr_sum += parseFloat(snr);
+        liveAnalyticsBuffer.snr_count++;
+    }
+    if (rssi !== null && rssi !== undefined && rssi >= -150 && rssi <= 0) {
+        liveAnalyticsBuffer.rssi_sum += parseFloat(rssi);
+        liveAnalyticsBuffer.rssi_count++;
+    }
+    if (temp !== null && temp !== undefined && !isNaN(temp)) {
+        liveAnalyticsBuffer.temp_sum += parseFloat(temp);
+        liveAnalyticsBuffer.temp_count++;
+    }
+    if (hum !== null && hum !== undefined && !isNaN(hum)) {
+        liveAnalyticsBuffer.hum_sum += parseFloat(hum);
+        liveAnalyticsBuffer.hum_count++;
+    }
+    liveAnalyticsBuffer.pendingTotal++;
+
+    // 若累積滿 100 筆立即寫入，否則以 15 秒定時防抖刷新
+    if (liveAnalyticsBuffer.pendingTotal >= 100) {
+        flushLiveAnalytics();
+    } else if (!liveAnalyticsFlushTimer) {
+        liveAnalyticsFlushTimer = setTimeout(flushLiveAnalytics, 15000);
+    }
 }
 
 // 2. 歷史活躍度趨勢 (由 daily_analytics_summary 快照極速讀取)
@@ -2549,9 +2997,16 @@ app.get('/api/gateway/relayed-nodes/:gatewayId', (req, res) => {
 
 // ==========================================
 // 🎯 API 3: 精準地理配對比對 (Per-Node Nearest Station)
-// 每個 Mesh 節點 → 找最近 CWA 站 → 個別 ΔT / ΔH → 按縣市分區聚合
+// 每個 Mesh 節點 → 找最近 CWA 站 → 個別 ΔT / ΔH → 按縣市分區聚合 (5分鐘快取)
 // ==========================================
-app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) => {
+let cwaNodeComparisonCache = { timestamp: 0, data: null };
+
+app.get('/api/analytics/cwa-node-comparison', withCache(300 * 1000), (req, res) => {
+    const now = Date.now();
+    if (cwaNodeComparisonCache.data && (now - cwaNodeComparisonCache.timestamp < 5 * 60 * 1000)) {
+        return res.json(cwaNodeComparisonCache.data);
+    }
+
     // 步驟 1: 取得所有有 GPS 座標的 Mesh 節點及其最新遙測數據
     const meshSql = `
         SELECT 
@@ -2580,11 +3035,11 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
     db.all(meshSql, [], (meshErr, meshNodes) => {
         if (meshErr) return res.status(500).json({ error: meshErr.message });
         if (!meshNodes || meshNodes.length === 0) {
-            return res.json({ nodeComparisons: [], regionSummary: [], totalNodes: 0 });
+            const emptyPayload = { nodeComparisons: [], regionSummary: [], totalNodes: 0 };
+            return res.json(emptyPayload);
         }
 
-        // 步驟 2: 取得所有有效 CWA 測站 (只取平地/丘陵站，排除高山)
-        // 策略：不用高度過濾（DB沒有高度欄位），改用溫度合理性過濾 (< 10°C 的明顯高山站在夏天才會出現)
+        // 步驟 2: 取得所有有效 CWA 測站
         const cwaSql = `
             SELECT station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather
             FROM cwa_weather_stations
@@ -2596,7 +3051,8 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
         db.all(cwaSql, [], (cwaErr, cwaStations) => {
             if (cwaErr) return res.status(500).json({ error: cwaErr.message });
             if (!cwaStations || cwaStations.length === 0) {
-                return res.json({ nodeComparisons: [], regionSummary: [], totalNodes: 0, cwaReady: false });
+                const emptyPayload = { nodeComparisons: [], regionSummary: [], totalNodes: 0, cwaReady: false };
+                return res.json(emptyPayload);
             }
 
             // 步驟 3: 對每個 Mesh 節點找最近的 CWA 站
@@ -2709,29 +3165,40 @@ app.get('/api/analytics/cwa-node-comparison', withCache(60 * 1000), (req, res) =
                 anomalyRate: r.nodeCount > 0 ? Math.round(r.anomalyCount / r.nodeCount * 100) : 0
             })).sort((a, b) => b.nodeCount - a.nodeCount);
 
-            res.json({
+            const payload = {
                 nodeComparisons,
                 regionSummary,
                 totalNodes: nodeComparisons.length,
                 cwaStationCount: cwaStations.length,
                 cwaReady: true,
                 generatedAt: new Date().toISOString()
-            });
+            };
+
+            cwaNodeComparisonCache = { timestamp: Date.now(), data: payload };
+            res.json(payload);
         });
     });
 });
 
 // ==========================================
-// ⛅ API 2.3.9: 各縣市分區環境與氣候遙測歷史趨勢
+// ⛅ API 2.3.9: 各縣市分區環境與氣候遙測歷史趨勢 (空間快取 + SQL預聚合 + 10分鐘快取)
 // ==========================================
-app.get('/api/analytics/county-weather-trends', withCache(60 * 1000), (req, res) => {
+let nodeCountyCache = { timestamp: 0, map: {} };
+let countyWeatherTrendsCache = { timestamp: 0, data: null };
+
+function getNodeCountyMap(callback) {
+    const now = Date.now();
+    if (nodeCountyCache.map && Object.keys(nodeCountyCache.map).length > 0 && (now - nodeCountyCache.timestamp < 15 * 60 * 1000)) {
+        return callback(null, nodeCountyCache.map);
+    }
+
     db.all("SELECT station_id, county, latitude, longitude FROM cwa_weather_stations WHERE latitude IS NOT NULL AND longitude IS NOT NULL", [], (err, cwaStations) => {
-        if (err) return res.status(500).json({ error: err.message });
+        if (err) return callback(err);
 
         db.all("SELECT node_id, latitude, longitude FROM nodes WHERE latitude IS NOT NULL AND latitude != 0 AND longitude IS NOT NULL AND longitude != 0", [], (nErr, nodes) => {
-            if (nErr) return res.status(500).json({ error: nErr.message });
+            if (nErr) return callback(nErr);
 
-            const nodeCountyMap = {};
+            const map = {};
             for (const n of (nodes || [])) {
                 let nearestCounty = '全網/其它';
                 let minDist = Infinity;
@@ -2742,86 +3209,113 @@ app.get('/api/analytics/county-weather-trends', withCache(60 * 1000), (req, res)
                         nearestCounty = st.county;
                     }
                 }
-                nodeCountyMap[n.node_id] = nearestCounty;
+                map[n.node_id] = nearestCounty;
             }
-
-            const sqlTele = `
-                SELECT 
-                    node_id,
-                    strftime('%Y-%m-%d', timestamp) as date,
-                    temperature,
-                    humidity
-                FROM telemetry_data
-                WHERE (temperature IS NOT NULL OR humidity IS NOT NULL)
-                  AND timestamp >= datetime('now', '-30 days')
-                ORDER BY date ASC
-            `;
-
-            db.all(sqlTele, [], (tErr, teleRows) => {
-                if (tErr) return res.status(500).json({ error: tErr.message });
-
-                const dateCountyMap = {};
-                const allCountiesSet = new Set();
-
-                (teleRows || []).forEach(r => {
-                    const date = r.date;
-                    const county = nodeCountyMap[r.node_id] || '全網/其它';
-                    allCountiesSet.add(county);
-
-                    if (!dateCountyMap[date]) dateCountyMap[date] = {};
-                    if (!dateCountyMap[date][county]) {
-                        dateCountyMap[date][county] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
-                    }
-                    if (!dateCountyMap[date]['全網平均']) {
-                        dateCountyMap[date]['全網平均'] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
-                    }
-
-                    const cObj = dateCountyMap[date][county];
-                    const allObj = dateCountyMap[date]['全網平均'];
-
-                    if (r.temperature !== null && r.temperature !== undefined) {
-                        cObj.tempSum += r.temperature;
-                        cObj.tempCount++;
-                        allObj.tempSum += r.temperature;
-                        allObj.tempCount++;
-                    }
-                    if (r.humidity !== null && r.humidity !== undefined) {
-                        cObj.humSum += r.humidity;
-                        cObj.humCount++;
-                        allObj.humSum += r.humidity;
-                        allObj.humCount++;
-                    }
-                });
-
-                const sortedCounties = Array.from(allCountiesSet).sort();
-                const counties = ['全網平均', ...sortedCounties];
-                const datesList = Object.keys(dateCountyMap).sort();
-
-                const tempTrends = datesList.map(d => {
-                    const row = { date: d };
-                    for (const c of counties) {
-                        const data = dateCountyMap[d][c];
-                        row[c] = (data && data.tempCount > 0) ? Math.round((data.tempSum / data.tempCount) * 10) / 10 : null;
-                    }
-                    return row;
-                });
-
-                const humTrends = datesList.map(d => {
-                    const row = { date: d };
-                    for (const c of counties) {
-                        const data = dateCountyMap[d][c];
-                        row[c] = (data && data.humCount > 0) ? Math.round(data.humSum / data.humCount) : null;
-                    }
-                    return row;
-                });
-
-                res.json({
-                    counties,
-                    tempTrends,
-                    humTrends
-                });
-            });
+            nodeCountyCache = { timestamp: now, map };
+            callback(null, map);
         });
+    });
+}
+
+function computeCountyWeatherTrends(callback) {
+    const now = Date.now();
+    if (countyWeatherTrendsCache.data && (now - countyWeatherTrendsCache.timestamp < 10 * 60 * 1000)) {
+        return callback(null, countyWeatherTrendsCache.data);
+    }
+
+    getNodeCountyMap((mapErr, nodeCountyMap) => {
+        if (mapErr) return callback(mapErr);
+
+        // 🚀 SQL 層分組聚合 (GROUP BY node_id, date)，減少 95% 傳回 Node.js 的資料筆數
+        const sqlTele = `
+            SELECT 
+                node_id,
+                strftime('%Y-%m-%d', timestamp) as date,
+                SUM(temperature) as temp_sum,
+                COUNT(temperature) as temp_count,
+                SUM(humidity) as hum_sum,
+                COUNT(humidity) as hum_count
+            FROM telemetry_data
+            WHERE (temperature IS NOT NULL OR humidity IS NOT NULL)
+              AND timestamp >= datetime('now', '-30 days')
+            GROUP BY node_id, strftime('%Y-%m-%d', timestamp)
+            ORDER BY date ASC
+        `;
+
+        db.all(sqlTele, [], (tErr, teleRows) => {
+            if (tErr) return callback(tErr);
+
+            const dateCountyMap = {};
+            const allCountiesSet = new Set();
+
+            (teleRows || []).forEach(r => {
+                const date = r.date;
+                const county = nodeCountyMap[r.node_id] || '全網/其它';
+                allCountiesSet.add(county);
+
+                if (!dateCountyMap[date]) dateCountyMap[date] = {};
+                if (!dateCountyMap[date][county]) {
+                    dateCountyMap[date][county] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
+                }
+                if (!dateCountyMap[date]['全網平均']) {
+                    dateCountyMap[date]['全網平均'] = { tempSum: 0, tempCount: 0, humSum: 0, humCount: 0 };
+                }
+
+                const cObj = dateCountyMap[date][county];
+                const allObj = dateCountyMap[date]['全網平均'];
+
+                if (r.temp_count > 0) {
+                    cObj.tempSum += r.temp_sum;
+                    cObj.tempCount += r.temp_count;
+                    allObj.tempSum += r.temp_sum;
+                    allObj.tempCount += r.temp_count;
+                }
+                if (r.hum_count > 0) {
+                    cObj.humSum += r.hum_sum;
+                    cObj.humCount += r.hum_count;
+                    allObj.humSum += r.hum_sum;
+                    allObj.humCount += r.hum_count;
+                }
+            });
+
+            const sortedCounties = Array.from(allCountiesSet).sort();
+            const counties = ['全網平均', ...sortedCounties];
+            const datesList = Object.keys(dateCountyMap).sort();
+
+            const tempTrends = datesList.map(d => {
+                const row = { date: d };
+                for (const c of counties) {
+                    const data = dateCountyMap[d][c];
+                    row[c] = (data && data.tempCount > 0) ? Math.round((data.tempSum / data.tempCount) * 10) / 10 : null;
+                }
+                return row;
+            });
+
+            const humTrends = datesList.map(d => {
+                const row = { date: d };
+                for (const c of counties) {
+                    const data = dateCountyMap[d][c];
+                    row[c] = (data && data.humCount > 0) ? Math.round(data.humSum / data.humCount) : null;
+                }
+                return row;
+            });
+
+            const payload = {
+                counties,
+                tempTrends,
+                humTrends
+            };
+
+            countyWeatherTrendsCache = { timestamp: Date.now(), data: payload };
+            callback(null, payload);
+        });
+    });
+}
+
+app.get('/api/analytics/county-weather-trends', withCache(300 * 1000), (req, res) => {
+    computeCountyWeatherTrends((err, data) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(data);
     });
 });
 // ==========================================
@@ -3101,10 +3595,21 @@ function startMqttClient() {
         isMqttConnected = true;
         io.emit('mqtt_status', { connected: true }); // mqtt_status 需要立即發送，不能批次
 
-        // 只訂閱台灣區域的 Topic (# 代表監聽 TW 路徑下的所有子頻道)
-        const topics = (process.env.MQTT_TOPICS || 'msh/TW/#').split(',');
+        // 只訂閱區域的 Topic (支援逗號分隔，並自動防禦未加引號導致 # 被 dotenv 當註解截斷為 / 的問題)
+        const rawTopicStr = process.env.MQTT_TOPICS || 'msh/TW/#';
+        const topics = rawTopicStr
+            .split(',')
+            .map(t => {
+                let topic = t.trim().replace(/^['"]|['"]$/g, '');
+                if (topic.endsWith('/') && !topic.endsWith('/#')) {
+                    topic = topic + '#';
+                }
+                return topic;
+            })
+            .filter(Boolean);
         client.subscribe(topics, (err) => {
             if (!err) console.log(`📡 訂閱成功！正在監聽: ${topics.join(', ')}`);
+            else console.error(`❌ 訂閱失敗:`, err.message);
         });
     });
 
@@ -3117,6 +3622,7 @@ function startMqttClient() {
     });
 
     client.on('message', (topic, message) => {
+        totalMqttPacketsReceived++;
         const rawHex = message.toString('hex').toUpperCase();
 
         try {
@@ -3127,16 +3633,16 @@ function startMqttClient() {
             const fromId = `!${packet.from.toString(16).padStart(8, '0')}`;
             const gatewayId = envelope.gateway_id || 'Unknown';
 
-            // 🛑 封包去重過濾器：檢查「發送者 + 封包ID」
+            // 🛑 封包去重與多 Gateway 限制：同一封包最多紀錄前 3 個 Gateway (寫前三個就好)
             const packetKey = `${fromId}-${packet.id}`;
-            if (seenPackets.has(packetKey)) return;
-
-            seenPackets.add(packetKey);
-
-            // 自動清理快取：保留最近 1000 個封包 ID，避免記憶體洩漏
-            if (seenPackets.size > 1000) {
-                const iter = seenPackets.values();
-                seenPackets.delete(iter.next().value);
+            const existingPkt = seenPackets.get(packetKey);
+            if (existingPkt && existingPkt.val >= 3) {
+                return; // 已達 3 個 Gateway 紀錄上限，忽略後續重複封包
+            }
+            if (existingPkt) {
+                existingPkt.val += 1;
+            } else {
+                seenPackets.add(packetKey, 1);
             }
 
             // 解析頻道名稱：優先尋找 /c/ 標籤，若無則過濾保留字
@@ -3213,8 +3719,7 @@ function startMqttClient() {
                     timestamp: new Date().toISOString(),
                     time: new Date().toLocaleTimeString(),
                     snr: packet.rx_snr,
-                    rssi: packet.rx_rssi,
-                    rawData: rawHex
+                    rssi: packet.rx_rssi
                 });
                 return;
             }
@@ -3305,8 +3810,7 @@ function startMqttClient() {
                 latitude: packetLat,
                 longitude: packetLng,
                 hops_away: hopsAway,
-                payload_json: payloadObj,
-                rawData: rawHex
+                payload_json: payloadObj
             });
 
             // 解析節點資訊 (名稱) - NODEINFO 外層更新

@@ -76,7 +76,6 @@ const TopologyGraph: React.FC<TopologyGraphProps> = ({ nodes, edges, darkMode })
       snr: e.snr
     }));
 
-    console.log("TopologyGraph Data:", { edgesCount: edges.length, validNodes: validNodeIds.size, filteredEdges: filteredEdges.length, graphNodes: graphNodes.length, graphLinks: graphLinks.length, sampleEdge: graphLinks[0] });
     return { nodes: graphNodes, links: graphLinks };
   }, [nodes, edges, filterLowConfidence, showOnlyDirect]);
 
@@ -199,4 +198,4 @@ const TopologyGraph: React.FC<TopologyGraphProps> = ({ nodes, edges, darkMode })
   );
 };
 
-export default TopologyGraph;
+export default React.memo(TopologyGraph);

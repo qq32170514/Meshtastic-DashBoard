@@ -46,12 +46,19 @@ function fmt(v: number | null | undefined): string {
 }
 
 function getDeltaColor(dt: number | null): string {
-  if (dt === null) return '#94a3b8';
-  const abs = Math.abs(dt);
-  if (abs >= 5) return '#ef4444';
-  if (abs >= 3) return '#f97316';
-  if (abs >= 1.5) return '#facc15';
-  return '#22c55e';
+  if (dt === null || isNaN(dt)) return '#94a3b8';
+  // 暖色系：高於氣象站 (ΔT > 1.5°C)
+  if (dt >= 5.0) return '#ef4444';   // 深紅：嚴重偏高 (≥ +5°C)
+  if (dt >= 3.0) return '#f97316';   // 亮橘：異常偏高 (+3 ~ +5°C)
+  if (dt >= 1.5) return '#facc15';   // 琥珀黃：略偏高 (+1.5 ~ +3°C)
+  
+  // 冷色系：低於氣象站 (ΔT < -1.5°C)
+  if (dt <= -5.0) return '#6366f1';  // 靛青/深藍：嚴重偏低 (≤ -5°C)
+  if (dt <= -3.0) return '#3b82f6';  // 鮮藍：偏低 (-5 ~ -3°C)
+  if (dt <= -1.5) return '#38bdf8';  // 天藍：略偏冷 (-3 ~ -1.5°C)
+  
+  // 正常區間：與氣象站接近 (±1.5°C)
+  return '#22c55e';                  // 翠綠：正常接近
 }
 
 function getWeatherIcon(weather?: string): string {
@@ -258,12 +265,15 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
         
         {/* 📍 地圖圖例 (Overlay 放置於地圖右上角，與 NodeMap 一致) */}
         <div className="absolute top-3 right-3 z-[1000] pointer-events-auto backdrop-blur-md bg-slate-900/85 border border-slate-700/80 p-2.5 rounded-xl shadow-2xl text-[10px] font-mono text-slate-300 space-y-1">
-          <div className="font-bold text-cyan-400 text-[11px] mb-1">🗺️ CWA 配對圖例</div>
-          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-green-500"></span>ΔT &lt; 1.5°C 正常</div>
-          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-yellow-400"></span>1.5–3°C 偏高</div>
-          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-orange-500"></span>3–5°C 異常偏高</div>
-          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-red-500"></span>≥ 5°C 嚴重過熱</div>
-          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-blue-400" style={{ background: 'rgba(59,130,246,0.3)' }}></span>CWA 官方氣象站</div>
+          <div className="font-bold text-cyan-400 text-[11px] mb-1">🗺️ CWA 配對圖例 (冷暖溫差)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-red-500"></span>≥ +5°C 嚴重過熱 (暖)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-orange-500"></span>+3 ~ +5°C 偏高 (暖)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-yellow-400"></span>+1.5 ~ +3°C 略高 (暖)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-green-500"></span>±1.5°C 正常接近</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-sky-400"></span>-1.5 ~ -3°C 略低 (冷)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-blue-500"></span>-3 ~ -5°C 偏低 (冷)</div>
+          <div className="flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-indigo-500"></span>≤ -5°C 嚴重過冷 (冷)</div>
+          <div className="flex items-center gap-1.5 pt-0.5 border-t border-slate-700/60"><span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-blue-400" style={{ background: 'rgba(59,130,246,0.3)' }}></span>CWA 官方氣象站</div>
           {selectedCounty && (
             <div className="pt-1 border-t border-slate-700 text-cyan-300 font-bold">
               篩選: {selectedCounty}
@@ -328,7 +338,7 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
               center={[n.nodeLat, n.nodeLng]}
               radius={n.anomaly ? 11 : 8}
               pathOptions={{
-                color: n.anomaly ? '#ef4444' : getDeltaColor(n.deltaTemp),
+                color: n.anomaly ? (n.deltaTemp !== null && n.deltaTemp < 0 ? '#818cf8' : '#ef4444') : getDeltaColor(n.deltaTemp),
                 fillColor: getDeltaColor(n.deltaTemp),
                 fillOpacity: 0.88,
                 weight: n.anomaly ? 2.5 : 1.5,
@@ -343,10 +353,17 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
                   比對站：{n.cwaStationName} ({fmt(n.distanceKm)} km)<br />
                   官方：<strong style={{ color: '#60a5fa' }}>{fmt(n.cwaTemp)} °C</strong>
                   {n.cwaHumidity != null ? <span style={{ color: '#60a5fa' }}> / {fmt(n.cwaHumidity)}% RH</span> : null}<br />
-                  <strong style={{ color: n.anomaly ? '#f87171' : n.deltaTemp != null && n.deltaTemp > 0 ? '#fb923c' : '#4ade80', fontSize: '12px' }}>
+                  <strong style={{
+                    color: n.anomaly
+                      ? (n.deltaTemp !== null && n.deltaTemp < 0 ? '#818cf8' : '#f87171')
+                      : n.deltaTemp != null
+                      ? (n.deltaTemp >= 1.5 ? '#fb923c' : n.deltaTemp <= -1.5 ? '#38bdf8' : '#4ade80')
+                      : '#94a3b8',
+                    fontSize: '12px'
+                  }}>
                     ΔT = {n.deltaTemp != null ? (n.deltaTemp > 0 ? '+' : '') + fmt(n.deltaTemp) + ' °C' : '--'}
                     {n.deltaHum != null ? ` · ΔH ${n.deltaHum > 0 ? '+' : ''}${fmt(n.deltaHum)}%` : ''}
-                    {n.anomaly ? '  ⚠️ 異常過熱' : ''}
+                    {n.anomaly ? (n.deltaTemp !== null && n.deltaTemp < 0 ? '  ❄️ 異常過冷' : '  ⚠️ 異常過熱') : ''}
                   </strong>
                 </div>
               </LeafletTooltip>
