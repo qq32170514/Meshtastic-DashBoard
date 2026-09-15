@@ -4,6 +4,7 @@ import * as turf from '@turf/turf';
 import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
+import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
 
 // Traceroute 多路徑型別
 export interface TracerouteHop {
@@ -144,6 +145,7 @@ interface NodeMapProps {
   traceroutePaths?: TraceroutePath[];
   isMapFullScreen?: boolean;
   mapCenter?: [number, number];
+  darkMode?: boolean;
 }
 
 const getHopColor = (hops: number) => {
@@ -157,7 +159,8 @@ const getHopColor = (hops: number) => {
   return "#ef4444";             // 5+ 跳: 紅色
 };
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter, darkMode = true }: NodeMapProps) => {
+  const [tileStyle, setTileStyle] = useState<string>(() => getDefaultTileStyle(darkMode));
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const [mapColorMode, setMapColorMode] = useState<'role' | 'cu'>('role');
   const [selectedGwId, setSelectedGwId] = useState<string | null>(null);
@@ -168,6 +171,15 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     relayedNodes: any[];
   } | null>(null);
   const [isHovered, setIsHovered] = useState(false);
+
+  // 監聽外部或跨元件底圖切換事件
+  useEffect(() => {
+    const handleTileChange = (e: any) => {
+      if (e.detail) setTileStyle(e.detail);
+    };
+    window.addEventListener('meshtastic-map-tile-change', handleTileChange);
+    return () => window.removeEventListener('meshtastic-map-tile-change', handleTileChange);
+  }, []);
 
   // 🚀 解決重疊 Cluster 自動收回與 Popup 自動關閉的狀態管理器 (整合防抖鎖定機制與 DOM 狀態防護)
   const [localNodes, setLocalNodes] = useState(nodes);
@@ -533,10 +545,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         <MapInvalidator />
         <MapController center={mapCenter} />
         <MapEventListener />
-        <TileLayer 
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        />
+        <AppTileLayer tileStyle={tileStyle} darkMode={darkMode} />
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
         {(showTraceroute || showHopGrid) && coverageData.map((grid, i) => {
@@ -1043,8 +1052,21 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         </div>
       )}
 
+      {/* 🗺️ 地圖風格切換按鈕 (右上控制群組，與全螢幕按鈕並列) */}
+      <div className="absolute top-4 right-16 z-[1000] pointer-events-auto">
+        <MapStyleSelector
+          currentStyle={tileStyle}
+          onSelect={setTileStyle}
+          darkMode={darkMode}
+        />
+      </div>
+
       {/* 圖例 Legend Overlay */}
-      <div className="absolute bottom-4 right-4 bg-white/90 backdrop-blur-sm p-3 rounded-xl shadow-xl z-[1000] border border-slate-200 pointer-events-auto min-w-[160px] transition-all duration-300">
+      <div className={`absolute bottom-4 right-4 backdrop-blur-md p-3 rounded-xl shadow-xl z-[1000] border pointer-events-auto min-w-[160px] transition-all duration-300 ${
+        darkMode 
+          ? 'bg-slate-900/90 border-slate-700/80 text-slate-200 shadow-slate-950/50' 
+          : 'bg-white/90 border-slate-200 text-slate-700'
+      }`}>
         <div
           className="flex items-center justify-between cursor-pointer group"
           onClick={() => setIsLegendExpanded(!isLegendExpanded)}

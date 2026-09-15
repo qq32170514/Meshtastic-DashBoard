@@ -114,8 +114,8 @@ app.use(helmet({
             scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
-            imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com"],
-            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com"],
+            imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com", "https://*.tile.openstreetmap.fr"],
+            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com", "https://*.tile.openstreetmap.fr"],
             objectSrc: ["'none'"],
             upgradeInsecureRequests: null
         }
@@ -2304,47 +2304,39 @@ function fetchAndSaveCWAData() {
                 if (stations.length === 0) return;
 
                 let updatedCount = 0;
-                db.serialize(() => {
-                    db.run('BEGIN TRANSACTION');
-                    const stmt = db.prepare(`
-                        INSERT INTO cwa_weather_stations 
-                        (station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(station_id) DO UPDATE SET
-                            temperature = excluded.temperature,
-                            humidity = excluded.humidity,
-                            weather = excluded.weather,
-                            updated_at = CURRENT_TIMESTAMP
-                    `);
+                const cwaUpsertSql = `
+                    INSERT INTO cwa_weather_stations 
+                    (station_id, station_name, county, town, latitude, longitude, temperature, humidity, weather, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(station_id) DO UPDATE SET
+                        temperature = excluded.temperature,
+                        humidity = excluded.humidity,
+                        weather = excluded.weather,
+                        updated_at = CURRENT_TIMESTAMP
+                `;
 
-                    stations.forEach(s => {
-                        const id = s.StationId;
-                        const name = s.StationName;
-                        const county = s.GeoInfo?.CountyName || '';
-                        const town = s.GeoInfo?.TownName || '';
-                        const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
-                        const lat = parseFloat(coords?.StationLatitude || s.Latitude);
-                        const lng = parseFloat(coords?.StationLongitude || s.Longitude);
+                stations.forEach(s => {
+                    const id = s.StationId;
+                    const name = s.StationName;
+                    const county = s.GeoInfo?.CountyName || '';
+                    const town = s.GeoInfo?.TownName || '';
+                    const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
+                    const lat = parseFloat(coords?.StationLatitude || s.Latitude);
+                    const lng = parseFloat(coords?.StationLongitude || s.Longitude);
 
-                        const tempRaw = s.WeatherElement?.AirTemperature;
-                        const humRaw = s.WeatherElement?.RelativeHumidity;
-                        const weather = s.WeatherElement?.Weather || '';
+                    const tempRaw = s.WeatherElement?.AirTemperature;
+                    const humRaw = s.WeatherElement?.RelativeHumidity;
+                    const weather = s.WeatherElement?.Weather || '';
 
-                        let temp = (tempRaw !== undefined && tempRaw !== '-99' && tempRaw !== -99) ? parseFloat(tempRaw) : null;
-                        let hum = (humRaw !== undefined && humRaw !== '-99' && humRaw !== -99) ? parseFloat(humRaw) : null;
+                    let temp = (tempRaw !== undefined && tempRaw !== '-99' && tempRaw !== -99) ? parseFloat(tempRaw) : null;
+                    let hum = (humRaw !== undefined && humRaw !== '-99' && humRaw !== -99) ? parseFloat(humRaw) : null;
 
-                        if (id && name && !isNaN(lat) && !isNaN(lng)) {
-                            stmt.run([id, name, county, town, lat, lng, temp, hum, weather]);
-                            updatedCount++;
-                        }
-                    });
-                    stmt.finalize();
-                    db.run('COMMIT', (err) => {
-                        if (!err) {
-                            console.log(`⛅ [中央氣象署 API] 成功更新 ${updatedCount} 個台灣官方氣象站即時觀測數據！`);
-                        }
-                    });
+                    if (id && name && !isNaN(lat) && !isNaN(lng)) {
+                        queueDbOp(cwaUpsertSql, [id, name, county, town, lat, lng, temp, hum, weather]);
+                        updatedCount++;
+                    }
                 });
+                console.log(`⛅ [中央氣象署 API] 成功排入 ${updatedCount} 個台灣官方氣象站即時觀測數據！`);
             } catch (e) {
                 console.error('❌ CWA API 解析失敗:', e.message);
             }

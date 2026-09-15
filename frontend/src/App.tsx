@@ -2,7 +2,8 @@ import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react'
 import { io } from 'socket.io-client';
 import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
-import { MapContainer, TileLayer, CircleMarker, Polyline, Popup } from 'react-leaflet';
+import { MapContainer, CircleMarker, Polyline, Popup } from 'react-leaflet';
+import { AppTileLayer } from './mapTiles';
 import type { TraceroutePath } from './NodeMap';
 import PacketTypePieChart from './PacketTypePieChart';
 import NodeRecoveryQR from './NodeRecoveryQR';
@@ -355,14 +356,20 @@ const PORTNUM_NAMES: Record<string | number, string> = {
 };
 const ITEMS_PER_PAGE = 20;
 
-const ANNOUNCEMENT_TITLE = "📢 v2.4 重大版本更新公告";
-const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v2.4！
+const ANNOUNCEMENT_TITLE = "📢 v3.0 重大版本升級公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v3.0 重大里程碑版本！
 
-本次更新重點：
-1. 📱 聯絡人 QR Code 產生器：新增 Contact QR 功能，解決 App 掃描後節點隱藏問題，完美相容並支援置頂。
-2. 🗺️ 地圖重疊點優化：引入防抖發散演算法，解決重疊節點點擊展開與彈窗關閉的 Bug。
-3. ⚡ 效能與 API 優化：後端啟用 gzip 壓縮，大幅優化 telemetry 查詢效能。
-4. 📦 按需載入與分流打包：前端採用 Lazy-loading 載入地圖與圖表，首屏載入速度提升 80% 以上。
+本次升級核心亮點：
+1. 🗺️ 全新多風格圖資引擎（徹底修復 403 阻擋）：
+   - 全面替換 OpenStreetMap 志工伺服器，改用高速穩定之 Esri 與 OSM 專業圖資服務。
+   - 預設「戰術深色雷達 (Dark Canvas)」，深灰黑科技風格與節點、跳數、連線高對比完美適配。
+   - 新增右上角「底圖風格切換器」，支援深色雷達、彩色街道 (OSM HOT)、衛星空照、地形等高、簡潔淺色、開放街道 6 款圖資隨選隨換，並具備偏好自動記憶。
+2. 🌤️ 中央氣象署 (CWA) 官方數據整合：
+   - 即時串接全台氣象測站觀測數據，自動配對節點溫濕度並進行溫差異常監控。
+3. 🛰️ 多路徑 Traceroute 拓撲與訊號協同分析：
+   - 整合即時多跳封包追蹤，提供跳數、SNR 顏色映射與網狀連線邏輯拓撲。
+4. ⚡ 系統效能與安全標頭 (CSP) 全面加固：
+   - 強化 Helmet Content-Security-Policy (CSP) 安全防護，並優化前端 Lazy-loading 分流打包與 Gzip 傳輸。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
@@ -835,7 +842,7 @@ function App() {
   const [nodeListSearchQuery, setNodeListSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState('base');
   const [showAnnouncement, setShowAnnouncement] = useState(() => {
-    return localStorage.getItem('hideAnnouncement_v2_2') !== 'true';
+    return localStorage.getItem('hideAnnouncement_v3_0') !== 'true';
   });
   const [hideAnnouncementNextTime, setHideAnnouncementNextTime] = useState(false);
 
@@ -1336,10 +1343,7 @@ function App() {
             </h5>
             <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
               <MapContainer key={`pos-map-${lat}-${lon}`} center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                <TileLayer 
-                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
-                />
+                <AppTileLayer darkMode={darkMode} />
                 <CircleMarker center={[lat, lon]} radius={8} pathOptions={{ fillColor: '#22c55e', color: 'white', weight: 2, fillOpacity: 0.9 }} />
               </MapContainer>
             </div>
@@ -1403,10 +1407,7 @@ function App() {
             {points.length >= 2 ? (
               <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
                 <MapContainer key={`route-map-${points.map(p=>p.join(',')).join('|')}`} center={points[0]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                  <TileLayer 
-                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
-                  />
+                  <AppTileLayer darkMode={darkMode} />
                   {points.map((p, idx) => (
                     <CircleMarker
                       key={idx}
@@ -2561,6 +2562,7 @@ function App() {
                       showHopGrid={showHopGrid}
                       simResultMap={simResultMap}
                       simState={simState}
+                      darkMode={darkMode}
                     />
                   </div>
                 </div>
@@ -2809,6 +2811,7 @@ function App() {
                                 showTrackerHistory={true}
                                 showTraceroute={showTraceroute}
                                 showHopGrid={showHopGrid}
+                                darkMode={darkMode}
                               />
                             </React.Suspense>
                           ) : (
@@ -3308,6 +3311,7 @@ function App() {
                       traceroutePaths={traceroutePaths}
                       isMapFullScreen={isMapFullScreen}
                       mapCenter={mapCenterCoords}
+                      darkMode={darkMode}
                     />
                   </React.Suspense>
                 </div>
@@ -3404,6 +3408,7 @@ function App() {
                               showTrackerHistory={true}
                               showTraceroute={showTraceroute}
                               showHopGrid={showHopGrid}
+                              darkMode={darkMode}
                             />
                           </React.Suspense>
                         ) : (
@@ -3716,6 +3721,7 @@ function App() {
                       onSelectNode={handleShowModal}
                       showNodes={false}
                       activeTab={activeTab}
+                      darkMode={darkMode}
                     />
                   </div>
 
@@ -3957,10 +3963,7 @@ function App() {
                                   style={{ height: '100%', width: '100%' }}
                                   zoomControl={false}
                                 >
-                                  <TileLayer
-                                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                                  />
+                                  <AppTileLayer darkMode={darkMode} />
                                   {/* 發送節點 Sender (Blue) */}
                                   {hasSenderGps && (
                                     <CircleMarker
@@ -4136,7 +4139,7 @@ function App() {
                   <Activity size={12} className="text-orange-500" />
                   連續運行時間: {displayedUptime != null ? `${Math.floor(displayedUptime / 3600)}h ${Math.floor((displayedUptime % 3600) / 60)}m ${Math.floor(displayedUptime % 60)}s` : '--'}
                 </div>
-                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v2.2</div>
+                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v3.0</div>
               </div>
             </div>
           </footer>
@@ -4168,9 +4171,9 @@ function App() {
                   onChange={(e) => {
                     setHideAnnouncementNextTime(e.target.checked);
                     if (e.target.checked) {
-                      localStorage.setItem('hideAnnouncement_v2_2', 'true');
+                      localStorage.setItem('hideAnnouncement_v3_0', 'true');
                     } else {
-                      localStorage.removeItem('hideAnnouncement_v2_2');
+                      localStorage.removeItem('hideAnnouncement_v3_0');
                     }
                   }}
                 />

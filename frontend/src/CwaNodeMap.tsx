@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Polyline, Tooltip as LeafletTooltip } from 'react-leaflet';
+import React, { useState, useEffect } from 'react';
+import { MapContainer, CircleMarker, Polyline, Tooltip as LeafletTooltip } from 'react-leaflet';
+import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
 
 export interface NodeComparison {
   nodeId: string;
@@ -79,6 +80,16 @@ interface CwaNodeMapProps {
 
 export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaNodeMapProps) {
   const [selectedCounty, setSelectedCounty] = useState<string | null>(null);
+  const [tileStyle, setTileStyle] = useState<string>(() => getDefaultTileStyle(darkMode));
+
+  // 監聽全域圖資切換事件
+  useEffect(() => {
+    const handleTileChange = (e: any) => {
+      if (e.detail) setTileStyle(e.detail);
+    };
+    window.addEventListener('meshtastic-map-tile-change', handleTileChange);
+    return () => window.removeEventListener('meshtastic-map-tile-change', handleTileChange);
+  }, []);
 
   if (nodes.length === 0) {
     return <div className="text-center text-slate-500 py-16 font-mono">沒有有 GPS 座標且有氣溫遙測的節點</div>;
@@ -263,6 +274,15 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
       {/* 🗺️ 配對地圖 (含圖例懸浮地圖上方) */}
       <div className="relative rounded-2xl overflow-hidden border border-slate-800 shadow-xl" style={{ height: '520px' }}>
         
+        {/* 🗺️ 地圖風格切換按鈕 (放置於左上角，避開 Leaflet 縮放按鈕) */}
+        <div className="absolute top-3 left-14 z-[1000] pointer-events-auto">
+          <MapStyleSelector
+            currentStyle={tileStyle}
+            onSelect={setTileStyle}
+            darkMode={darkMode}
+          />
+        </div>
+
         {/* 📍 地圖圖例 (Overlay 放置於地圖右上角，與 NodeMap 一致) */}
         <div className="absolute top-3 right-3 z-[1000] pointer-events-auto backdrop-blur-md bg-slate-900/85 border border-slate-700/80 p-2.5 rounded-xl shadow-2xl text-[10px] font-mono text-slate-300 space-y-1">
           <div className="font-bold text-cyan-400 text-[11px] mb-1">🗺️ CWA 配對圖例 (冷暖溫差)</div>
@@ -287,10 +307,7 @@ export default function CwaNodeMap({ nodes, regionSummary = [], darkMode }: CwaN
           zoom={selectedCounty ? 11 : 9}
           style={{ height: '100%', width: '100%' }}
         >
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
+          <AppTileLayer tileStyle={tileStyle} darkMode={darkMode} />
 
           {/* 連線：Mesh 節點 → 配對 CWA 站 */}
           {filteredNodes.map(n => (
