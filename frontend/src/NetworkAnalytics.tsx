@@ -1522,9 +1522,15 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
                       <td className="px-4 py-3 font-mono font-bold text-blue-400">{n.cwaTemp !== null ? `${Number(n.cwaTemp).toFixed(1)} °C` : '--'}</td>
                       <td className="px-4 py-3 font-mono font-bold text-[12px]">
                         {n.deltaTemp !== null ? (
-                          <span className={n.anomaly ? 'text-red-400' : n.deltaTemp > 0 ? 'text-orange-400' : 'text-emerald-400'}>
+                          <span className={
+                            n.deltaTemp >= 1.5
+                              ? (n.deltaTemp >= 5 ? 'text-red-400 font-black' : 'text-orange-400 font-bold')
+                              : n.deltaTemp <= -1.5
+                              ? (n.deltaTemp <= -5 ? 'text-indigo-400 font-black' : 'text-sky-400 font-bold')
+                              : 'text-emerald-400 font-medium'
+                          }>
                             {n.deltaTemp > 0 ? '+' : ''}{Number(n.deltaTemp).toFixed(1)} °C
-                            {n.anomaly && ' ⚠️'}
+                            {n.anomaly && (n.deltaTemp > 0 ? ' ⚠️' : ' ❄️')}
                           </span>
                         ) : '--'}
                       </td>

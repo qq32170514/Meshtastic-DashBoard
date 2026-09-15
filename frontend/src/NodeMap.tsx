@@ -4,6 +4,7 @@ import * as turf from '@turf/turf';
 import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp } from 'lucide-react';
+import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
 
 // Traceroute 多路徑型別
 export interface TracerouteHop {
@@ -64,13 +65,34 @@ const getRecencyVisuals = (lastSeen?: string) => {
   return { filter: 'grayscale(1) brightness(0.4)' };
 };
 
-// 建立自定義彩色圖標 (SVG 渲染)
+// 🚀 建立自定義彩色圖標快取池 (避免每次重新渲染建立數百個重複的 L.divIcon 實例)
+const iconCache = new Map<string, L.DivIcon>();
+
+const getRecencyBucket = (lastSeen?: string): string => {
+  if (!lastSeen) return 'bOld';
+  const diffMs = Date.now() - new Date(lastSeen).getTime();
+  const diffMinutes = diffMs / 60000;
+  const diffHours = diffMs / 3600000;
+  if (diffMinutes < 5) return 'b5m';
+  if (diffHours < 2) return 'b2h';
+  if (diffHours < 12) return 'b12h';
+  if (diffHours < 24) return 'b24h';
+  return 'bOld';
+};
+
 const createColoredIcon = (role?: string, lastSeen?: string) => {
+  const roleKey = String(role || '').toUpperCase();
+  const recencyKey = getRecencyBucket(lastSeen);
+  const cacheKey = `${roleKey}_${recencyKey}`;
+
+  const cached = iconCache.get(cacheKey);
+  if (cached) return cached;
+
   const color = getRoleColor(role);
   const { filter } = getRecencyVisuals(lastSeen);
   const baseShadow = 'drop-shadow(0 2px 4px rgba(0,0,0,0.3))';
 
-  return L.divIcon({
+  const icon = L.divIcon({
     html: `
       <svg width="25" height="41" viewBox="0 0 25 41" fill="none" xmlns="http://www.w3.org/2000/svg" style="filter: ${baseShadow} ${filter}; transition: filter 0.5s ease;">
         <path d="M12.5 0C5.596 0 0 5.596 0 12.5C0 21.875 12.5 41 12.5 41C12.5 41 25 21.875 25 12.5C25 5.596 19.404 0 12.5 0Z" fill="${color}" stroke="white" stroke-width="1.5"/>
@@ -82,6 +104,9 @@ const createColoredIcon = (role?: string, lastSeen?: string) => {
     iconAnchor: [12, 41],
     popupAnchor: [1, -34],
   });
+
+  iconCache.set(cacheKey, icon);
+  return icon;
 };
 
 // 顏色映射函數：活躍時間越近，顏色越深
@@ -120,6 +145,7 @@ interface NodeMapProps {
   traceroutePaths?: TraceroutePath[];
   isMapFullScreen?: boolean;
   mapCenter?: [number, number];
+  darkMode?: boolean;
 }
 
 const getHopColor = (hops: number) => {
@@ -133,7 +159,8 @@ const getHopColor = (hops: number) => {
   return "#ef4444";             // 5+ 跳: 紅色
 };
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter }: NodeMapProps) => {
+const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter, darkMode = true }: NodeMapProps) => {
+  const [tileStyle, setTileStyle] = useState<string>(() => getDefaultTileStyle(darkMode));
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const [mapColorMode, setMapColorMode] = useState<'role' | 'cu'>('role');
   const [selectedGwId, setSelectedGwId] = useState<string | null>(null);
@@ -144,6 +171,15 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     relayedNodes: any[];
   } | null>(null);
   const [isHovered, setIsHovered] = useState(false);
+
+  // 監聽外部或跨元件底圖切換事件
+  useEffect(() => {
+    const handleTileChange = (e: any) => {
+      if (e.detail) setTileStyle(e.detail);
+    };
+    window.addEventListener('meshtastic-map-tile-change', handleTileChange);
+    return () => window.removeEventListener('meshtastic-map-tile-change', handleTileChange);
+  }, []);
 
   // 🚀 解決重疊 Cluster 自動收回與 Popup 自動關閉的狀態管理器 (整合防抖鎖定機制與 DOM 狀態防護)
   const [localNodes, setLocalNodes] = useState(nodes);
@@ -248,6 +284,21 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
 
   const nodesWithGPS = useMemo(() => {
     const withGPS = localNodes.filter(n => n.latitude && n.longitude);
+    const CELL_SIZE = 0.00015;
+    const grid = new Map<string, { node: Node; index: number }[]>();
+
+    // 🚀 O(N) 將座標映射至二維空間網格，避免 O(N^2) 巢狀迴圈
+    withGPS.forEach((node, index) => {
+      const cellX = Math.floor(node.latitude! / CELL_SIZE);
+      const cellY = Math.floor(node.longitude! / CELL_SIZE);
+      const key = `${cellX}_${cellY}`;
+      const bucket = grid.get(key);
+      if (bucket) {
+        bucket.push({ node, index });
+      } else {
+        grid.set(key, [{ node, index }]);
+      }
+    });
 
     const jittered: Node[] = [];
     const processedIndices = new Set<number>();
@@ -255,34 +306,33 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     for (let i = 0; i < withGPS.length; i++) {
       if (processedIndices.has(i)) continue;
 
-      // 尋找與當前節點距離在 0.00015 度（約 15 米）以內的所有其他節點
-      const group: { node: Node; index: number }[] = [{ node: withGPS[i], index: i }];
-      const lat1 = withGPS[i].latitude!;
-      const lng1 = withGPS[i].longitude!;
+      const nodeI = withGPS[i];
+      const cellX = Math.floor(nodeI.latitude! / CELL_SIZE);
+      const cellY = Math.floor(nodeI.longitude! / CELL_SIZE);
+      const group: { node: Node; index: number }[] = [];
 
-      for (let j = i + 1; j < withGPS.length; j++) {
-        if (processedIndices.has(j)) continue;
-        const lat2 = withGPS[j].latitude!;
-        const lng2 = withGPS[j].longitude!;
-
-        const diffLat = lat1 - lat2;
-        const diffLng = lng1 - lng2;
-        const distanceDegrees = Math.sqrt(diffLat * diffLat + diffLng * diffLng);
-
-        if (distanceDegrees < 0.00015) {
-          group.push({ node: withGPS[j], index: j });
+      // 🚀 只檢索相鄰 3x3 空間網格 (O(1) 區域檢索)
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const neighborBucket = grid.get(`${cellX + dx}_${cellY + dy}`);
+          if (!neighborBucket) continue;
+          for (const item of neighborBucket) {
+            if (processedIndices.has(item.index)) continue;
+            const diffLat = nodeI.latitude! - item.node.latitude!;
+            const diffLng = nodeI.longitude! - item.node.longitude!;
+            if (Math.sqrt(diffLat * diffLat + diffLng * diffLng) < CELL_SIZE) {
+              group.push(item);
+            }
+          }
         }
       }
 
-      // 標記這些已被分組的節點索引
       group.forEach(item => processedIndices.add(item.index));
 
-      // 進行發散
-      if (group.length === 1) {
-        jittered.push(group[0].node);
+      if (group.length <= 1) {
+        jittered.push(nodeI);
       } else {
         const count = group.length;
-        // 發散半徑大約 0.00015 度（約 15 米），這使得各個點之間至少相隔約 25 米，在高縮放級別可清晰並排點擊
         const radius = 0.00015;
         group.forEach((item, idx) => {
           const angle = (idx * 2 * Math.PI) / count;
@@ -495,10 +545,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         <MapInvalidator />
         <MapController center={mapCenter} />
         <MapEventListener />
-        <TileLayer 
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" 
-        />
+        <AppTileLayer tileStyle={tileStyle} darkMode={darkMode} />
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
         {(showTraceroute || showHopGrid) && coverageData.map((grid, i) => {
@@ -536,16 +583,18 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
               </Rectangle>
             );
           } else if (showTraceroute) {
-            // 覆蓋範圍模式：顯示訊號密度 (單色青色漸層)
-            const opacity = Math.min(0.8, 0.2 + (grid.packet_count / 20));
+            // 覆蓋範圍模式：顯示訊號密度 (白底高對比湛藍漸層，點位清晰分明)
+            const opacity = Math.min(0.85, 0.38 + (grid.packet_count / 15));
             return (
               <Rectangle
                 key={`cov-grid-${i}`}
                 bounds={bounds as any}
                 pathOptions={{
-                  fillColor: '#06b6d4',
+                  fillColor: '#0284c7',
                   fillOpacity: opacity,
-                  stroke: false
+                  stroke: true,
+                  color: '#0369a1',
+                  weight: 1
                 }}
               >
                 <Tooltip sticky>
@@ -562,8 +611,8 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           return null;
         })}
 
-        {/* 2. 🛰️ 繪製多條 Traceroute 路徑（含每跳 SNR，以新舊著色） */}
-        {showTraceroute && traceroutePaths.length > 0 && traceroutePaths.map((path) => {
+        {/* 2. 🛰️ 繪製多條 Traceroute 路徑（含每跳 SNR，以新舊著色） - 整合至拓撲邏輯連線圖層 */}
+        {showLogicGraph && traceroutePaths.length > 0 && traceroutePaths.map((path) => {
           // 依封包時間計算年齡，決定顏色與透明度
           const ageMs = Date.now() - new Date(path.timestamp.replace(' ', 'T') + 'Z').getTime();
           const ageMin = ageMs / 60000;
@@ -633,7 +682,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           );
         })}
         {/* Fallback: 無多路徑資料時顯示單筆最新路徑 */}
-        {showTraceroute && traceroutePaths.length === 0 && traceroutePath.length >= 2 && (
+        {showLogicGraph && traceroutePaths.length === 0 && traceroutePath.length >= 2 && (
           <React.Fragment>
             <Polyline
               positions={traceroutePath.map(n => [n.latitude, n.longitude]) as any}
@@ -1003,8 +1052,21 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         </div>
       )}
 
+      {/* 🗺️ 地圖風格切換按鈕 (右上控制群組，與全螢幕按鈕並列) */}
+      <div className="absolute top-4 right-16 z-[1000] pointer-events-auto">
+        <MapStyleSelector
+          currentStyle={tileStyle}
+          onSelect={setTileStyle}
+          darkMode={darkMode}
+        />
+      </div>
+
       {/* 圖例 Legend Overlay */}
-      <div className="absolute bottom-4 right-4 bg-white/90 backdrop-blur-sm p-3 rounded-xl shadow-xl z-[1000] border border-slate-200 pointer-events-auto min-w-[160px] transition-all duration-300">
+      <div className={`absolute bottom-4 right-4 backdrop-blur-md p-3 rounded-xl shadow-xl z-[1000] border pointer-events-auto min-w-[160px] transition-all duration-300 ${
+        darkMode 
+          ? 'bg-slate-900/90 border-slate-700/80 text-slate-200 shadow-slate-950/50' 
+          : 'bg-white/90 border-slate-200 text-slate-700'
+      }`}>
         <div
           className="flex items-center justify-between cursor-pointer group"
           onClick={() => setIsLegendExpanded(!isLegendExpanded)}
@@ -1038,7 +1100,7 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
             {/* 網格圖層說明 */}
             {(showTraceroute || showHopGrid) && (
               <div>
-                <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">分析圖層分析 Analytics</div>
+                <div className="text-[9px] font-bold text-slate-400 mb-1 uppercase tracking-tighter">覆蓋與跳轉分析 Analytics</div>
                 <div className="space-y-1">
                   {showTraceroute && (
                     <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
@@ -1058,6 +1120,24 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                       </div>
                     </div>
                   )}
+                </div>
+              </div>
+            )}
+
+            {/* 拓撲與路徑連線說明 */}
+            {showLogicGraph && (
+              <div>
+                <div className="text-[9px] font-bold text-purple-400 mb-1 uppercase tracking-tighter">拓撲邏輯連線 Topology</div>
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                    <span className="w-4 h-0.5 bg-[#22c55e]"></span> 鄰居直連 (Neighbor)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                    <span className="w-4 h-0.5 bg-[#3b82f6]"></span> 追蹤路徑 (Traceroute)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-600">
+                    <span className="w-4 h-0.5 bg-[#f59e0b]"></span> 跳數估算 (Hop Limit)
+                  </div>
                 </div>
               </div>
             )}
