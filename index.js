@@ -17,6 +17,11 @@ const os = require('os');
 const net = require('net'); // 🚀 引入 Node.js 原生 TCP 模組
 require('dotenv').config(); // 讀取 .env 檔案
 
+// 🛡️ 必要環境變數相容性對齊 (相容 MQTT_* 與舊版 HIVEMQ_* 命名)
+process.env.MQTT_BROKER = process.env.MQTT_BROKER || process.env.HIVEMQ_URL;
+process.env.MQTT_USER = process.env.MQTT_USER || process.env.HIVEMQ_USER;
+process.env.MQTT_PASSWORD = process.env.MQTT_PASSWORD || process.env.HIVEMQ_PASSWORD;
+
 // 🛡️ 必要環境變數驗證 (Fail Fast - 缺漏直接終止啟動)
 const requiredEnv = ['MQTT_BROKER', 'MQTT_USER', 'MQTT_PASSWORD'];
 const missingEnv = requiredEnv.filter(name => !process.env[name]);
