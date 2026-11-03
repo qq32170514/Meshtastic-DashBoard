@@ -54,3 +54,4 @@ scratch/
 scratch_*
 test_*.js
 *.tmp
+rf-engine/terrain_cache/

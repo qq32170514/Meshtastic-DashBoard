@@ -147,12 +147,15 @@ app.use(express.json({ limit: '256kb' }));
 // 🛡️ 受約束的代理信任 (僅信任第一層反向代理如 Cloudflare)
 app.set('trust proxy', 1);
 
+const isLocalIp = (ip) => !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.');
+
 // 🛡️ Rate Limiting (公開 API 頻率限制防護)
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 分鐘
     max: 500, // 每 IP 最多 500 次請求
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => isLocalIp(req.ip),
     message: { error: 'Too many requests, please try again later.' }
 });
 
@@ -161,6 +164,7 @@ const expensiveLimiter = rateLimit({
     max: 100, // 針對昂貴查詢更嚴格限制 (每 IP 最多 100 次)
     standardHeaders: true,
     legacyHeaders: false,
+    skip: (req) => isLocalIp(req.ip),
     message: { error: 'Too many analytics requests, please try again later.' }
 });
 
@@ -1519,6 +1523,34 @@ app.get('/api/traceroute/paths', withCache(30 * 1000), (req, res) => {
     });
 });
 
+// 📡 靜態服務：全島 ITM 電波覆蓋烘焙圖資
+app.use('/coverage', express.static(path.join(__dirname, 'public/coverage')));
+
+// 📡 API: 取得全台 3D 地形電波覆蓋圖 (ITM) 資訊
+app.get('/api/coverage/itm-info', (req, res) => {
+    const metaPath = path.join(__dirname, 'public/coverage/taiwan_coverage.json');
+    if (!fs.existsSync(metaPath)) {
+        return res.json({ available: false });
+    }
+    try {
+        const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        res.json({ available: true, ...data });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to read coverage metadata' });
+    }
+});
+
+// 📡 API: 手動或背景排程觸發重新烘焙全台覆蓋圖
+app.post('/api/coverage/rebuild', (req, res) => {
+    const { exec } = require('child_process');
+    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
+    exec(`node "${bakeScript}" 500`, (err, stdout, stderr) => {
+        if (err) console.error('❌ 全台覆蓋烘焙失敗:', err.message);
+        else console.log('✅ 全台覆蓋烘焙排程完成！');
+    });
+    res.json({ success: true, message: '全台電波覆蓋烘焙排程已在背景啟動' });
+});
+
 // 🚀 核心升級：網格化覆蓋率聚合 API
 // 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
 app.get('/api/coverage/griddata', withCache(30 * 1000), (req, res) => {
@@ -2291,6 +2323,321 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
     return R * c;
 }
 
+// ==========================================
+// 📡 11. 節點與閘道器 遙測接收成功率 (Packet Reception Rate, PRR)
+// 支援 雙向視角：
+// 1. 節點視角 (node_id)：該節點發送的所有遙測，被各 Gateway 收到的理論成功率
+// 2. 閘道器視角 (gateway_id)：該 Gateway 接收周遭各節點的成功率與距離衰減
+// 3. 全局概況 (無參數)：統計全網遙測覆蓋 Top 節點與 Gateway
+// ==========================================
+app.get('/api/analytics/reception-rate', withCache(30 * 1000), (req, res) => {
+    const range = req.query.range || '24h';
+    let hours = 24;
+    if (range === '7d') hours = 7 * 24;
+    if (range === '30d') hours = 30 * 24;
+
+    const nodeId = req.query.node_id ? req.query.node_id.trim() : null;
+    const gatewayId = req.query.gateway_id ? req.query.gateway_id.trim() : null;
+
+    // 視角 1：從特定節點出發 (Node-centric)
+    if (nodeId) {
+        db.get(`SELECT node_id, short_name, long_name, latitude, longitude, role FROM nodes WHERE node_id = ?`, [nodeId], (err, nodeMeta) => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            const sql = `
+                SELECT p.timestamp, p.gateway_id, p.snr, p.rssi, p.hops_away,
+                       g.short_name as gw_short_name, g.latitude as gw_lat, g.longitude as gw_lng
+                FROM packet_logs p
+                LEFT JOIN nodes g ON p.gateway_id = g.node_id
+                WHERE p.node_id = ?
+                  AND (p.portnum = '67' OR p.portnum = 'TELEMETRY_APP' OR p.portnum = 'TELEMETRY')
+                  AND p.timestamp >= datetime('now', '-${hours} hours')
+                  AND p.gateway_id IS NOT NULL AND p.gateway_id != '' AND p.gateway_id != 'Unknown'
+                ORDER BY p.timestamp ASC
+            `;
+
+            db.all(sql, [nodeId], (err, rows) => {
+                if (err) return res.status(500).json({ error: err.message });
+                if (!rows || rows.length === 0) {
+                    return res.json({
+                        target_type: 'node',
+                        node: nodeMeta || { node_id: nodeId },
+                        estimated_interval_sec: null,
+                        expected_rounds: 0,
+                        global_observed_rounds: 0,
+                        gateways: []
+                    });
+                }
+
+                // 🔬 動態算法：聚合所有閘道聯合觀測到的廣播回合 (只要任一閘道收到就算一回合)
+                // 以「全網聯合觀測回合數」作為實際發射次數估計，比靜態時間/中位數公式更準確
+                const distinctTimestamps = Array.from(new Set(rows.map(r => r.timestamp))).sort();
+                const globalRounds = [];
+                let lastT = 0;
+                for (const ts of distinctTimestamps) {
+                    const t = new Date(ts).getTime();
+                    if (t - lastT > 60 * 1000) {
+                        globalRounds.push(ts);
+                    }
+                    lastT = t;
+                }
+
+                // 計算中位數間隔 (僅供顯示用途)
+                const deltas = [];
+                for (let i = 1; i < globalRounds.length; i++) {
+                    const diff = (new Date(globalRounds[i]).getTime() - new Date(globalRounds[i-1]).getTime()) / 1000;
+                    if (diff > 60 && diff < 7200) deltas.push(diff); // 排除異常長間隔(>2hr)
+                }
+                deltas.sort((a, b) => a - b);
+                const medianSec = deltas.length > 0 ? deltas[Math.floor(deltas.length / 2)] : 1800;
+
+                // ✅ 核心改進: 用「全網觀測回合數」作為分母 (動態校正)
+                // globalRounds.length 是真實觀測到的廣播次數，比靜態公式更可靠
+                const expectedRounds = globalRounds.length;
+
+                // 分組計算各 Gateway
+                const gwMap = new Map();
+                for (const r of rows) {
+                    if (!gwMap.has(r.gateway_id)) {
+                        const dist = (nodeMeta && nodeMeta.latitude && nodeMeta.longitude && r.gw_lat && r.gw_lng)
+                            ? Math.round(calculateHaversineDistance(nodeMeta.latitude, nodeMeta.longitude, r.gw_lat, r.gw_lng) * 10) / 10
+                            : null;
+
+                        gwMap.set(r.gateway_id, {
+                            gateway_id: r.gateway_id,
+                            short_name: r.gw_short_name || r.gateway_id,
+                            latitude: r.gw_lat,
+                            longitude: r.gw_lng,
+                            distance_km: dist,
+                            timestamps: [],
+                            snrs: [],
+                            rssis: [],
+                            hops: [],
+                            direct_count: 0
+                        });
+                    }
+                    const item = gwMap.get(r.gateway_id);
+                    item.timestamps.push(r.timestamp);
+                    if (r.snr !== null && r.snr !== undefined) item.snrs.push(r.snr);
+                    if (r.rssi !== null && r.rssi !== undefined) item.rssis.push(r.rssi);
+                    if (r.hops_away !== null && r.hops_away !== undefined) {
+                        item.hops.push(r.hops_away);
+                        if (r.hops_away === 0) item.direct_count++;
+                    }
+                }
+
+                const gatewayList = [];
+                for (const [gwId, data] of gwMap.entries()) {
+                    const gwRounds = [];
+                    let lastGwT = 0;
+                    for (const ts of data.timestamps.sort()) {
+                        const t = new Date(ts).getTime();
+                        if (t - lastGwT > 60 * 1000) {
+                            gwRounds.push(ts);
+                        }
+                        lastGwT = t;
+                    }
+
+                    const successRate = expectedRounds > 0 ? Math.min(100, Math.round((gwRounds.length / expectedRounds) * 1000) / 10) : 0;
+                    const captureRate = globalRounds.length > 0 ? Math.min(100, Math.round((gwRounds.length / globalRounds.length) * 1000) / 10) : 0;
+                    const avgSnr = data.snrs.length > 0 ? Math.round((data.snrs.reduce((a,b)=>a+b,0)/data.snrs.length)*10)/10 : null;
+                    const avgRssi = data.rssis.length > 0 ? Math.round((data.rssis.reduce((a,b)=>a+b,0)/data.rssis.length)*10)/10 : null;
+                    const avgHops = data.hops.length > 0 ? Math.round((data.hops.reduce((a,b)=>a+b,0)/data.hops.length)*10)/10 : 0;
+
+                    gatewayList.push({
+                        gateway_id: gwId,
+                        short_name: data.short_name,
+                        latitude: data.latitude,
+                        longitude: data.longitude,
+                        distance_km: data.distance_km,
+                        received_rounds: gwRounds.length,
+                        expected_rounds: expectedRounds,
+                        success_rate: successRate,
+                        relative_capture_rate: captureRate,
+                        avg_snr: avgSnr,
+                        avg_rssi: avgRssi,
+                        avg_hops: avgHops,
+                        is_direct: data.direct_count > (gwRounds.length / 2),
+                        direct_count: data.direct_count,
+                        relayed_count: gwRounds.length - data.direct_count
+                    });
+                }
+
+                gatewayList.sort((a, b) => b.success_rate - a.success_rate);
+
+                res.json({
+                    target_type: 'node',
+                    node: nodeMeta || { node_id: nodeId },
+                    estimated_interval_sec: Math.round(medianSec),
+                    expected_rounds: expectedRounds,
+                    global_observed_rounds: globalRounds.length,
+                    gateways: gatewayList
+                });
+            });
+        });
+        return;
+    }
+
+    // 視角 2：從特定閘道器出發 (Gateway-centric)
+    if (gatewayId) {
+        db.get(`SELECT node_id, short_name, long_name, latitude, longitude, role FROM nodes WHERE node_id = ?`, [gatewayId], (err, gwMeta) => {
+            if (err) return res.status(500).json({ error: err.message });
+
+            const sql = `
+                SELECT p.timestamp, p.node_id, p.snr, p.rssi, p.hops_away,
+                       n.short_name as node_short_name, n.latitude as node_lat, n.longitude as node_lng
+                FROM packet_logs p
+                LEFT JOIN nodes n ON p.node_id = n.node_id
+                WHERE p.gateway_id = ?
+                  AND (p.portnum = '67' OR p.portnum = 'TELEMETRY_APP' OR p.portnum = 'TELEMETRY')
+                  AND p.timestamp >= datetime('now', '-${hours} hours')
+                  AND p.node_id IS NOT NULL AND p.node_id != ''
+                ORDER BY p.timestamp ASC
+            `;
+
+            db.all(sql, [gatewayId], (err, rows) => {
+                if (err) return res.status(500).json({ error: err.message });
+                if (!rows || rows.length === 0) {
+                    return res.json({
+                        target_type: 'gateway',
+                        gateway: gwMeta || { node_id: gatewayId },
+                        total_nodes_received: 0,
+                        nodes: []
+                    });
+                }
+
+                const nodeMap = new Map();
+                for (const r of rows) {
+                    if (!nodeMap.has(r.node_id)) {
+                        const dist = (gwMeta && gwMeta.latitude && gwMeta.longitude && r.node_lat && r.node_lng)
+                            ? Math.round(calculateHaversineDistance(gwMeta.latitude, gwMeta.longitude, r.node_lat, r.node_lng) * 10) / 10
+                            : null;
+
+                        nodeMap.set(r.node_id, {
+                            node_id: r.node_id,
+                            short_name: r.node_short_name || r.node_id,
+                            latitude: r.node_lat,
+                            longitude: r.node_lng,
+                            distance_km: dist,
+                            timestamps: [],
+                            snrs: [],
+                            rssis: [],
+                            hops: [],
+                            direct_count: 0
+                        });
+                    }
+                    const item = nodeMap.get(r.node_id);
+                    item.timestamps.push(r.timestamp);
+                    if (r.snr !== null && r.snr !== undefined) item.snrs.push(r.snr);
+                    if (r.rssi !== null && r.rssi !== undefined) item.rssis.push(r.rssi);
+                    if (r.hops_away !== null && r.hops_away !== undefined) {
+                        item.hops.push(r.hops_away);
+                        if (r.hops_away === 0) item.direct_count++;
+                    }
+                }
+
+                const nodeList = [];
+                for (const [nodeIdKey, data] of nodeMap.entries()) {
+                    const nodeRounds = [];
+                    let lastT = 0;
+                    for (const ts of data.timestamps.sort()) {
+                        const t = new Date(ts).getTime();
+                        if (t - lastT > 60 * 1000) {
+                            nodeRounds.push(ts);
+                        }
+                        lastT = t;
+                    }
+
+                    // 🔬 閘道器視角：用中位數間隔估算「此閘道在時間窗內理論應收到的回合數」
+                    // 這能反映閘道接收此節點的一致性 (接收規律性)
+                    const deltas = [];
+                    for (let i = 1; i < nodeRounds.length; i++) {
+                        const diff = (new Date(nodeRounds[i]).getTime() - new Date(nodeRounds[i-1]).getTime()) / 1000;
+                        if (diff > 60 && diff < 7200) deltas.push(diff); // 排除異常長間隔(>2hr)
+                    }
+                    deltas.sort((a, b) => a - b);
+                    const medianSec = deltas.length > 0 ? deltas[Math.floor(deltas.length / 2)] : 1800;
+                    // ✅ gateway-centric 接收一致性: 用時間窗/中位數估算預期，計算此閘道實際接收率
+                    // 此值表示「此閘道對此節點的捕獲一致性」，高 = 穩定收到；低 = 時常漏收
+                    const expectedRounds = Math.max(nodeRounds.length, Math.round((hours * 3600) / medianSec));
+                    const successRate = expectedRounds > 0 ? Math.min(100, Math.round((nodeRounds.length / expectedRounds) * 1000) / 10) : 0;
+
+                    const avgSnr = data.snrs.length > 0 ? Math.round((data.snrs.reduce((a,b)=>a+b,0)/data.snrs.length)*10)/10 : null;
+                    const avgRssi = data.rssis.length > 0 ? Math.round((data.rssis.reduce((a,b)=>a+b,0)/data.rssis.length)*10)/10 : null;
+                    const avgHops = data.hops.length > 0 ? Math.round((data.hops.reduce((a,b)=>a+b,0)/data.hops.length)*10)/10 : 0;
+
+                    nodeList.push({
+                        node_id: nodeIdKey,
+                        short_name: data.short_name,
+                        latitude: data.latitude,
+                        longitude: data.longitude,
+                        distance_km: data.distance_km,
+                        received_rounds: nodeRounds.length,
+                        expected_rounds: expectedRounds,
+                        success_rate: successRate,
+                        avg_snr: avgSnr,
+                        avg_rssi: avgRssi,
+                        avg_hops: avgHops,
+                        is_direct: data.direct_count > (nodeRounds.length / 2),
+                        direct_count: data.direct_count,
+                        relayed_count: nodeRounds.length - data.direct_count
+                    });
+                }
+
+                nodeList.sort((a, b) => b.received_rounds - a.received_rounds);
+
+                res.json({
+                    target_type: 'gateway',
+                    gateway: gwMeta || { node_id: gatewayId },
+                    total_nodes_received: nodeList.length,
+                    nodes: nodeList
+                });
+            });
+        });
+        return;
+    }
+
+    // 視角 3：概況總覽 (無特定 node/gateway 時，列出最活躍的前 10 個節點與閘道器供前端快速選取)
+    const summarySql = `
+        SELECT p.node_id, n.short_name, COUNT(DISTINCT p.gateway_id) as gw_count, COUNT(*) as pkt_count
+        FROM packet_logs p
+        LEFT JOIN nodes n ON p.node_id = n.node_id
+        WHERE (p.portnum = '67' OR p.portnum = 'TELEMETRY_APP' OR p.portnum = 'TELEMETRY')
+          AND p.timestamp >= datetime('now', '-${hours} hours')
+          AND p.gateway_id IS NOT NULL AND p.gateway_id != '' AND p.gateway_id != 'Unknown'
+        GROUP BY p.node_id
+        ORDER BY gw_count DESC, pkt_count DESC
+        LIMIT 10
+    `;
+
+    const gwSummarySql = `
+        SELECT p.gateway_id, g.short_name, COUNT(DISTINCT p.node_id) as node_count, COUNT(*) as pkt_count
+        FROM packet_logs p
+        LEFT JOIN nodes g ON p.gateway_id = g.node_id
+        WHERE (p.portnum = '67' OR p.portnum = 'TELEMETRY_APP' OR p.portnum = 'TELEMETRY')
+          AND p.timestamp >= datetime('now', '-${hours} hours')
+          AND p.gateway_id IS NOT NULL AND p.gateway_id != '' AND p.gateway_id != 'Unknown'
+        GROUP BY p.gateway_id
+        ORDER BY node_count DESC, pkt_count DESC
+        LIMIT 10
+    `;
+
+    Promise.all([
+        new Promise((resolve, reject) => db.all(summarySql, [], (e, r) => e ? reject(e) : resolve(r || []))),
+        new Promise((resolve, reject) => db.all(gwSummarySql, [], (e, r) => e ? reject(e) : resolve(r || [])))
+    ]).then(([topNodes, topGateways]) => {
+        res.json({
+            target_type: 'overview',
+            range,
+            hours,
+            top_nodes: topNodes,
+            top_gateways: topGateways
+        });
+    }).catch(err => {
+        res.status(500).json({ error: err.message });
+    });
+});
+
 function fetchAndSaveCWAData() {
     const cwaKey = process.env.CWA_API_KEY;
     if (!cwaKey) {
@@ -2351,34 +2698,171 @@ function fetchAndSaveCWAData() {
     });
 }
 
-// 每 15 分鐘自動刷新中央氣象署氣象資料
+// 快取 CWA 日射與日照測站資料
+let cwaSolarCache = {
+    updatedAt: 0,
+    stations: []
+};
+
+// 抓取 CWA 署屬日射專屬測站 (O-A0091-001) 與 局屬日照綜合測站 (O-A0003-001)
+function fetchCwaSolarData() {
+    const cwaKey = process.env.CWA_API_KEY;
+    if (!cwaKey) return;
+
+    function fetchJson(url) {
+        return new Promise((resolve, reject) => {
+            https.get(url, res => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    return https.get(res.headers.location, r2 => {
+                        let d = '';
+                        r2.on('data', c => d += c);
+                        r2.on('end', () => {
+                            try { resolve(JSON.parse(d)); } catch (e) { reject(e); }
+                        });
+                    }).on('error', reject);
+                }
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(d)); } catch (e) { reject(e); }
+                });
+            }).on('error', reject);
+        });
+    }
+
+    Promise.all([
+        fetchJson(`https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001?Authorization=${cwaKey}`).catch(() => null),
+        fetchJson(`https://opendata.cwa.gov.tw/fileapi/v1/opendataapi/O-A0091-001?Authorization=${cwaKey}&format=JSON`).catch(() => null)
+    ]).then(([o3, o91]) => {
+        const solarMap = new Map();
+
+        // 1. 署屬日射專屬測站 (O-A0091-001: 34站)
+        if (o91?.cwaopendata?.dataset?.Station) {
+            o91.cwaopendata.dataset.Station.forEach(s => {
+                const id = s.StationId;
+                const coords = s.GeoInfo?.Coordinates?.[0];
+                const lat = parseFloat(coords?.StationLatitude);
+                const lng = parseFloat(coords?.StationLongitude);
+                const rad = parseFloat(s.WeatherElement?.SolarRadiation);
+                if (id && !isNaN(lat) && !isNaN(lng)) {
+                    solarMap.set(id, {
+                        id,
+                        name: s.StationName,
+                        lat,
+                        lng,
+                        solar_radiation_mj: rad > -50 ? rad : null,
+                        obs_time: s.ObsTime?.DateTime || null
+                    });
+                }
+            });
+        }
+
+        // 2. 局屬自動綜合測站 (O-A0003-001: 363站，含日照時數與紫外線)
+        if (o3?.records?.Station) {
+            o3.records.Station.forEach(s => {
+                const id = s.StationId;
+                const coords = s.GeoInfo?.Coordinates?.find(c => c.CoordinateName === 'WGS84');
+                const lat = parseFloat(coords?.StationLatitude || s.Latitude);
+                const lng = parseFloat(coords?.StationLongitude || s.Longitude);
+                const sun = parseFloat(s.WeatherElement?.SunshineDuration);
+                const uv = parseFloat(s.WeatherElement?.UVIndex);
+                const weather = s.WeatherElement?.Weather;
+
+                if (!solarMap.has(id) && id && !isNaN(lat) && !isNaN(lng)) {
+                    solarMap.set(id, {
+                        id,
+                        name: s.StationName,
+                        lat,
+                        lng,
+                        solar_radiation_mj: null
+                    });
+                }
+
+                if (solarMap.has(id)) {
+                    const item = solarMap.get(id);
+                    item.sunshine_duration = sun > -50 ? sun : null;
+                    item.uv_index = uv > -50 ? uv : null;
+                    item.weather = weather && weather !== '-99' ? weather : null;
+                }
+            });
+        }
+
+        if (solarMap.size > 0) {
+            cwaSolarCache = {
+                updatedAt: Date.now(),
+                stations: Array.from(solarMap.values())
+            };
+            console.log(`☀️ [中央氣象署日射 API] 成功更新 ${solarMap.size} 個測站之日射量與日照時數！`);
+        }
+    }).catch(err => {
+        console.error('❌ CWA 日射資料抓取失敗:', err.message);
+    });
+}
+
+// 每 15 分鐘自動刷新中央氣象署氣象與日射資料
 cron.schedule('*/15 * * * *', () => {
     fetchAndSaveCWAData();
+    fetchCwaSolarData();
 });
 
-// API 1: 取得最近的官方氣象站觀測資料與溫差比對
+// ⏰ 每日凌晨 04:00 自動重新烘焙全台 3D 地形電波覆蓋圖 (Longley-Rice ITM)
+cron.schedule('0 4 * * *', () => {
+    console.log('⏰ [排程觸發] 開始每日全台電波覆蓋 (ITM) 自動烘焙...');
+    const { exec } = require('child_process');
+    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
+    exec(`node "${bakeScript}" 500`, (err, stdout) => {
+        if (err) console.error('❌ 排程烘焙失敗:', err.message);
+        else console.log('✅ 每日排程烘焙成功完成！');
+    });
+});
+
+// API 1: 取得最近的官方氣象站觀測資料與日射比對
 app.get('/api/cwa/nearest', (req, res) => {
     let { lat, lng, node_id } = req.query;
 
     const findNearest = (targetLat, targetLng, nodeObj) => {
         db.all(`SELECT * FROM cwa_weather_stations WHERE temperature IS NOT NULL AND latitude IS NOT NULL AND longitude IS NOT NULL`, [], (err, stations) => {
-            if (err || !stations || stations.length === 0) {
-                return res.json({ nearestStation: null, nodeTemp: nodeObj?.temperature, nodeHumidity: nodeObj?.humidity });
+            let nearest = null;
+            if (!err && stations && stations.length > 0) {
+                let minDistance = Infinity;
+                stations.forEach(st => {
+                    const dist = calculateHaversineDistance(targetLat, targetLng, st.latitude, st.longitude);
+                    if (dist < minDistance) {
+                        minDistance = dist;
+                        nearest = st;
+                    }
+                });
+                if (nearest) {
+                    nearest.distance_km = Math.round(minDistance * 100) / 100;
+                }
             }
 
-            let nearest = null;
-            let minDistance = Infinity;
-
-            stations.forEach(st => {
-                const dist = calculateHaversineDistance(targetLat, targetLng, st.latitude, st.longitude);
-                if (dist < minDistance) {
-                    minDistance = dist;
-                    nearest = st;
-                }
-            });
-
-            if (nearest) {
-                nearest.distance_km = Math.round(minDistance * 100) / 100;
+            // 尋找最近的日射 / 日照測站
+            let solarStation = null;
+            if (cwaSolarCache.stations.length > 0) {
+                let minSolarDist = Infinity;
+                cwaSolarCache.stations.forEach(st => {
+                    if (st.solar_radiation_mj != null || st.sunshine_duration != null) {
+                        const dist = calculateHaversineDistance(targetLat, targetLng, st.lat, st.lng);
+                        if (dist < minSolarDist) {
+                            minSolarDist = dist;
+                            solarStation = {
+                                station_id: st.id,
+                                station_name: st.name,
+                                distance_km: Math.round(dist * 100) / 100,
+                                solar_radiation_mj: st.solar_radiation_mj,
+                                solar_radiation_wh: st.solar_radiation_mj ? Math.round(st.solar_radiation_mj * 277.78) : null,
+                                peak_sun_hours: st.solar_radiation_mj ? Math.round(st.solar_radiation_mj * 0.27778 * 10) / 10 : null,
+                                sunshine_duration: st.sunshine_duration,
+                                uv_index: st.uv_index,
+                                weather: st.weather,
+                                obs_time: st.obs_time
+                            };
+                        }
+                    }
+                });
+            } else {
+                fetchCwaSolarData();
             }
 
             const nTemp = nodeObj?.temperature != null ? parseFloat(nodeObj.temperature) : null;
@@ -2389,6 +2873,7 @@ app.get('/api/cwa/nearest', (req, res) => {
 
             res.json({
                 nearestStation: nearest,
+                solarStation,
                 nodeTemp: nTemp,
                 nodeHumidity: nHum,
                 deltaTemp,
@@ -3409,6 +3894,7 @@ server.listen(PORT, () => {
     console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
     bootstrapAnalyticsSummary();
     fetchAndSaveCWAData();
+    fetchCwaSolarData();
     // 啟動 RF 監聽
     setupRFListener(io, db);
 

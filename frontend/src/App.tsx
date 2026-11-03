@@ -1,12 +1,14 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart3, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart2, BarChart3, ChevronDown, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import { AppTileLayer } from './mapTiles';
 import type { TraceroutePath } from './NodeMap';
 import PacketTypePieChart from './PacketTypePieChart';
 import NodeRecoveryQR from './NodeRecoveryQR';
+import SolarForecastCard from './SolarForecastCard';
+import RFCoverageCard from './RFCoverageCard';
 
 const NodeMap = React.lazy(() => import('./NodeMap'));
 const TelemetryCharts = React.lazy(() => import('./TelemetryCharts'));
@@ -356,20 +358,26 @@ const PORTNUM_NAMES: Record<string | number, string> = {
 };
 const ITEMS_PER_PAGE = 20;
 
-const ANNOUNCEMENT_TITLE = "📢 v3.0 重大版本升級公告";
-const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v3.0 重大里程碑版本！
+const ANNOUNCEMENT_TITLE = "📢 v3.1 重大版本升級公告";
+const ANNOUNCEMENT_TEXT = `歡迎來到 Meshtastic DashBoard v3.1 重大里程碑版本！
 
 本次升級核心亮點：
-1. 🗺️ 全新多風格圖資引擎（徹底修復 403 阻擋）：
-   - 全面替換 OpenStreetMap 志工伺服器，改用高速穩定之 Esri 與 OSM 專業圖資服務。
-   - 預設「戰術深色雷達 (Dark Canvas)」，深灰黑科技風格與節點、跳數、連線高對比完美適配。
-   - 新增右上角「底圖風格切換器」，支援深色雷達、彩色街道 (OSM HOT)、衛星空照、地形等高、簡潔淺色、開放街道 6 款圖資隨選隨換，並具備偏好自動記憶。
-2. 🌤️ 中央氣象署 (CWA) 官方數據整合：
-   - 即時串接全台氣象測站觀測數據，自動配對節點溫濕度並進行溫差異常監控。
-3. 🛰️ 多路徑 Traceroute 拓撲與訊號協同分析：
-   - 整合即時多跳封包追蹤，提供跳數、SNR 顏色映射與網狀連線邏輯拓撲。
-4. ⚡ 系統效能與安全標頭 (CSP) 全面加固：
-   - 強化 Helmet Content-Security-Policy (CSP) 安全防護，並優化前端 Lazy-loading 分流打包與 Gzip 傳輸。
+1. 📡 全台 3D 地形電波覆蓋模擬 (Longley-Rice ITM 引擎)：
+   - 頂部標籤列整合「全台電波覆蓋」開關與即時基站數徽章。
+   - 採用 Longley-Rice 不規則地形傳播模型 (ITM) 與 SRTM 數值高程 (DEM)，精確模擬中央山脈阻隔與平原繞射衰減。
+   - 啟用多核心 WebAssembly 並行加速技術，深度渲染全台活躍固定站點與關鍵中繼，產出高解析訊號覆蓋熱區圖。
+   - 後端排程每日清晨 04:00 自動烘焙最新覆蓋圖層。
+2. 🏔️ 官方 Site Planner 單站工程級分析 (RFCoverageCard)：
+   - 節點詳情頁面內嵌 Meshtastic 官方 Site Planner 互動式模擬器。
+   - 自動帶入節點真實經緯度、海拔高度與天線配置，提供直觀的即時傳播與信號分析。
+3. ☀️ 太陽能發電預測與氣象署 (CWA) 輻射比對 (SolarForecastCard)：
+   - 串接 Forecast.Solar 公開預報 API，提供太陽能供電節點當日/明日發電瓦時、尖峰功率與日照曲線預估。
+   - 整合台灣中央氣象署全台測站即時日射量與日照時數，為離網野外中繼站提供全天候日照健康診斷。
+4. 📊 遙測封包接收成功率 (PRR) 多時段分析：
+   - 支援 24 小時、7 天、30 天時段篩選，精準評估各節點與閘道器之封包傳遞與接收成功率，並支援地圖色彩映射。
+5. 🧭 界面與操作體驗全面優化：
+   - 地圖頂部標籤列統一整合各功能層（節點地圖、覆蓋範圍、跳轉分析、拓撲邏輯連線、全台電波覆蓋）。
+   - 地圖畫布去蕪存菁，視野更寬廣俐落。
 
 聯絡作者 : qq32170514@gmail.com (歡迎交流與提供建議)
 `;
@@ -591,6 +599,11 @@ function App() {
   const [selectedNodePath, setSelectedNodePath] = useState<any[]>([]);
   const [showTrackerHistory, setShowTrackerHistory] = useState(false);
   const [showSimulator, setShowSimulator] = useState(false);
+  // 📊 遙測封包接收成功率 (PRR) 節點詳情面板狀態
+  const [nodeReceptionData, setNodeReceptionData] = useState<any | null>(null);
+  const [prrRange, setPrrRange] = useState<'24h' | '7d' | '30d'>('24h');
+  const [isPrrLoading, setIsPrrLoading] = useState(false);
+  const [prrPanelOpen, setPrrPanelOpen] = useState(true);
   const [fusionEdges, setFusionEdges] = useState<any[]>([]);
   const [traceroutePaths, setTraceroutePaths] = useState<TraceroutePath[]>([]);
   const [mapFavoriteGroup, setMapFavoriteGroup] = useState<string>('all');
@@ -833,16 +846,27 @@ function App() {
 
   // 地圖圖層開關與資料
   const [showLogicGraph, setShowLogicGraph] = useState(false);
+  const [showItmCoverage, setShowItmCoverage] = useState(false);
+  const [itmMeta, setItmMeta] = useState<any | null>(null);
   const [showNodes, setShowNodes] = useState(true);
   const [showUtilization, setShowUtilization] = useState(false);
   const [neighbors, setNeighbors] = useState<any[]>([]);
   const [gatewayLeaderboard, setGatewayLeaderboard] = useState<any[]>([]);
 
+  useEffect(() => {
+    fetch('/api/coverage/itm-info')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.available !== false) setItmMeta(data);
+      })
+      .catch(() => {});
+  }, []);
+
   // 封包過濾狀態
   const [nodeListSearchQuery, setNodeListSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState('base');
   const [showAnnouncement, setShowAnnouncement] = useState(() => {
-    return localStorage.getItem('hideAnnouncement_v3_0') !== 'true';
+    return localStorage.getItem('hideAnnouncement_v3_1') !== 'true';
   });
   const [hideAnnouncementNextTime, setHideAnnouncementNextTime] = useState(false);
 
@@ -1294,6 +1318,22 @@ function App() {
     }
   };
 
+  // 📊 PRR: 節點詳情頁遙測接收成功率分析
+  const fetchNodePRR = async (nodeId: string, range: string = '24h', asGateway = false) => {
+    setIsPrrLoading(true);
+    setNodeReceptionData(null);
+    try {
+      const param = asGateway ? `gateway_id=${encodeURIComponent(nodeId)}` : `node_id=${encodeURIComponent(nodeId)}`;
+      const res = await fetch(`/api/analytics/reception-rate?${param}&range=${range}`);
+      const data = await res.json();
+      setNodeReceptionData(data);
+    } catch (err) {
+      console.error('PRR fetch error:', err);
+    } finally {
+      setIsPrrLoading(false);
+    }
+  };
+
   const handleShowModal = (nodeId: string) => {
     if (selectedNodeId !== nodeId) {
       setNodePacketsCurrentPage(1);
@@ -1738,8 +1778,17 @@ function App() {
   useEffect(() => {
     if (selectedNodeId) {
       fetchNodeStats(selectedNodeId);
+      // 切換節點時重置 PRR 資料，等待使用者手動或 details tab 自動觸發
+      setNodeReceptionData(null);
     }
   }, [selectedNodeId]);
+
+  // 當切換到 details tab 且有選中節點時，自動載入 PRR 資料
+  useEffect(() => {
+    if (activeTab === 'details' && selectedNodeId && !nodeReceptionData && !isPrrLoading) {
+      fetchNodePRR(selectedNodeId, prrRange, false);
+    }
+  }, [activeTab, selectedNodeId]);
 
   useEffect(() => {
     if (selectedNodeId) {
@@ -2792,6 +2841,16 @@ function App() {
                         <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
                       </section>
 
+                      {/* ☀️ 太陽能發電試算 */}
+                      <section>
+                        <SolarForecastCard node={selectedNode} darkMode={darkMode} />
+                      </section>
+
+                      {/* 📡 3D 地形電波覆蓋模擬 (Site Planner) */}
+                      <section>
+                        <RFCoverageCard node={selectedNode} darkMode={darkMode} />
+                      </section>
+
                       <section>
                         <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4 border-b pb-2 flex items-center gap-2">
                           <MapIcon size={14} /> 節點位置
@@ -2904,6 +2963,197 @@ function App() {
                             </tbody>
                           </table>
                           {gatewayStats.length === 0 && <div className="p-10 text-center text-slate-300 italic text-sm">無路徑紀錄資料</div>}
+                        </div>
+                      </section>
+
+                      {/* 📊 遙測封包接收成功率 (PRR) 分析面板 */}
+                      <section>
+                        <div className={`rounded-xl border shadow-sm overflow-hidden ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                          {/* 面板標題列 */}
+                          <div
+                            className={`p-4 flex items-center justify-between cursor-pointer select-none ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}
+                            onClick={() => setPrrPanelOpen(v => !v)}
+                          >
+                            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+                              <BarChart2 size={14} className="text-emerald-500" />
+                              遙測接收成功率分析 (PRR)
+                              {isPrrLoading && <span className="ml-1 text-[10px] animate-pulse text-emerald-400">載入中...</span>}
+                            </h4>
+                            <div className="flex items-center gap-2">
+                              {/* 時間範圍切換 */}
+                              <div className={`flex rounded-lg p-0.5 border text-[10px] font-mono ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'}`} onClick={e => e.stopPropagation()}>
+                                {(['24h', '7d', '30d'] as const).map(r => (
+                                  <button
+                                    key={r}
+                                    onClick={() => {
+                                      setPrrRange(r);
+                                      if (selectedNode) {
+                                        const isGw = nodeReceptionData?.target_type === 'gateway';
+                                        fetchNodePRR(selectedNode.node_id, r, isGw);
+                                      }
+                                    }}
+                                    className={`px-2 py-0.5 rounded-md transition-all ${prrRange === r ? 'bg-emerald-500 text-white font-bold' : darkMode ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-800'}`}
+                                  >{r}</button>
+                                ))}
+                              </div>
+                              {/* 雙視角切換 */}
+                              <div className={`flex rounded-lg p-0.5 border text-[10px] font-mono ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'}`} onClick={e => e.stopPropagation()}>
+                                <button
+                                  onClick={() => selectedNode && fetchNodePRR(selectedNode.node_id, prrRange, false)}
+                                  className={`px-2 py-0.5 rounded-md transition-all ${!nodeReceptionData || nodeReceptionData?.target_type === 'node' ? 'bg-blue-500 text-white font-bold' : darkMode ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-800'}`}
+                                  title="節點視角：此節點發射的遙測被各閘道收到的比例"
+                                >📡 節點視角</button>
+                                <button
+                                  onClick={() => selectedNode && fetchNodePRR(selectedNode.node_id, prrRange, true)}
+                                  className={`px-2 py-0.5 rounded-md transition-all ${nodeReceptionData?.target_type === 'gateway' ? 'bg-cyan-500 text-white font-bold' : darkMode ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-800'}`}
+                                  title="閘道視角：此節點作為閘道器時接收各節點遙測的成功率"
+                                >🛰️ 閘道視角</button>
+                              </div>
+                              <ChevronDown size={14} className={`text-slate-400 transition-transform duration-200 ${prrPanelOpen ? 'rotate-180' : ''}`} />
+                            </div>
+                          </div>
+
+                          {prrPanelOpen && (
+                            <div className={`border-t p-4 space-y-4 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+                              {isPrrLoading ? (
+                                <div className="py-8 text-center">
+                                  <div className="inline-block w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin mb-2" />
+                                  <p className={`text-xs ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>正在分析封包接收率...</p>
+                                </div>
+                              ) : nodeReceptionData ? (
+                                <>
+                                  {/* 節點視角摘要卡片 */}
+                                  {nodeReceptionData.target_type === 'node' && (
+                                    <div className={`p-3 rounded-xl border text-xs font-mono ${darkMode ? 'bg-slate-800/60 border-slate-700/60' : 'bg-slate-50 border-slate-200'}`}>
+                                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-2">
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>推算心跳週期</div>
+                                          <div className="font-bold text-amber-400">{nodeReceptionData.estimated_interval_sec ? `約 ${Math.round(nodeReceptionData.estimated_interval_sec / 60)} 分` : 'N/A'}</div>
+                                        </div>
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>全網廣播回合</div>
+                                          <div className="font-bold text-cyan-400">{nodeReceptionData.expected_rounds} 次</div>
+                                        </div>
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>覆蓋閘道數</div>
+                                          <div className="font-bold text-emerald-400">{nodeReceptionData.gateways?.length ?? 0} 個</div>
+                                        </div>
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>最佳閘道</div>
+                                          <div className="font-bold text-emerald-400">
+                                            {nodeReceptionData.gateways?.length > 0 ? `${nodeReceptionData.gateways[0].success_rate}%` : 'N/A'}
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <p className={`text-[10px] pt-2 border-t ${darkMode ? 'border-slate-700 text-slate-500' : 'border-slate-200 text-slate-400'}`}>
+                                        💡 成功率 = 閘道收到的廣播回合數 ÷ 全網聯合觀測廣播總數 (動態校正)
+                                      </p>
+                                    </div>
+                                  )}
+
+                                  {/* 閘道器視角摘要卡片 */}
+                                  {nodeReceptionData.target_type === 'gateway' && (
+                                    <div className={`p-3 rounded-xl border text-xs font-mono ${darkMode ? 'bg-slate-800/60 border-slate-700/60' : 'bg-slate-50 border-slate-200'}`}>
+                                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-2">
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>接收節點數</div>
+                                          <div className="font-bold text-cyan-400">{nodeReceptionData.total_nodes_received} 個</div>
+                                        </div>
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>時間範圍</div>
+                                          <div className="font-bold text-slate-300">{prrRange === '24h' ? '近 24 小時' : prrRange === '7d' ? '近 7 天' : '近 30 天'}</div>
+                                        </div>
+                                        <div>
+                                          <div className={`text-[10px] uppercase tracking-wider mb-0.5 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>最多封包節點</div>
+                                          <div className="font-bold text-emerald-400">
+                                            {nodeReceptionData.nodes?.length > 0 ? nodeReceptionData.nodes[0].short_name || nodeReceptionData.nodes[0].node_id : 'N/A'}
+                                          </div>
+                                        </div>
+                                      </div>
+                                      <p className={`text-[10px] pt-2 border-t ${darkMode ? 'border-slate-700 text-slate-500' : 'border-slate-200 text-slate-400'}`}>
+                                        💡 閘道視角：此節點作為閘道器對各周遭節點遙測的捕獲一致性
+                                      </p>
+                                    </div>
+                                  )}
+
+                                  {/* 成功率清單 */}
+                                  <div className="space-y-2 max-h-80 overflow-y-auto pr-0.5">
+                                    {nodeReceptionData.target_type === 'node' && nodeReceptionData.gateways?.map((gw: any) => {
+                                      const isHigh = gw.success_rate >= 80;
+                                      const isMid = gw.success_rate >= 50 && gw.success_rate < 80;
+                                      const barColor = isHigh ? 'bg-emerald-500' : isMid ? 'bg-amber-500' : 'bg-rose-500';
+                                      const textColor = isHigh ? 'text-emerald-400' : isMid ? 'text-amber-400' : 'text-rose-400';
+                                      return (
+                                        <div key={gw.gateway_id} className={`p-3 rounded-xl border transition-colors ${darkMode ? 'bg-slate-800/50 border-slate-700/40 hover:border-emerald-500/30' : 'bg-slate-50 border-slate-200 hover:border-emerald-300'}`}>
+                                          <div className="flex justify-between items-start mb-1.5">
+                                            <div className="flex items-center gap-1.5 flex-wrap">
+                                              <button onClick={() => setSelectedNodeId(gw.gateway_id)} className="font-mono font-bold text-blue-400 hover:underline text-xs">{gw.short_name || gw.gateway_id}</button>
+                                              {gw.distance_km !== null && <span className="text-[10px] text-cyan-400">({gw.distance_km} km)</span>}
+                                              <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold ${gw.is_direct ? 'bg-green-500/20 text-green-400' : 'bg-orange-500/20 text-orange-400'}`}>
+                                                {gw.is_direct ? '🟢 直收' : `🔀 ${gw.avg_hops}跳`}
+                                              </span>
+                                            </div>
+                                            <span className={`text-sm font-black font-mono ${textColor}`}>{gw.success_rate}%</span>
+                                          </div>
+                                          <div className={`w-full rounded-full h-1.5 overflow-hidden mb-1 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}>
+                                            <div className={`h-full rounded-full transition-all duration-700 ${barColor}`} style={{ width: `${Math.min(100, gw.success_rate)}%` }} />
+                                          </div>
+                                          <div className={`flex justify-between text-[10px] font-mono ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+                                            <span>收 {gw.received_rounds} / 全網 {gw.expected_rounds} 回合</span>
+                                            <span>SNR {gw.avg_snr ?? '--'}dB</span>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+
+                                    {nodeReceptionData.target_type === 'gateway' && nodeReceptionData.nodes?.map((n: any) => {
+                                      const isHigh = n.success_rate >= 80;
+                                      const isMid = n.success_rate >= 50 && n.success_rate < 80;
+                                      const barColor = isHigh ? 'bg-emerald-500' : isMid ? 'bg-amber-500' : 'bg-rose-500';
+                                      const textColor = isHigh ? 'text-emerald-400' : isMid ? 'text-amber-400' : 'text-rose-400';
+                                      return (
+                                        <div key={n.node_id} className={`p-3 rounded-xl border transition-colors ${darkMode ? 'bg-slate-800/50 border-slate-700/40 hover:border-cyan-500/30' : 'bg-slate-50 border-slate-200 hover:border-cyan-300'}`}>
+                                          <div className="flex justify-between items-start mb-1.5">
+                                            <div className="flex items-center gap-1.5 flex-wrap">
+                                              <button onClick={() => setSelectedNodeId(n.node_id)} className="font-mono font-bold text-cyan-400 hover:underline text-xs">{n.short_name || n.node_id}</button>
+                                              {n.distance_km !== null && <span className="text-[10px] text-slate-400">({n.distance_km} km)</span>}
+                                              <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold ${n.is_direct ? 'bg-green-500/20 text-green-400' : 'bg-orange-500/20 text-orange-400'}`}>
+                                                {n.is_direct ? '🟢 直收' : `🔀 ${n.avg_hops}跳`}
+                                              </span>
+                                            </div>
+                                            <span className={`text-sm font-black font-mono ${textColor}`}>{n.success_rate}%</span>
+                                          </div>
+                                          <div className={`w-full rounded-full h-1.5 overflow-hidden mb-1 ${darkMode ? 'bg-slate-700' : 'bg-slate-200'}`}>
+                                            <div className={`h-full rounded-full transition-all duration-700 ${barColor}`} style={{ width: `${Math.min(100, n.success_rate)}%` }} />
+                                          </div>
+                                          <div className={`flex justify-between text-[10px] font-mono ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+                                            <span>收 {n.received_rounds} / 預期 {n.expected_rounds} 回合</span>
+                                            <span>SNR {n.avg_snr ?? '--'}dB</span>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+
+                                    {((nodeReceptionData.target_type === 'node' && !nodeReceptionData.gateways?.length) ||
+                                      (nodeReceptionData.target_type === 'gateway' && !nodeReceptionData.nodes?.length)) && (
+                                      <div className={`py-6 text-center text-sm italic ${darkMode ? 'text-slate-600' : 'text-slate-400'}`}>
+                                        在 {prrRange === '24h' ? '過去 24 小時' : prrRange === '7d' ? '過去 7 天' : '過去 30 天'}內無遙測封包紀錄
+                                      </div>
+                                    )}
+                                  </div>
+                                </>
+                              ) : (
+                                <div className={`py-8 text-center ${darkMode ? 'text-slate-600' : 'text-slate-400'}`}>
+                                  <BarChart2 size={32} className="mx-auto mb-3 opacity-30" />
+                                  <p className="text-sm mb-3">點擊上方視角按鈕以載入分析資料</p>
+                                  <button
+                                    onClick={() => selectedNode && fetchNodePRR(selectedNode.node_id, prrRange, false)}
+                                    className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition-colors"
+                                  >📡 載入節點視角 PRR</button>
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </section>
 
@@ -3097,6 +3347,8 @@ function App() {
                       <button
                         onClick={() => setShowTrackerHistory(!showTrackerHistory)}
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showTrackerHistory ? 'bg-pink-600 border-pink-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
+                        title="此功能已移至節點詳情頁面"
+                        style={{ display: 'none' }}
                       >
                         <Activity size={12} /> 歷史軌跡
                       </button>
@@ -3105,6 +3357,19 @@ function App() {
                         className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showLogicGraph ? 'bg-purple-600 border-purple-500 text-white shadow-lg shadow-purple-500/20' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
                       >
                         <Share2 size={12} /> 拓撲邏輯連線
+                      </button>
+                      <button
+                        onClick={() => setShowItmCoverage(!showItmCoverage)}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black border transition-all ${showItmCoverage ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/25 ring-2 ring-indigo-400/40' : 'bg-slate-800 border-slate-700 text-slate-500 hover:text-slate-300'}`}
+                        title="切換顯示由中央山脈 3D 數值高程 (DEM) 模擬之全台 LoRa 電波覆蓋熱區 (Longley-Rice ITM)"
+                      >
+                        <Radio size={12} className={showItmCoverage ? 'text-white animate-pulse' : 'text-indigo-400'} />
+                        <span>全台電波覆蓋</span>
+                        {itmMeta?.station_count ? (
+                          <span className={`px-1.5 py-0.5 rounded-full text-[9px] font-mono leading-none ${showItmCoverage ? 'bg-indigo-700 text-indigo-100' : 'bg-slate-700/80 text-slate-400'}`}>
+                            {itmMeta.station_count}站
+                          </span>
+                        ) : null}
                       </button>
                     </div>
                     <div className="flex items-center gap-3">
@@ -3307,6 +3572,9 @@ function App() {
                       simResultMap={simResultMap}
                       simState={simState}
                       showLogicGraph={showLogicGraph}
+                      showItmCoverage={showItmCoverage}
+                      setShowItmCoverage={setShowItmCoverage}
+                      itmMeta={itmMeta}
                       fusionEdges={fusionEdges}
                       traceroutePaths={traceroutePaths}
                       isMapFullScreen={isMapFullScreen}
@@ -4139,13 +4407,13 @@ function App() {
                   <Activity size={12} className="text-orange-500" />
                   連續運行時間: {displayedUptime != null ? `${Math.floor(displayedUptime / 3600)}h ${Math.floor((displayedUptime % 3600) / 60)}m ${Math.floor(displayedUptime % 60)}s` : '--'}
                 </div>
-                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v3.0</div>
+                <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v3.1</div>
               </div>
             </div>
           </footer>
         </div>
       )}
-      {showAnnouncement && (
+      {!appLoading && showAnnouncement && (
         <div className="fixed inset-0 z-[3000] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setShowAnnouncement(false)}></div>
           <div className={`relative w-full max-w-lg rounded-2xl shadow-2xl border p-6 flex flex-col gap-4 ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
@@ -4171,9 +4439,9 @@ function App() {
                   onChange={(e) => {
                     setHideAnnouncementNextTime(e.target.checked);
                     if (e.target.checked) {
-                      localStorage.setItem('hideAnnouncement_v3_0', 'true');
+                      localStorage.setItem('hideAnnouncement_v3_1', 'true');
                     } else {
-                      localStorage.removeItem('hideAnnouncement_v3_0');
+                      localStorage.removeItem('hideAnnouncement_v3_1');
                     }
                   }}
                 />
