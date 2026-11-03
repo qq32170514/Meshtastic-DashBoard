@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle, GeoJSON, Circle } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle, GeoJSON, Circle, ImageOverlay } from 'react-leaflet';
 import * as turf from '@turf/turf';
 import L from 'leaflet';
 import { Node } from './App';
-import { Info, ChevronDown, ChevronUp } from 'lucide-react';
+import { Info, ChevronDown, ChevronUp, BarChart2, Radio, Activity, Wifi } from 'lucide-react';
 import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
 
 // Traceroute 多路徑型別
@@ -141,6 +141,9 @@ interface NodeMapProps {
   simState?: { sourceNodeId: string, maxHops: number, minSnr: number };
   showSimulator?: boolean;
   showLogicGraph?: boolean;
+  showItmCoverage?: boolean;
+  setShowItmCoverage?: React.Dispatch<React.SetStateAction<boolean>> | ((val: boolean | ((prev: boolean) => boolean)) => void);
+  itmMeta?: any;
   fusionEdges?: any[];
   traceroutePaths?: TraceroutePath[];
   isMapFullScreen?: boolean;
@@ -159,7 +162,36 @@ const getHopColor = (hops: number) => {
   return "#ef4444";             // 5+ 跳: 紅色
 };
 
-const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDetail, isDetailView = false, showNodes = true, showUtilization = false, showTraceroute = false, traceroutePath = [], neighbors = [], showHopGrid = false, coverageData = [], selectedNodePath = [], showTrackerHistory = false, showSimulator = false, simResultMap, simState, activeTab, showLogicGraph = false, fusionEdges = [], traceroutePaths = [], isMapFullScreen = false, mapCenter, darkMode = true }: NodeMapProps) => {
+const NodeMap = ({
+  nodes,
+  allNodes = [],
+  gateways = [],
+  onSelectNode,
+  onShowDetail,
+  isDetailView = false,
+  showNodes = true,
+  showUtilization = false,
+  showTraceroute = false,
+  traceroutePath = [],
+  neighbors = [],
+  showHopGrid = false,
+  coverageData = [],
+  selectedNodePath = [],
+  showTrackerHistory = false,
+  showSimulator = false,
+  simResultMap,
+  simState,
+  activeTab,
+  showLogicGraph = false,
+  showItmCoverage: externalShowItmCoverage,
+  setShowItmCoverage: externalSetShowItmCoverage,
+  itmMeta: externalItmMeta,
+  fusionEdges = [],
+  traceroutePaths = [],
+  isMapFullScreen = false,
+  mapCenter,
+  darkMode = true
+}: NodeMapProps) => {
   const [tileStyle, setTileStyle] = useState<string>(() => getDefaultTileStyle(darkMode));
   const [isLegendExpanded, setIsLegendExpanded] = useState(false);
   const [mapColorMode, setMapColorMode] = useState<'role' | 'cu'>('role');
@@ -171,6 +203,75 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     relayedNodes: any[];
   } | null>(null);
   const [isHovered, setIsHovered] = useState(false);
+
+  // 📡 全台 3D 地形電波覆蓋 (Longley-Rice ITM) 預先烘焙圖層狀態
+  const [internalShowItmCoverage, setInternalShowItmCoverage] = useState<boolean>(false);
+  const showItmCoverage = externalShowItmCoverage !== undefined ? externalShowItmCoverage : internalShowItmCoverage;
+  const setShowItmCoverage = externalSetShowItmCoverage || setInternalShowItmCoverage;
+  const [internalItmMeta, setInternalItmMeta] = useState<any | null>(null);
+  const itmMeta = externalItmMeta !== undefined ? externalItmMeta : internalItmMeta;
+
+  useEffect(() => {
+    if (externalItmMeta !== undefined) return;
+    fetch('/api/coverage/itm-info')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.available !== false) setInternalItmMeta(data);
+      })
+      .catch(() => {});
+  }, [externalItmMeta]);
+
+  // 📊 遙測封包接收成功率 (PRR) 圖層狀態
+  const [showReceptionRate, setShowReceptionRate] = useState<boolean>(false);
+  const [receptionRange, setReceptionRange] = useState<'24h' | '7d' | '30d'>('24h');
+  const [receptionData, setReceptionData] = useState<any | null>(null);
+  const [receptionOverview, setReceptionOverview] = useState<any | null>(null);
+  const [isLoadingReception, setIsLoadingReception] = useState<boolean>(false);
+
+  const fetchReceptionRate = useCallback(async (type: 'node' | 'gateway' | 'overview', id?: string, range: string = '24h') => {
+    setIsLoadingReception(true);
+    try {
+      let url = `/api/analytics/reception-rate?range=${range}`;
+      if (type === 'node' && id) url += `&node_id=${encodeURIComponent(id)}`;
+      if (type === 'gateway' && id) url += `&gateway_id=${encodeURIComponent(id)}`;
+
+      const res = await fetch(url);
+      const data = await res.json();
+      if (type === 'overview') {
+        setReceptionOverview(data);
+      } else {
+        setReceptionData(data);
+      }
+    } catch (err) {
+      console.error('Fetch reception rate error:', err);
+    } finally {
+      setIsLoadingReception(false);
+    }
+  }, []);
+
+  const currentDetailNodeId = (isDetailView && nodes.length > 0 && nodes[0]?.node_id) ? nodes[0].node_id : null;
+
+  // 當時窗切換時，自動重新抓取目前視角資料
+  useEffect(() => {
+    if (!showReceptionRate) return;
+    if (receptionData?.target_type === 'node' && receptionData.node?.node_id) {
+      fetchReceptionRate('node', receptionData.node.node_id, receptionRange);
+    } else if (receptionData?.target_type === 'gateway' && receptionData.gateway?.node_id) {
+      fetchReceptionRate('gateway', receptionData.gateway.node_id, receptionRange);
+    } else if (currentDetailNodeId) {
+      fetchReceptionRate('node', currentDetailNodeId, receptionRange);
+    } else {
+      fetchReceptionRate('overview', undefined, receptionRange);
+    }
+  }, [receptionRange]);
+
+  // 當詳情節點切換時，若 PRR 開啟中，自動同步載入新節點的 PRR 資料
+  useEffect(() => {
+    if (showReceptionRate && currentDetailNodeId) {
+      setSelectedGwId(null);
+      fetchReceptionRate('node', currentDetailNodeId, receptionRange);
+    }
+  }, [currentDetailNodeId, showReceptionRate]);
 
   // 監聽外部或跨元件底圖切換事件
   useEffect(() => {
@@ -377,7 +478,14 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           key={node.node_id}
           icon={createColoredIcon(node.role, node.last_seen)}
           position={[node.latitude!, node.longitude!]}
-          eventHandlers={{ click: () => onSelectNode(node.node_id) }}
+          eventHandlers={{
+            click: () => {
+              onSelectNode(node.node_id);
+              if (showReceptionRate) {
+                fetchReceptionRate('node', node.node_id, receptionRange);
+              }
+            }
+          }}
         >
           {/* Hover 顯示簡易節點圖卡 Tooltip */}
           <Tooltip
@@ -482,9 +590,19 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
     if (selectedGwId === gwId) {
       setSelectedGwId(null);
       setRelayedNodesData(null);
+      if (showReceptionRate) {
+        if (currentDetailNodeId) {
+          fetchReceptionRate('node', currentDetailNodeId, receptionRange);
+        } else {
+          setReceptionData(null);
+        }
+      }
       return;
     }
     setSelectedGwId(gwId);
+    if (showReceptionRate) {
+      fetchReceptionRate('gateway', gwId, receptionRange);
+    }
     try {
       const res = await fetch(`/api/gateway/relayed-nodes/${encodeURIComponent(gwId)}`);
       const data = await res.json();
@@ -546,6 +664,16 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         <MapController center={mapCenter} />
         <MapEventListener />
         <AppTileLayer tileStyle={tileStyle} darkMode={darkMode} />
+
+        {/* 📡 全台 3D 地形電波覆蓋熱區 (Longley-Rice ITM 烘焙圖層) */}
+        {showItmCoverage && (
+          <ImageOverlay
+            url={`/coverage/taiwan_coverage.png?t=${itmMeta?.updated_at || ''}`}
+            bounds={itmMeta?.bounds || [[21.8, 119.3], [25.5, 122.2]]}
+            opacity={0.7}
+            zIndex={350}
+          />
+        )}
 
         {/* 1. 繪製網格圖層 (覆蓋範圍 Coverage & 跳轉分析 Hop Analysis) */}
         {(showTraceroute || showHopGrid) && coverageData.map((grid, i) => {
@@ -933,6 +1061,145 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
           });
         })()}
 
+        {/* 📊 遙測封包接收成功率 (PRR) 雙向動態連線圖層 */}
+        {showReceptionRate && receptionData && (() => {
+          // 視角 1：節點出發 (Node-centric)
+          if (receptionData.target_type === 'node' && receptionData.node?.latitude && receptionData.node?.longitude) {
+            const srcLat = receptionData.node.latitude;
+            const srcLng = receptionData.node.longitude;
+            const nodeName = receptionData.node.short_name || receptionData.node.node_id;
+
+            return (
+              <React.Fragment>
+                {/* 發射源節點外圍呼吸光環 */}
+                <CircleMarker
+                  center={[srcLat, srcLng]}
+                  radius={13}
+                  pathOptions={{
+                    color: '#10b981',
+                    fillColor: '#10b981',
+                    fillOpacity: 0.35,
+                    weight: 2
+                  }}
+                />
+                {receptionData.gateways?.map((gw: any) => {
+                  if (!gw.latitude || !gw.longitude) return null;
+                  const isHigh = gw.success_rate >= 80;
+                  const isMid = gw.success_rate >= 50 && gw.success_rate < 80;
+                  const color = isHigh ? '#10b981' : isMid ? '#f59e0b' : '#f43f5e';
+                  const weight = isHigh ? 3.5 : isMid ? 2.5 : 1.8;
+                  const dashArray = isHigh ? undefined : isMid ? '8, 4' : '4, 6';
+                  const opacity = isHigh ? 0.9 : isMid ? 0.75 : 0.6;
+
+                  return (
+                    <React.Fragment key={`prr-node-link-${gw.gateway_id}`}>
+                      <Polyline
+                        positions={[[srcLat, srcLng], [gw.latitude, gw.longitude]]}
+                        pathOptions={{ color, weight, opacity, dashArray }}
+                      >
+                        <Tooltip sticky>
+                          <div className="text-[11px] font-mono p-1 space-y-1">
+                            <div className="font-bold flex items-center justify-between gap-3 border-b border-slate-700/60 pb-1" style={{ color }}>
+                              <span>📡 遙測接收率: {gw.success_rate}%</span>
+                              <span className="text-[10px] text-slate-400">({gw.received_rounds}/{gw.expected_rounds} 回合)</span>
+                            </div>
+                            <div className="text-slate-200">
+                              節點: <b>{nodeName}</b> ➔ 網關: <b>{gw.short_name}</b>
+                            </div>
+                            {gw.distance_km !== null && (
+                              <div className="text-cyan-400 font-bold">直線距離: {gw.distance_km} km</div>
+                            )}
+                            <div className="text-slate-400 text-[10px]">
+                              SNR: {gw.avg_snr !== null ? `${gw.avg_snr} dB` : 'N/A'} | RSSI: {gw.avg_rssi !== null ? `${gw.avg_rssi} dBm` : 'N/A'}
+                            </div>
+                            <div className="text-amber-300 text-[10px]">
+                              路徑: {gw.is_direct ? '🟢 直收 (0-Hop)' : `🟡 中繼 (${gw.avg_hops} Hops)`}
+                            </div>
+                          </div>
+                        </Tooltip>
+                      </Polyline>
+                      <CircleMarker
+                        center={[gw.latitude, gw.longitude]}
+                        radius={7}
+                        pathOptions={{ color, fillColor: color, fillOpacity: 0.8, weight: 2 }}
+                      />
+                    </React.Fragment>
+                  );
+                })}
+              </React.Fragment>
+            );
+          }
+
+          // 視角 2：網關接收 (Gateway-centric)
+          if (receptionData.target_type === 'gateway' && receptionData.gateway?.latitude && receptionData.gateway?.longitude) {
+            const gwLat = receptionData.gateway.latitude;
+            const gwLng = receptionData.gateway.longitude;
+            const gwName = receptionData.gateway.short_name || receptionData.gateway.node_id;
+
+            return (
+              <React.Fragment>
+                {/* 接收端網關外圍呼吸光環 */}
+                <CircleMarker
+                  center={[gwLat, gwLng]}
+                  radius={14}
+                  pathOptions={{
+                    color: '#06b6d4',
+                    fillColor: '#06b6d4',
+                    fillOpacity: 0.4,
+                    weight: 2.5
+                  }}
+                />
+                {receptionData.nodes?.map((n: any) => {
+                  if (!n.latitude || !n.longitude) return null;
+                  const isHigh = n.success_rate >= 80;
+                  const isMid = n.success_rate >= 50 && n.success_rate < 80;
+                  const color = isHigh ? '#10b981' : isMid ? '#f59e0b' : '#f43f5e';
+                  const weight = isHigh ? 3.5 : isMid ? 2.5 : 1.8;
+                  const dashArray = isHigh ? undefined : isMid ? '8, 4' : '4, 6';
+                  const opacity = isHigh ? 0.9 : isMid ? 0.75 : 0.6;
+
+                  return (
+                    <React.Fragment key={`prr-gw-link-${n.node_id}`}>
+                      <Polyline
+                        positions={[[n.latitude, n.longitude], [gwLat, gwLng]]}
+                        pathOptions={{ color, weight, opacity, dashArray }}
+                      >
+                        <Tooltip sticky>
+                          <div className="text-[11px] font-mono p-1 space-y-1">
+                            <div className="font-bold flex items-center justify-between gap-3 border-b border-slate-700/60 pb-1" style={{ color }}>
+                              <span>🛰️ 網關接收率: {n.success_rate}%</span>
+                              <span className="text-[10px] text-slate-400">({n.received_rounds}/{n.expected_rounds} 回合)</span>
+                            </div>
+                            <div className="text-slate-200">
+                              來源: <b>{n.short_name}</b> ➔ 網關: <b>{gwName}</b>
+                            </div>
+                            {n.distance_km !== null && (
+                              <div className="text-cyan-400 font-bold">直線距離: {n.distance_km} km</div>
+                            )}
+                            <div className="text-slate-400 text-[10px]">
+                              SNR: {n.avg_snr !== null ? `${n.avg_snr} dB` : 'N/A'} | RSSI: {n.avg_rssi !== null ? `${n.avg_rssi} dBm` : 'N/A'}
+                            </div>
+                            <div className="text-amber-300 text-[10px]">
+                              路徑: {n.is_direct ? '🟢 直收 (0-Hop)' : `🟡 中繼 (${n.avg_hops} Hops)`}
+                            </div>
+                          </div>
+                        </Tooltip>
+                      </Polyline>
+                      <CircleMarker
+                        center={[n.latitude, n.longitude]}
+                        radius={6}
+                        pathOptions={{ color, fillColor: color, fillOpacity: 0.8, weight: 1.5 }}
+                      />
+                    </React.Fragment>
+                  );
+                })}
+              </React.Fragment>
+            );
+          }
+
+          return null;
+        })()}
+
         {/* --- 動態 Hop 覆蓋模擬器 (Weighted Reachability Map) --- */}
         {showSimulator && simResultMap && simState && simState.sourceNodeId && (() => {
           const hopGroups = new Map<number, Node[]>();
@@ -1052,8 +1319,259 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
         </div>
       )}
 
-      {/* 🗺️ 地圖風格切換按鈕 (右上控制群組，與全螢幕按鈕並列) */}
-      <div className="absolute top-4 right-16 z-[1000] pointer-events-auto">
+      {/* 📊 遙測封包接收成功率 (PRR) 雙向分析抽屜面板 */}
+      {showReceptionRate && (receptionData || receptionOverview || isLoadingReception) && (
+        <div className="absolute top-16 right-4 z-[1000] w-[350px] backdrop-blur-md bg-slate-900/95 border border-emerald-500/50 p-4 rounded-2xl shadow-2xl space-y-3 text-slate-100 animate-fadeIn pointer-events-auto max-h-[80vh] flex flex-col">
+          {/* 面板頂部標題與控制項 */}
+          <div className="flex items-center justify-between border-b border-slate-700/60 pb-2">
+            <div className="font-bold text-xs text-emerald-400 flex items-center gap-1.5 font-mono">
+              <BarChart2 size={14} />
+              <span>
+                {receptionData?.target_type === 'node'
+                  ? `📡 ${receptionData.node?.short_name || receptionData.node?.node_id || nodes[0]?.short_name || '節點'} 遙測接收率 (PRR)`
+                  : receptionData?.target_type === 'gateway'
+                    ? '🛰️ 網關接收 ➔ 周遭節點成功率'
+                    : `📡 ${nodes[0]?.short_name || '該節點'} 遙測接收率 (PRR)`}
+              </span>
+              {isLoadingReception && <span className="ml-1 text-[10px] animate-pulse text-emerald-400">...</span>}
+            </div>
+            <div className="flex items-center gap-1">
+              <div className="flex bg-slate-800 rounded-lg p-0.5 border border-slate-700 text-[10px] font-mono">
+                <button
+                  onClick={() => setReceptionRange('24h')}
+                  className={`px-1.5 py-0.5 rounded-md transition-all ${receptionRange === '24h' ? 'bg-emerald-500 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
+                >24h</button>
+                <button
+                  onClick={() => setReceptionRange('7d')}
+                  className={`px-1.5 py-0.5 rounded-md transition-all ${receptionRange === '7d' ? 'bg-emerald-500 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
+                >7d</button>
+                <button
+                  onClick={() => setReceptionRange('30d')}
+                  className={`px-1.5 py-0.5 rounded-md transition-all ${receptionRange === '30d' ? 'bg-emerald-500 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
+                >30d</button>
+              </div>
+              <button
+                onClick={() => { setReceptionData(null); setReceptionOverview(null); setShowReceptionRate(false); }}
+                className="text-slate-400 hover:text-white text-xs px-1.5 py-0.5 font-mono ml-1 hover:bg-slate-800 rounded"
+              >✕</button>
+            </div>
+          </div>
+
+          {isLoadingReception && !receptionData && (
+            <div className="py-8 text-center text-xs font-mono text-slate-400">
+              <div className="inline-block w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin mb-2" />
+              <div>正在分析「{nodes[0]?.short_name || nodes[0]?.node_id || '該節點'}」接收率...</div>
+            </div>
+          )}
+
+          {/* 視角詳情摘要卡片 */}
+          {receptionData?.target_type === 'node' && (
+            <div className="bg-slate-800/80 p-2.5 rounded-xl border border-slate-700/60 text-[11px] font-mono space-y-1">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">當前節點:</span>
+                <span className="font-bold text-emerald-300">{receptionData.node?.short_name || receptionData.node?.node_id}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">推算心跳週期:</span>
+                <span className="font-bold text-amber-300">約 {Math.round((receptionData.estimated_interval_sec || 1800) / 60)} 分鐘/次</span>
+              </div>
+              <div className="flex justify-between items-center text-[10px]">
+                <span className="text-slate-400">理論預期回合:</span>
+                <span className="text-cyan-300 font-bold">{receptionData.expected_rounds} 回合 (全網觀測: {receptionData.global_observed_rounds})</span>
+              </div>
+              <div className="flex justify-between items-center text-[10px]">
+                <span className="text-slate-400">成功捕獲網關數:</span>
+                <span className="text-emerald-400 font-bold">{receptionData.gateways?.length || 0} 個</span>
+              </div>
+            </div>
+          )}
+
+          {receptionData?.target_type === 'gateway' && (
+            <div className="bg-slate-800/80 p-2.5 rounded-xl border border-slate-700/60 text-[11px] font-mono space-y-1">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">當前閘道器:</span>
+                <span className="font-bold text-cyan-300">{receptionData.gateway?.short_name || receptionData.gateway?.node_id}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">收到節點總數:</span>
+                <span className="font-bold text-emerald-300">{receptionData.total_nodes_received || 0} 個節點</span>
+              </div>
+              <div className="text-[10px] text-slate-400 pt-0.5">
+                💡 依各節點理論心跳計算該網關的單站捕獲成功率
+              </div>
+              {isDetailView && currentDetailNodeId && (
+                <button
+                  onClick={() => {
+                    setSelectedGwId(null);
+                    fetchReceptionRate('node', currentDetailNodeId, receptionRange);
+                  }}
+                  className="w-full mt-1.5 py-1 px-2 rounded-lg bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-bold transition flex items-center justify-center gap-1 shadow"
+                >
+                  🔙 返回「{nodes[0]?.short_name || currentDetailNodeId}」節點接收率
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* 滾動清單 */}
+          <div className="flex-1 overflow-y-auto space-y-1.5 pr-1 max-h-60">
+            {/* 節點視角清單 */}
+            {receptionData?.target_type === 'node' && (
+              receptionData.gateways?.length === 0 ? (
+                <div className="text-slate-500 text-center py-4 text-xs italic font-mono">在此時窗內無網關接收紀錄</div>
+              ) : (
+                receptionData.gateways?.map((gw: any) => {
+                  const isHigh = gw.success_rate >= 80;
+                  const isMid = gw.success_rate >= 50 && gw.success_rate < 80;
+                  const barColor = isHigh ? 'bg-emerald-500' : isMid ? 'bg-amber-500' : 'bg-rose-500';
+                  const textColor = isHigh ? 'text-emerald-400' : isMid ? 'text-amber-400' : 'text-rose-400';
+
+                  return (
+                    <div
+                      key={gw.gateway_id}
+                      onClick={() => handleGatewayClick(gw.gateway_id)}
+                      className="p-2 rounded-xl bg-slate-800/60 border border-slate-700/40 hover:border-emerald-500/50 hover:bg-slate-800 transition-all cursor-pointer space-y-1"
+                    >
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-mono font-bold text-slate-200">
+                          {gw.short_name || gw.gateway_id}
+                          {gw.distance_km !== null && <span className="text-[10px] text-cyan-400 font-normal ml-1">({gw.distance_km} km)</span>}
+                        </span>
+                        <span className={`text-[11px] font-mono font-bold ${textColor}`}>
+                          {gw.success_rate}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-700/50 rounded-full h-1.5 overflow-hidden">
+                        <div className={`h-full rounded-full transition-all duration-500 ${barColor}`} style={{ width: `${Math.min(100, gw.success_rate)}%` }}></div>
+                      </div>
+                      <div className="flex justify-between text-[10px] font-mono text-slate-400 pt-0.5">
+                        <span>{gw.received_rounds}/{gw.expected_rounds} 回合</span>
+                        <span>{gw.is_direct ? '0-Hop 直收' : `${gw.avg_hops} Hops`} | {gw.avg_snr ?? '--'}dB</span>
+                      </div>
+                    </div>
+                  );
+                })
+              )
+            )}
+
+            {/* 閘道器視角清單 */}
+            {receptionData?.target_type === 'gateway' && (
+              receptionData.nodes?.length === 0 ? (
+                <div className="text-slate-500 text-center py-4 text-xs italic font-mono">無經手接收遙測紀錄</div>
+              ) : (
+                receptionData.nodes?.map((n: any) => {
+                  const isHigh = n.success_rate >= 80;
+                  const isMid = n.success_rate >= 50 && n.success_rate < 80;
+                  const barColor = isHigh ? 'bg-emerald-500' : isMid ? 'bg-amber-500' : 'bg-rose-500';
+                  const textColor = isHigh ? 'text-emerald-400' : isMid ? 'text-amber-400' : 'text-rose-400';
+
+                  return (
+                    <div
+                      key={n.node_id}
+                      onClick={() => { onSelectNode(n.node_id); if (onShowDetail) onShowDetail(n.node_id); }}
+                      className="p-2 rounded-xl bg-slate-800/60 border border-slate-700/40 hover:border-cyan-500/50 hover:bg-slate-800 transition-all cursor-pointer space-y-1"
+                    >
+                      <div className="flex justify-between items-center text-xs">
+                        <span className="font-mono font-bold text-slate-200">
+                          {n.short_name || n.node_id}
+                          {n.distance_km !== null && <span className="text-[10px] text-cyan-400 font-normal ml-1">({n.distance_km} km)</span>}
+                        </span>
+                        <span className={`text-[11px] font-mono font-bold ${textColor}`}>
+                          {n.success_rate}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-700/50 rounded-full h-1.5 overflow-hidden">
+                        <div className={`h-full rounded-full transition-all duration-500 ${barColor}`} style={{ width: `${Math.min(100, n.success_rate)}%` }}></div>
+                      </div>
+                      <div className="flex justify-between text-[10px] font-mono text-slate-400 pt-0.5">
+                        <span>{n.received_rounds}/{n.expected_rounds} 回合</span>
+                        <span>{n.is_direct ? '0-Hop 直收' : `${n.avg_hops} Hops`} | {n.avg_snr ?? '--'}dB</span>
+                      </div>
+                    </div>
+                  );
+                })
+              )
+            )}
+
+            {/* 總覽模式：引導點選或快速選取熱門項目 */}
+            {!receptionData && receptionOverview && (
+              <div className="space-y-2 text-xs font-mono">
+                <div className="text-[11px] text-slate-300 bg-slate-800/60 p-2 rounded-xl border border-slate-700/50">
+                  👆 點選地圖上的任一<b>節點</b>或<b>網關</b>，立即繪製雙向接收成功率連線！或直接從下方熱門清單中選取：
+                </div>
+                <div>
+                  <div className="text-[10px] font-bold text-emerald-400 uppercase tracking-wider mb-1">🔥 活躍節點 (多網關覆蓋)</div>
+                  <div className="space-y-1">
+                    {receptionOverview.top_nodes?.map((tn: any) => (
+                      <div
+                        key={tn.node_id}
+                        onClick={() => fetchReceptionRate('node', tn.node_id, receptionRange)}
+                        className="flex justify-between items-center p-1.5 rounded-lg bg-slate-800/40 hover:bg-emerald-950/40 hover:border-emerald-500/40 border border-transparent cursor-pointer"
+                      >
+                        <span className="font-bold text-slate-200">{tn.short_name || tn.node_id}</span>
+                        <span className="text-[10px] text-emerald-400">{tn.gw_count} 個網關收到</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="pt-1">
+                  <div className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider mb-1">🛰️ 核心網關 (覆蓋多節點)</div>
+                  <div className="space-y-1">
+                    {receptionOverview.top_gateways?.map((tg: any) => (
+                      <div
+                        key={tg.gateway_id}
+                        onClick={() => fetchReceptionRate('gateway', tg.gateway_id, receptionRange)}
+                        className="flex justify-between items-center p-1.5 rounded-lg bg-slate-800/40 hover:bg-cyan-950/40 hover:border-cyan-500/40 border border-transparent cursor-pointer"
+                      >
+                        <span className="font-bold text-slate-200">{tg.short_name || tg.gateway_id}</span>
+                        <span className="text-[10px] text-cyan-400">{tg.node_count} 個節點覆蓋</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 🗺️ 地圖風格切換按鈕 (右上控制群組) */}
+      <div className="absolute top-4 right-16 z-[1000] flex items-center gap-2 pointer-events-auto">
+        {/* PRR 切換按鈕：只在詳情地圖內顯示 */}
+        {isDetailView && (
+          <button
+            onClick={() => {
+              const next = !showReceptionRate;
+              setShowReceptionRate(next);
+              if (next) {
+                setRelayedNodesData(null);
+                setSelectedGwId(null);
+                if (currentDetailNodeId) {
+                  fetchReceptionRate('node', currentDetailNodeId, receptionRange);
+                } else {
+                  fetchReceptionRate('overview', undefined, receptionRange);
+                }
+              } else {
+                setReceptionData(null);
+                setReceptionOverview(null);
+              }
+            }}
+            className={`px-3 py-1.5 rounded-xl text-xs font-mono font-bold flex items-center gap-1.5 backdrop-blur-md shadow-lg border transition-all ${
+              showReceptionRate
+                ? 'bg-emerald-600/90 text-white border-emerald-400 shadow-emerald-950/50 ring-2 ring-emerald-500/40'
+                : darkMode
+                  ? 'bg-slate-900/80 text-slate-300 border-slate-700/80 hover:bg-slate-800 hover:text-white'
+                  : 'bg-white/90 text-slate-700 border-slate-200 hover:bg-slate-100 hover:text-slate-900'
+            }`}
+            title="切換顯示節點與閘道器遙測封包接收成功率 (PRR)"
+          >
+            <BarChart2 size={13} className={showReceptionRate ? 'text-white' : 'text-emerald-400'} />
+            <span>PRR 成功率</span>
+            {isLoadingReception && <span className="animate-spin text-[10px]">⏳</span>}
+          </button>
+        )}
+
         <MapStyleSelector
           currentStyle={tileStyle}
           onSelect={setTileStyle}
@@ -1139,6 +1657,55 @@ const NodeMap = ({ nodes, allNodes = [], gateways = [], onSelectNode, onShowDeta
                     <span className="w-4 h-0.5 bg-[#f59e0b]"></span> 跳數估算 (Hop Limit)
                   </div>
                 </div>
+              </div>
+            )}
+
+            {/* 遙測接收率 (PRR) 圖例說明 */}
+            {showReceptionRate && (
+              <div>
+                <div className="text-[9px] font-bold text-emerald-400 mb-1 uppercase tracking-tighter">遙測接收率 PRR</div>
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1 bg-[#10b981] rounded"></span> ≥ 80% (高可靠/主力)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1 bg-[#f59e0b] rounded"></span> 50%~79% (中等/備援)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-0.5 border-b-2 border-dashed border-[#f43f5e]"></span> &lt; 50% (衰減/邊緣)
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 📡 全台 3D 地形電波覆蓋圖例說明 */}
+            {showItmCoverage && (
+              <div>
+                <div className="text-[9px] font-bold text-purple-400 mb-1 uppercase tracking-tighter flex items-center justify-between">
+                  <span>全台電波覆蓋 (ITM)</span>
+                  {itmMeta?.station_count && (
+                    <span className="text-[9px] text-purple-300 font-mono">共 {itmMeta.station_count} 站</span>
+                  )}
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1.5 bg-[#ef4444] rounded"></span> ≥ -75 dBm (極強)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1.5 bg-[#eab308] rounded"></span> -95 ~ -75 dBm (主力)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1.5 bg-[#06b6d4] rounded"></span> -115 ~ -95 dBm (可用)
+                  </div>
+                  <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <span className="w-4 h-1.5 bg-[#6366f1] rounded"></span> -130 ~ -115 dBm (邊緣)
+                  </div>
+                </div>
+                {itmMeta?.updated_at && (
+                  <div className="text-[8px] text-slate-400 font-mono pt-1">
+                    更新: {new Date(itmMeta.updated_at).toLocaleString('zh-TW', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                  </div>
+                )}
               </div>
             )}
 
