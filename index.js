@@ -116,11 +116,12 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+            scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://static.cloudflareinsights.com"],
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
             imgSrc: ["'self'", "data:", "blob:", "https://*.tile.openstreetmap.org", "https://*.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com", "https://*.tile.openstreetmap.fr"],
-            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com", "https://*.tile.openstreetmap.fr"],
+            connectSrc: ["'self'", "ws:", "wss:", "https://*.tile.openstreetmap.org", "https://*.basemaps.cartocdn.com", "https://server.arcgisonline.com", "https://*.tile.openstreetmap.fr", "https://api.forecast.solar", "https://cloudflareinsights.com"],
+            frameSrc: ["'self'", "https://site.meshtastic.org"],
             objectSrc: ["'none'"],
             upgradeInsecureRequests: null
         }
