@@ -688,13 +688,7 @@ if (process.env.TURSO_URL) {
 }
 
 db.serialize(() => {
-    // 🚀 效能優先：所有 DDL 前先設定最佳 PRAGMA
-    db.run(`PRAGMA journal_mode = WAL`);
-    db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 具備完整崩潰一致性防護，且免除每次交易強制磁碟 sync
-    db.run(`PRAGMA cache_size = -64000`);    // 64MB 頁面快取（負值代表 KB），大幅減少 4GB 資料庫的冷讀取 I/O
-    db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
-    // PRAGMA 設定由 src/database/sqlite.config.js 統一管理並在 Adapter 初始化時驗證讀回 (P1-05)
-    db.run(`PRAGMA wal_autocheckpoint = 1000`); // 每累積 1000 頁自動 checkpoint
+    // 🚀 PRAGMA 設定由 src/database/sqlite.config.js 統一管理並在 Adapter 初始化時驗證讀回 (P1-2, P1-05)
 
     db.run(`
         CREATE TABLE IF NOT EXISTS telemetry_data (
@@ -3946,26 +3940,40 @@ app.get('/api/analytics/bundle', async (req, res) => {
     }
 });
 
-// 啟動 Express 伺服器
-server.listen(PORT, () => {
-    console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
-    console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
-    bootstrapAnalyticsSummary();
-    fetchAndSaveCWAData();
-    fetchCwaSolarData();
-    // 啟動 RF 監聽
-    setupRFListener(io, db);
+// 啟動 Express 伺服器 (P1-4: 確保資料庫初始化完成才開啟通訊埠)
+async function startServer() {
+    try {
+        if (db && db.readyPromise) {
+            await db.readyPromise;
+            console.log('✅ [BOOTSTRAP] 資料庫子系統初始化與 PRAGMA 驗證完成，準備開啟服務埠');
+        }
 
-    // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取
-    const warmCache = () => {
-        const portToUse = server.address()?.port || PORT;
-        ['7d', '24h', '30d'].forEach(r => {
-            fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => { });
+        server.listen(PORT, () => {
+            console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
+            console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
+            bootstrapAnalyticsSummary();
+            fetchAndSaveCWAData();
+            fetchCwaSolarData();
+            // 啟動 RF 監聽
+            setupRFListener(io, db);
+
+            // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取
+            const warmCache = () => {
+                const portToUse = server.address()?.port || PORT;
+                ['7d', '24h', '30d'].forEach(r => {
+                    fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => { });
+                });
+            };
+            setTimeout(warmCache, 2000);
+            setInterval(warmCache, 3 * 60 * 1000);
         });
-    };
-    setTimeout(warmCache, 2000);
-    setInterval(warmCache, 3 * 60 * 1000);
-});
+    } catch (bootErr) {
+        console.error('❌ [FATAL_BOOTSTRAP_ERROR] 資料庫初始化失敗，拒絕啟動伺服器與相關模組:', bootErr.message);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 
 // ==========================================
@@ -4118,9 +4126,15 @@ root.load([
     Routing = root.lookupType("meshtastic.Routing");
     RouteDiscovery = root.lookupType("meshtastic.RouteDiscovery");
     NeighborInfo = root.lookupType("meshtastic.NeighborInfo");
-    MeshPacket = root.lookupType("meshtastic.MeshPacket"); // 🚀 Load MeshPacket type
-    console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
-    startMqttClient(); // 修正為 startMqttClient
+    (async () => {
+        try {
+            if (db && db.readyPromise) await db.readyPromise;
+            console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
+            startMqttClient();
+        } catch (dbErr) {
+            console.error('❌ [MQTT_BOOT_ABORT] 資料庫尚未就緒，取消 MQTT 啟動:', dbErr.message);
+        }
+    })();
 });
 
 // ==========================================

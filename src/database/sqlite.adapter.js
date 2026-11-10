@@ -179,51 +179,64 @@ class SQLiteAdapter {
         const pragmas = this.#pragmas;
 
         // 1. journal_mode (硬性)
+        const expectedJournal = String(pragmas.journal_mode || 'WAL').toLowerCase();
         const jRow = await this._rawQueryOne(`PRAGMA journal_mode = ${pragmas.journal_mode}`);
-        if (!jRow || String(jRow.journal_mode).toLowerCase() !== 'wal') {
-            throw new Error(`[HARD_FAIL] PRAGMA journal_mode 驗證失敗: ${JSON.stringify(jRow)}`);
+        if (!jRow || String(jRow.journal_mode).toLowerCase() !== expectedJournal) {
+            throw new Error(`[HARD_FAIL] PRAGMA journal_mode 驗證失敗: 預期 ${expectedJournal}, 實際 ${JSON.stringify(jRow)}`);
         }
 
         // 2. synchronous (硬性)
+        const syncMap = { OFF: 0, NORMAL: 1, FULL: 2, EXTRA: 3 };
+        const expectedSync = typeof pragmas.synchronous === 'number'
+            ? pragmas.synchronous
+            : (syncMap[String(pragmas.synchronous).toUpperCase()] ?? 1);
         await this._rawExecute(`PRAGMA synchronous = ${pragmas.synchronous}`);
         const sRow = await this._rawQueryOne(`PRAGMA synchronous`);
-        if (!sRow || Number(sRow.synchronous) !== 1) {
-            throw new Error(`[HARD_FAIL] PRAGMA synchronous 驗證失敗: ${JSON.stringify(sRow)}`);
+        if (!sRow || Number(sRow.synchronous) !== expectedSync) {
+            throw new Error(`[HARD_FAIL] PRAGMA synchronous 驗證失敗: 預期 ${expectedSync}, 實際 ${JSON.stringify(sRow)}`);
         }
 
         // 3. busy_timeout (硬性)
-        await this._rawExecute(`PRAGMA busy_timeout = ${pragmas.busy_timeout}`);
+        const expectedTimeout = Number(pragmas.busy_timeout);
+        await this._rawExecute(`PRAGMA busy_timeout = ${expectedTimeout}`);
         const bRow = await this._rawQueryOne(`PRAGMA busy_timeout`);
-        if (!bRow || Number(bRow.timeout) !== pragmas.busy_timeout) {
-            throw new Error(`[HARD_FAIL] PRAGMA busy_timeout 驗證失敗: ${JSON.stringify(bRow)}`);
+        if (!bRow || Number(bRow.timeout) !== expectedTimeout) {
+            throw new Error(`[HARD_FAIL] PRAGMA busy_timeout 驗證失敗: 預期 ${expectedTimeout}, 實際 ${JSON.stringify(bRow)}`);
         }
 
         // 4. foreign_keys (硬性)
+        const fkStr = String(pragmas.foreign_keys).toUpperCase();
+        const expectedFk = (fkStr === 'ON' || pragmas.foreign_keys === 1 || pragmas.foreign_keys === true) ? 1 : 0;
         await this._rawExecute(`PRAGMA foreign_keys = ${pragmas.foreign_keys}`);
         const fRow = await this._rawQueryOne(`PRAGMA foreign_keys`);
-        if (!fRow || Number(fRow.foreign_keys) !== 0) {
-            throw new Error(`[HARD_FAIL] PRAGMA foreign_keys 驗證失敗: ${JSON.stringify(fRow)}`);
+        if (!fRow || Number(fRow.foreign_keys) !== expectedFk) {
+            throw new Error(`[HARD_FAIL] PRAGMA foreign_keys 驗證失敗: 預期 ${expectedFk}, 實際 ${JSON.stringify(fRow)}`);
         }
 
         // 5. wal_autocheckpoint (硬性)
-        await this._rawExecute(`PRAGMA wal_autocheckpoint = ${pragmas.wal_autocheckpoint}`);
+        const expectedWalAuto = Number(pragmas.wal_autocheckpoint);
+        await this._rawExecute(`PRAGMA wal_autocheckpoint = ${expectedWalAuto}`);
         const wRow = await this._rawQueryOne(`PRAGMA wal_autocheckpoint`);
-        if (!wRow || Number(wRow.wal_autocheckpoint) !== pragmas.wal_autocheckpoint) {
-            throw new Error(`[HARD_FAIL] PRAGMA wal_autocheckpoint 驗證失敗: ${JSON.stringify(wRow)}`);
+        if (!wRow || Number(wRow.wal_autocheckpoint) !== expectedWalAuto) {
+            throw new Error(`[HARD_FAIL] PRAGMA wal_autocheckpoint 驗證失敗: 預期 ${expectedWalAuto}, 實際 ${JSON.stringify(wRow)}`);
         }
 
         // 6. cache_size (軟性)
         await this._rawExecute(`PRAGMA cache_size = ${pragmas.cache_size}`);
         const cRow = await this._rawQueryOne(`PRAGMA cache_size`);
-        if (!cRow || Number(cRow.cache_size) !== pragmas.cache_size) {
-            console.warn(`⚠️ [PRAGMA_SOFT_WARN] cache_size 讀回值 (${cRow?.cache_size}) 與設定值不完全相符。`);
+        if (!cRow || Number(cRow.cache_size) !== Number(pragmas.cache_size)) {
+            console.warn(`⚠️ [PRAGMA_SOFT_WARN] cache_size 讀回值 (${cRow?.cache_size}) 與設定值 (${pragmas.cache_size}) 不完全相符。`);
         }
 
         // 7. temp_store (軟性)
+        const tempMap = { DEFAULT: 0, FILE: 1, MEMORY: 2 };
+        const expectedTemp = typeof pragmas.temp_store === 'number'
+            ? pragmas.temp_store
+            : (tempMap[String(pragmas.temp_store).toUpperCase()] ?? 2);
         await this._rawExecute(`PRAGMA temp_store = ${pragmas.temp_store}`);
         const tRow = await this._rawQueryOne(`PRAGMA temp_store`);
-        if (!tRow || Number(tRow.temp_store) !== 2) {
-            console.warn(`⚠️ [PRAGMA_SOFT_WARN] temp_store 讀回值 (${tRow?.temp_store}) 非記憶體模式。`);
+        if (!tRow || Number(tRow.temp_store) !== expectedTemp) {
+            console.warn(`⚠️ [PRAGMA_SOFT_WARN] temp_store 讀回值 (${tRow?.temp_store}) 與預期 (${expectedTemp}) 不符。`);
         }
 
         // 8. mmap_size (軟性)

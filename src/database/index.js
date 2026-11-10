@@ -13,7 +13,7 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
         shutdownHandler,
         backupManager,
 
-        // 傳統 sqlite3.Database 相容方法
+        // 傳統 sqlite3.Database 相容方法 (P1-3: Callback Exactly-Once 防重調用)
         run(sql, paramsOrCb, maybeCb) {
             let params = [];
             let callback = null;
@@ -24,15 +24,24 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
                 if (typeof maybeCb === 'function') callback = maybeCb;
             }
 
-            return adapter.execute(sql, params)
-                .then((res) => {
-                    if (callback) callback.call(res, null);
+            let callbackCalled = false;
+            return adapter.execute(sql, params).then(
+                (res) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback.call(res, null);
+                    }
                     return res;
-                })
-                .catch((err) => {
-                    if (callback) callback(err);
-                    else throw err;
-                });
+                },
+                (err) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(err);
+                    } else {
+                        throw err;
+                    }
+                }
+            );
         },
 
         get(sql, paramsOrCb, maybeCb) {
@@ -45,15 +54,24 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
                 if (typeof maybeCb === 'function') callback = maybeCb;
             }
 
-            return adapter.queryOne(sql, params)
-                .then((row) => {
-                    if (callback) callback(null, row);
+            let callbackCalled = false;
+            return adapter.queryOne(sql, params).then(
+                (row) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(null, row);
+                    }
                     return row;
-                })
-                .catch((err) => {
-                    if (callback) callback(err);
-                    else throw err;
-                });
+                },
+                (err) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(err);
+                    } else {
+                        throw err;
+                    }
+                }
+            );
         },
 
         all(sql, paramsOrCb, maybeCb) {
@@ -66,15 +84,24 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
                 if (typeof maybeCb === 'function') callback = maybeCb;
             }
 
-            return adapter.query(sql, params)
-                .then((rows) => {
-                    if (callback) callback(null, rows);
+            let callbackCalled = false;
+            return adapter.query(sql, params).then(
+                (rows) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(null, rows);
+                    }
                     return rows;
-                })
-                .catch((err) => {
-                    if (callback) callback(err);
-                    else throw err;
-                });
+                },
+                (err) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(err);
+                    } else {
+                        throw err;
+                    }
+                }
+            );
         },
 
         serialize(fn) {
@@ -84,14 +111,23 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
         },
 
         close(callback) {
-            return shutdownHandler.handle('MANUAL_CLOSE', { exitProcess: false })
-                .then(() => {
-                    if (callback) callback(null);
-                })
-                .catch((err) => {
-                    if (callback) callback(err);
-                    else throw err;
-                });
+            let callbackCalled = false;
+            return shutdownHandler.handle('MANUAL_CLOSE', { exitProcess: false }).then(
+                () => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(null);
+                    }
+                },
+                (err) => {
+                    if (callback && !callbackCalled) {
+                        callbackCalled = true;
+                        callback(err);
+                    } else {
+                        throw err;
+                    }
+                }
+            );
         },
 
         // WriteQueue 便捷操作
@@ -151,7 +187,9 @@ async function createDatabaseSubsystem(options = {}) {
 }
 
 /**
- * 同步初始化工廠 (適用於主應用頂層 CommonJS 啟動)
+ * @deprecated 由於 SQLite 初始化與 PRAGMA 驗證本質為非同步，同步工廠無法保證回傳時資料庫已就緒。
+ * 主應用或模組強烈建議改用 async createDatabaseSubsystem(options)。
+ * 若使用本方法，可透過回傳物件的 readyPromise 確保初始化完成；若失敗將自動觸發 setFatalError。
  */
 function initDatabaseSubsystemSync(options = {}) {
     const {
@@ -182,11 +220,15 @@ function initDatabaseSubsystemSync(options = {}) {
     });
     const backupManager = new BackupManager(adapter, backupDir, mergedConfig.backup);
 
-    adapter.initialize(dbPath).catch((err) => {
+    const readyPromise = adapter.initialize(dbPath).catch((err) => {
         console.error('❌ [DATABASE_SUBSYSTEM] 初始化失敗:', err.message);
+        adapter.setFatalError(err);
+        throw err;
     });
 
-    return _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager);
+    const dbCompat = _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager);
+    dbCompat.readyPromise = readyPromise;
+    return dbCompat;
 }
 
 module.exports = {

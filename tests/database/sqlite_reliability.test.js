@@ -8,6 +8,7 @@ const sqlite3 = require('sqlite3').verbose();
 
 const {
     createDatabaseSubsystem,
+    initDatabaseSubsystemSync,
     SQLiteAdapter,
     ADAPTER_STATES,
     AUTH_TYPES,
@@ -31,7 +32,7 @@ function cleanupTempDb(dbPath) {
     try { if (fs.existsSync(`${dbPath}-shm`)) fs.unlinkSync(`${dbPath}-shm`); } catch (_) {}
 }
 
-describe('SQLite Reliability v2.7.2 Comprehensive Test Suite (30 Scenarios)', () => {
+describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', () => {
 
     // ==========================================
     // Group A: Scheduler / Shutdown (7 Scenarios)
@@ -731,6 +732,324 @@ describe('SQLite Reliability v2.7.2 Comprehensive Test Suite (30 Scenarios)', ()
 
         await adapter.close();
         cleanupTempDb(dbPath);
+    });
+
+    // ==========================================
+    // Group F: SQLite Reliability v2.7.3 Defects & Invariants (7 Scenarios)
+    // ==========================================
+
+    it('31. Drain 不將 UNCOMMITTED_ERROR 誤判為成功 (v2.7.3 P0-1)', async () => {
+        const dbPath = getTempDbPath('drain_uncommitted_error');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE uncomm_test (id INT)');
+
+        // 模擬一個 UNKNOWN 錯誤使得項目轉移入 uncommittedErrors
+        const err = new Error('SQLITE_UNKNOWN_INTERNAL: Unexpected engine fault');
+        db.writeQueue.totalAccepted++;
+        const badItem = {
+            id: crypto.randomUUID(),
+            seq: 999,
+            sql: 'INSERT INTO uncomm_test VALUES (1)',
+            params: [],
+            status: ITEM_STATUS.QUEUED,
+            attempt: 0,
+            callback: null
+        };
+        db.writeQueue._transitionItem(badItem, ITEM_STATUS.UNCOMMITTED_ERROR, err);
+
+        const m = db.writeQueue.getMetrics();
+        assert.equal(m.queuedCount, 0);
+        assert.equal(m.retryPendingCount, 0);
+        assert.equal(m.inFlightCount, 0);
+        assert.equal(m.uncommittedErrorCount, 1);
+        assert.equal(m.totalUncommitted, 1);
+        assert.equal(m.totalPending, 0);
+
+        // 透過 shutdownHandler.handle 驗收
+        const shutResult = await db.shutdownHandler.handle('MANUAL_CLOSE', { exitProcess: false });
+
+        assert.equal(shutResult.success, false);
+        assert.equal(shutResult.metrics.totalUncommitted, 1);
+        assert.equal(shutResult.metrics.uncommittedErrorCount, 1);
+
+        cleanupTempDb(dbPath);
+    });
+
+    it('32. Deadline 到期後禁止 Binary Isolation 啟動新交易 (v2.7.3 P0-2)', async () => {
+        const dbPath = getTempDbPath('deadline_bi_gate');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE dead_bi (id INT PRIMARY KEY)');
+
+        let txCount = 0;
+        const origTx = db.adapter.transaction.bind(db.adapter);
+        let triggerDeadlineNow = false;
+
+        db.adapter.transaction = async function(fn) {
+            txCount++;
+            if (txCount === 1) {
+                // 第一筆交易：正常提交 Left (包含 id: 1)
+                const res = await origTx(fn);
+                // Left 完成後，立即模擬 Deadline 到達
+                triggerDeadlineNow = true;
+                return res;
+            }
+            // 第二筆交易（若被啟動）：應被嚴格阻止
+            return origTx(fn);
+        };
+
+        const origDateNow = Date.now;
+        const origDeadline = origDateNow() + 1000;
+        Date.now = function() {
+            if (triggerDeadlineNow) {
+                return origDeadline + 5000; // deadline expired!
+            }
+            return origDateNow();
+        };
+
+        const item1 = { id: '1', seq: 1, sql: 'INSERT INTO dead_bi VALUES (1)', params: [], status: ITEM_STATUS.IN_FLIGHT, attempt: 0 };
+        const item2 = { id: '2', seq: 2, sql: 'INSERT INTO dead_bi VALUES (2)', params: [], status: ITEM_STATUS.IN_FLIGHT, attempt: 0 };
+
+        try {
+            await assert.rejects(
+                async () => {
+                    await db.writeQueue._binaryIsolateBatch([item1, item2], null, origDeadline);
+                },
+                /DEADLINE_EXPIRED/
+            );
+
+            // 驗證：僅啟動了 1 次交易 (Left: item1)，第二個交易 (Right: item2) 絕對沒有啟動！
+            assert.equal(txCount, 1);
+            // 驗證 item1 成功提交，item2 保持未提交狀態
+            assert.equal(item1.status, ITEM_STATUS.COMMITTED);
+            assert.notEqual(item2.status, ITEM_STATUS.COMMITTED);
+
+            const row = await db.get('SELECT id FROM dead_bi WHERE id = 1');
+            assert.ok(row);
+            const row2 = await db.get('SELECT id FROM dead_bi WHERE id = 2');
+            assert.equal(row2, null);
+        } finally {
+            Date.now = origDateNow;
+            db.adapter.transaction = origTx;
+            await db.close();
+            cleanupTempDb(dbPath);
+        }
+    });
+
+    it('33. SQLITE_FULL 發生時 Drain 立即中止且不無限重試 (v2.7.3 P0-3)', async () => {
+        const dbPath = getTempDbPath('drain_disk_full_stop');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE df_test (id INT)');
+
+        let txAttempts = 0;
+        const origTx = db.adapter.drainTransaction.bind(db.adapter);
+        db.adapter.drainTransaction = async function(fn, cap) {
+            txAttempts++;
+            const fullErr = new Error('database or disk is full');
+            fullErr.code = 'SQLITE_FULL';
+            throw fullErr;
+        };
+
+        for (let i = 0; i < 3; i++) {
+            db.queueDbOp('INSERT INTO df_test VALUES (?)', [i]);
+        }
+
+        const drainCap = { id: crypto.randomUUID() };
+        // 執行 drain，應該在第一次遭遇 SQLITE_FULL 後立即終止，而不是重試到 3000ms 超時
+        const startTime = Date.now();
+        const result = await db.writeQueue.drain(drainCap, 3000);
+        const elapsed = Date.now() - startTime;
+
+        assert.equal(result.isDiskFull, true);
+        assert.equal(result.isClean, false);
+        // 驗證 Worker 在第一次失敗後立即 break，沒有進行無限重試
+        assert.equal(txAttempts, 1);
+        // 驗證耗時遠小於 3000ms deadline（即時中斷退出）
+        assert.ok(elapsed < 2000, `耗時過長: ${elapsed}ms`);
+
+        // 驗證資料仍完整保留在隊列中
+        assert.equal(db.writeQueue.queue.length, 3);
+        assert.equal(db.writeQueue.state, QUEUE_STATES.PAUSED_DISK_FULL);
+
+        db.adapter.drainTransaction = origTx;
+        cleanupTempDb(dbPath);
+    });
+
+    it('34. PAUSED_DISK_FULL 狀態下拒絕新寫入 (v2.7.3 P1-1)', async () => {
+        const dbPath = getTempDbPath('paused_disk_full_reject');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE df_rej (id INT)');
+
+        // 人工將佇列切入 PAUSED_DISK_FULL
+        db.writeQueue.state = QUEUE_STATES.PAUSED_DISK_FULL;
+
+        const initialAccepted = db.writeQueue.getMetrics().totalAccepted;
+        const initialRejected = db.writeQueue.getMetrics().totalRejected;
+
+        let cbErr = null;
+        const accepted = db.queueDbOp('INSERT INTO df_rej VALUES (1)', [], (err) => {
+            cbErr = err;
+        });
+
+        assert.equal(accepted, false);
+        assert.ok(cbErr);
+        assert.match(cbErr.message, /磁碟滿額暫停/);
+        assert.equal(db.writeQueue.getMetrics().totalRejected, initialRejected + 1);
+        assert.equal(db.writeQueue.getMetrics().totalAccepted, initialAccepted);
+        assert.equal(db.writeQueue.queue.length, 0);
+
+        // 恢復磁碟滿額
+        db.writeQueue.resumeDiskFull();
+        assert.equal(db.writeQueue.state, QUEUE_STATES.NORMAL);
+
+        await db.close();
+        cleanupTempDb(dbPath);
+    });
+
+    it('35. PRAGMA 動態比對與硬性驗證 (v2.7.3 P1-2)', async () => {
+        const dbPath = getTempDbPath('pragma_verify');
+        // 測試正常初始化讀回一致性
+        const db = await createDatabaseSubsystem({ dbPath });
+
+        const j = await db.get('PRAGMA journal_mode');
+        assert.equal(String(j.journal_mode).toLowerCase(), 'wal');
+
+        const s = await db.get('PRAGMA synchronous');
+        assert.equal(Number(s.synchronous), 1); // NORMAL is 1
+
+        const b = await db.get('PRAGMA busy_timeout');
+        assert.equal(Number(b.timeout), 10000);
+
+        const f = await db.get('PRAGMA foreign_keys');
+        assert.equal(Number(f.foreign_keys), 0); // OFF is 0
+
+        const w = await db.get('PRAGMA wal_autocheckpoint');
+        assert.equal(Number(w.wal_autocheckpoint), 1000);
+
+        await db.close();
+
+        // 測試 PRAGMA 設定不符時拋出 HARD_FAIL 且 Adapter 進入 ERROR 狀態
+        const badAdapter = new SQLiteAdapter({
+            pragmas: {
+                journal_mode: 'INVALID_MODE'
+            }
+        });
+        await assert.rejects(
+            async () => {
+                await badAdapter.initialize(getTempDbPath('pragma_bad'));
+            },
+            /HARD_FAIL.*PRAGMA journal_mode/
+        );
+        assert.equal(badAdapter.state, ADAPTER_STATES.ERROR);
+
+        cleanupTempDb(dbPath);
+    });
+
+    it('36. Callback Exactly-Once 相容層防重調用 (v2.7.3 P1-3)', async () => {
+        const dbPath = getTempDbPath('compat_callback_once');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE cb_test (id INT PRIMARY KEY, val TEXT)');
+
+        // 1. run 成功，但 callback 內部自行拋出例外
+        let runCbCount = 0;
+        await assert.rejects(
+            async () => {
+                await db.run('INSERT INTO cb_test VALUES (1, "a")', (err) => {
+                    runCbCount++;
+                    throw new Error('Callback User Exception');
+                });
+            },
+            /Callback User Exception/
+        );
+        assert.equal(runCbCount, 1);
+
+        // 2. get 成功，callback 內部拋出例外
+        let getCbCount = 0;
+        await assert.rejects(
+            async () => {
+                await db.get('SELECT * FROM cb_test WHERE id = 1', (err, row) => {
+                    getCbCount++;
+                    throw new Error('Get Callback Exception');
+                });
+            },
+            /Get Callback Exception/
+        );
+        assert.equal(getCbCount, 1);
+
+        // 3. all 成功，callback 內部拋出例外
+        let allCbCount = 0;
+        await assert.rejects(
+            async () => {
+                await db.all('SELECT * FROM cb_test', (err, rows) => {
+                    allCbCount++;
+                    throw new Error('All Callback Exception');
+                });
+            },
+            /All Callback Exception/
+        );
+        assert.equal(allCbCount, 1);
+
+        // 4. run 失敗，callback 內部拋出例外
+        let errCbCount = 0;
+        await assert.rejects(
+            async () => {
+                await db.run('INSERT INTO cb_test VALUES (1, "duplicate")', (err) => {
+                    errCbCount++;
+                    assert.ok(err);
+                    throw new Error('Err Callback Exception');
+                });
+            },
+            /Err Callback Exception/
+        );
+        assert.equal(errCbCount, 1);
+
+        await db.close();
+        cleanupTempDb(dbPath);
+    });
+
+    it('37. Database Factory 初始化與啟動前置保護 (v2.7.3 P1-4)', async () => {
+        // 1. 正常非同步工廠建立
+        const dbPath = getTempDbPath('factory_success');
+        const db = await createDatabaseSubsystem({ dbPath });
+        assert.equal(db.adapter.state, ADAPTER_STATES.READY);
+        await db.close();
+        cleanupTempDb(dbPath);
+
+        // 2. 初始化失敗時，createDatabaseSubsystem 必須拒絕回傳
+        await assert.rejects(
+            async () => {
+                await createDatabaseSubsystem({
+                    dbPath: getTempDbPath('factory_fail'),
+                    config: {
+                        pragmas: { busy_timeout: -999 } // 無效 timeout 觸發 HARD_FAIL
+                    }
+                });
+            },
+            /HARD_FAIL/
+        );
+
+        // 3. initDatabaseSubsystemSync 提供 readyPromise 供主程式 await，失敗時拒絕
+        const syncDb = initDatabaseSubsystemSync({
+            dbPath: getTempDbPath('factory_sync_fail'),
+            config: {
+                pragmas: { busy_timeout: -999 }
+            }
+        });
+        assert.ok(syncDb.readyPromise);
+        await assert.rejects(
+            async () => {
+                await syncDb.readyPromise;
+            },
+            /HARD_FAIL/
+        );
+        assert.equal(syncDb.adapter.state, ADAPTER_STATES.ERROR);
+
+        // 嘗試在 ERROR 狀態下執行操作，必須即刻拒絕
+        await assert.rejects(
+            async () => {
+                await syncDb.run('SELECT 1');
+            },
+            /故障熔斷狀態/
+        );
     });
 
 });

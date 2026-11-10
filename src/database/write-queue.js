@@ -94,15 +94,15 @@ class WriteQueue {
         const queuedCount = this.queue.length;
         const inFlightCount = this.#inFlightItems.size;
         const retryPendingCount = this.retryPendingItems.size;
-        const totalUncommitted = queuedCount + retryPendingCount + inFlightCount;
+        const uncommittedErrorCount = this.uncommittedErrors.length;
+        const totalPending = queuedCount + retryPendingCount + inFlightCount;
+        const totalUncommitted = totalPending + uncommittedErrorCount;
 
         const totalTrackedAccepted = (
             this.totalCommitted +
-            queuedCount +
-            retryPendingCount +
-            inFlightCount +
+            totalPending +
             this.totalQuarantined +
-            this.totalUncommittedErrors
+            uncommittedErrorCount
         );
 
         return {
@@ -110,13 +110,15 @@ class WriteQueue {
             queuedCount,
             retryPendingCount,
             inFlightCount,
+            uncommittedErrorCount,
+            totalPending,
             totalUncommitted,
             totalAccepted: this.totalAccepted,
             totalCommitted: this.totalCommitted,
             totalRejected: this.totalRejected,
             totalQuarantined: this.totalQuarantined,
-            totalUncommittedErrors: this.totalUncommittedErrors,
-            totalAbandoned: this.totalQuarantined + this.totalUncommittedErrors, // 向後相容指標
+            totalUncommittedErrors: uncommittedErrorCount,
+            totalAbandoned: this.totalQuarantined + uncommittedErrorCount, // 向後相容指標
             conservationCheck: (this.totalAccepted === totalTrackedAccepted),
             shutdownGateClosed: this._shutdownGateClosed
         };
@@ -237,18 +239,20 @@ class WriteQueue {
             }
         }
 
-        // 檢查 Adapter 與 Queue 狀態
+        // 檢查 Adapter 與 Queue 狀態 (P1-1: 包含 PAUSED_DISK_FULL)
         const adapterStatus = typeof this.#adapter.getActiveStatus === 'function' ? this.#adapter.getActiveStatus() : null;
         if (
             this._shutdownGateClosed ||
             (adapterStatus && !adapterStatus.acceptingNewTasks) ||
+            this.state === QUEUE_STATES.PAUSED_DISK_FULL ||
             this.state === QUEUE_STATES.PAUSED_ERROR ||
             this.state === QUEUE_STATES.CLOSED ||
             this.#adapter.state === ADAPTER_STATES.ERROR ||
             this.#adapter.state === ADAPTER_STATES.CLOSED
         ) {
             this.totalRejected++;
-            const err = new Error(`[QUEUE_REJECTED] 資料庫或寫入隊列處於錯誤或關閉狀態 (queue: ${this.state}, adapter: ${this.#adapter.state})`);
+            const reason = this.state === QUEUE_STATES.PAUSED_DISK_FULL ? '磁碟滿額暫停' : '錯誤或關閉狀態';
+            const err = new Error(`[QUEUE_REJECTED] 資料庫或寫入隊列處於${reason} (queue: ${this.state}, adapter: ${this.#adapter.state})`);
             if (callback) callback(err);
             return false;
         }
@@ -421,6 +425,14 @@ class WriteQueue {
 
             if (errType === ERROR_TYPES.DISK_FULL) {
                 this.state = QUEUE_STATES.PAUSED_DISK_FULL;
+                if (this.flushTimer) {
+                    clearTimeout(this.flushTimer);
+                    this.flushTimer = null;
+                }
+                this._requeueRemainingBatchAtHead(remaining);
+                throw err;
+            } else if (err.message && err.message.includes('DEADLINE_EXPIRED')) {
+                // P0-2: Deadline 到期，剩餘尚未提交的子批次按原始 seq 完整原子退回隊列頭部
                 this._requeueRemainingBatchAtHead(remaining);
                 throw err;
             } else if (errType === ERROR_TYPES.FATAL_CORRUPT || errType === ERROR_TYPES.ROLLBACK_FAILURE || errType === ERROR_TYPES.UNKNOWN) {
@@ -454,6 +466,17 @@ class WriteQueue {
     async _commitOrIsolate(batch, capability = null, deadlineAt = null) {
         if (!batch || batch.length === 0) return;
 
+        // P0-2: 統一交易准入檢查 (Admission Check)
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限 (${deadlineAt}) 已到達，禁止啟動新交易`);
+        }
+        if (this._shutdownGateClosed && !capability) {
+            throw new Error('[GATE_CLOSED] 停機閘門已關閉，禁止啟動非 Drain 交易');
+        }
+        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+            throw new Error(`[QUEUE_PAUSED] 寫入隊列處於暫停狀態 (${this.state})，禁止啟動新交易`);
+        }
+
         const isDrain = Boolean(capability);
         const executeFn = (txFn) => {
             return isDrain
@@ -482,13 +505,13 @@ class WriteQueue {
                 return;
             }
 
-            // 非資料約束錯誤（DISK_FULL, UNKNOWN, BUSY 等）直接向上拋出，由最外層統一退回！
+            // 非資料約束錯誤（DISK_FULL, UNKNOWN, BUSY, DEADLINE 等）直接向上拋出，由最外層統一退回！
             throw err;
         }
     }
 
     /**
-     * 遞迴二分拆分：子層不自行退回，保持 Left 優先 (P0-1)
+     * 遞迴二分拆分：子層不自行退回，保持 Left 優先 (P0-1, P0-2)
      */
     async _binaryIsolateBatch(batch, capability = null, deadlineAt = null) {
         if (batch.length === 1) {
@@ -500,6 +523,11 @@ class WriteQueue {
             return;
         }
 
+        // P0-2: 遞迴前再次檢查 Deadline，防止子批次超時啟動新交易
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限已到達，禁止遞迴拆分執行子批次`);
+        }
+
         const mid = Math.floor(batch.length / 2);
         const left = batch.slice(0, mid);
         const right = batch.slice(mid);
@@ -507,7 +535,12 @@ class WriteQueue {
         // 先執行 Left，若 Left 拋出非約束錯誤，直接往上拋給 _executeTopLevelBatch 統一原子排回
         await this._commitOrIsolate(left, capability, deadlineAt);
 
-        // Left 成功後再執行 Right
+        // P0-2: Left 成功後再檢查 Deadline，若超時則拋出 DEADLINE_EXPIRED，由頂層統一退回 Right
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限已到達，禁止執行右側子批次`);
+        }
+
+        // Left 成功且在期限內，再執行 Right
         await this._commitOrIsolate(right, capability, deadlineAt);
     }
 
@@ -535,11 +568,14 @@ class WriteQueue {
         let deadlineTimeoutId = null;
         const deadlinePromise = new Promise((resolve) => {
             deadlineTimeoutId = setTimeout(() => {
-                const uncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size;
+                const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
                 resolve({
                     isClean: false,
+                    isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
+                    hasUncommittedErrors: this.uncommittedErrors.length > 0,
+                    isDiskFull: this.state === QUEUE_STATES.PAUSED_DISK_FULL,
                     deadlineExpired: true,
-                    uncommitted,
+                    uncommitted: totalUncommitted,
                     adapterStatus: this.#adapter.getActiveStatus()
                 });
             }, deadlineMs);
@@ -549,6 +585,10 @@ class WriteQueue {
         const drainWorkerPromise = (async () => {
             while (this.queue.length > 0 || this.retryPendingItems.size > 0 || this.#inFlightItems.size > 0) {
                 if (Date.now() >= deadlineAt) {
+                    break;
+                }
+                // P0-3: 磁碟滿額或嚴重錯誤時立即中止 Drain，避免無限重試
+                if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
                     break;
                 }
 
@@ -565,17 +605,29 @@ class WriteQueue {
                     }
                     try {
                         await this._executeTopLevelBatch(batch, capability, deadlineAt);
-                    } catch (_) {}
+                    } catch (batchErr) {
+                        // 若遇到磁碟滿額或嚴重錯誤，立即中斷排空迴圈 (P0-3)
+                        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                            break;
+                        }
+                    }
                 } else if (this.#inFlightItems.size > 0) {
                     await new Promise(r => setTimeout(r, 20));
                 }
             }
 
-            const clean = (this.queue.length === 0 && this.retryPendingItems.size === 0 && this.#inFlightItems.size === 0);
+            const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
+            const hasErrors = this.uncommittedErrors.length > 0;
+            const isDiskFull = this.state === QUEUE_STATES.PAUSED_DISK_FULL;
+            const clean = (totalUncommitted === 0 && !isDiskFull);
+
             return {
                 isClean: clean,
-                deadlineExpired: !clean,
-                uncommitted: this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size,
+                isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
+                hasUncommittedErrors: hasErrors,
+                isDiskFull,
+                deadlineExpired: (Date.now() >= deadlineAt),
+                uncommitted: totalUncommitted,
                 adapterStatus: this.#adapter.getActiveStatus()
             };
         })();

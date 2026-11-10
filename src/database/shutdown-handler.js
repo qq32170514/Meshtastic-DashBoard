@@ -49,12 +49,19 @@ class ShutdownHandler {
                 const qMetrics = this.#writeQueue.getMetrics();
                 const adapterStatus = this.#adapter.getActiveStatus();
 
-                if (drainResult.isClean && !drainResult.deadlineExpired && qMetrics.totalUncommitted === 0 && adapterStatus.isQuiescent) {
+                if (
+                    drainResult.isClean &&
+                    !drainResult.deadlineExpired &&
+                    !drainResult.hasUncommittedErrors &&
+                    !drainResult.isDiskFull &&
+                    qMetrics.totalUncommitted === 0 &&
+                    adapterStatus.isQuiescent
+                ) {
                     drainClean = true;
                     this.#authority.markDrainCompleted(drainCap);
                     console.log('✅ [SHUTDOWN] 隊列資料已全數安全寫入並排空');
                 } else {
-                    console.warn(`⚠️ [SHUTDOWN] 隊列未完全排空 (未提交: ${qMetrics.totalUncommitted}, 在途: ${qMetrics.inFlightCount}, Quiescent: ${adapterStatus.isQuiescent})`);
+                    console.warn(`⚠️ [SHUTDOWN] 隊列未完全排空 (未提交: ${qMetrics.totalUncommitted}, 在途: ${qMetrics.inFlightCount}, 未提錯誤: ${qMetrics.uncommittedErrorCount || 0}, 磁碟滿額: ${Boolean(drainResult.isDiskFull)}, Quiescent: ${adapterStatus.isQuiescent})`);
                 }
             } catch (drainErr) {
                 console.error('⚠️ [SHUTDOWN] 隊列排空階段遭遇異常或超時:', drainErr.message);
