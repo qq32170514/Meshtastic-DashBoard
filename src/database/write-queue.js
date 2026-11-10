@@ -36,6 +36,7 @@ class WriteQueue {
     #adapter;
     #itemSeq = 0;
     #currentFlushPromise = null;
+    #retryTimers = new Set();
 
     constructor(adapter, config = {}) {
         if (!adapter) {
@@ -122,6 +123,28 @@ class WriteQueue {
             conservationCheck: (this.totalAccepted === totalTrackedAccepted),
             shutdownGateClosed: this._shutdownGateClosed
         };
+    }
+
+    /**
+     * 🌟 清除所有待處理之退避重試定時器 (P0-1)
+     */
+    _clearAllRetryTimers() {
+        for (const timerId of this.#retryTimers) {
+            clearTimeout(timerId);
+        }
+        this.#retryTimers.clear();
+    }
+
+    /**
+     * 🌟 安全呼叫入列拒絕回呼 (P1-1: 隔離回呼拋出之異常，保證 Exactly-Once 且不破壞佇列)
+     */
+    _safeRejectCallback(callback, err) {
+        if (typeof callback !== 'function') return;
+        try {
+            callback(err);
+        } catch (cbErr) {
+            console.error('❌ [ENQUEUE_CALLBACK_EXCEPTION] 入列拒絕回呼拋出異常:', cbErr.message);
+        }
     }
 
     /**
@@ -253,14 +276,14 @@ class WriteQueue {
             this.totalRejected++;
             const reason = this.state === QUEUE_STATES.PAUSED_DISK_FULL ? '磁碟滿額暫停' : '錯誤或關閉狀態';
             const err = new Error(`[QUEUE_REJECTED] 資料庫或寫入隊列處於${reason} (queue: ${this.state}, adapter: ${this.#adapter.state})`);
-            if (callback) callback(err);
+            this._safeRejectCallback(callback, err);
             return false;
         }
 
         if (this.state === QUEUE_STATES.CLOSING) {
             this.totalRejected++;
             const err = new Error('[QUEUE_REJECTED] 系統關閉中，拒絕新寫入');
-            if (callback) callback(err);
+            this._safeRejectCallback(callback, err);
             return false;
         }
 
@@ -268,7 +291,7 @@ class WriteQueue {
         if (this.queue.length + this.retryPendingItems.size >= this.#config.maxQueueSize) {
             this.totalRejected++;
             const err = new Error(`[BACKPRESSURE_REJECTED] 隊列已達上限 (${this.#config.maxQueueSize})，寫入拒絕`);
-            if (callback) callback(err);
+            this._safeRejectCallback(callback, err);
             return false;
         }
 
@@ -325,35 +348,39 @@ class WriteQueue {
     }
 
     /**
-     * 將項目排入重試等待隊列 (單一歸屬原則：不在 queue 中，只在 retryPendingItems)
+     * 將項目排入重試等待隊列 (單一歸屬原則：不在 queue 中，只在 retryPendingItems) (P0-1)
      */
     _scheduleRetry(batch, delayMs, deadlineAt = null) {
-        // P0-3: 檢查剩餘預算
-        if (deadlineAt) {
-            const remainingBudget = deadlineAt - Date.now();
-            if (delayMs > remainingBudget) {
-                console.warn(`⚠️ [RETRY_BUDGET_EXCEEDED] 退避延遲 (${delayMs}ms) 超過剩餘預算 (${remainingBudget}ms)，轉為 UNCOMMITTED_ERROR`);
-                for (const item of batch) {
-                    this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED]'));
-                    this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 停機期限內無法完成重試'));
-                }
-                return;
+        const retryAt = Date.now() + delayMs;
+        for (const item of batch) {
+            item.attempt++;
+            item.retryAt = retryAt;
+        }
+
+        // P0-1, P0-3: 檢查剩餘排空期限預算
+        if (deadlineAt && (Date.now() + delayMs > deadlineAt)) {
+            console.warn(`⚠️ [RETRY_BUDGET_EXCEEDED] 退避延遲 (${delayMs}ms) 超過剩餘排空期限預算，轉為 UNCOMMITTED_ERROR`);
+            for (const item of batch) {
+                this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED]'));
+                this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 停機期限內無法容納重試延遲'));
             }
+            return;
         }
 
         for (const item of batch) {
-            item.attempt++;
             this._transitionItem(item, ITEM_STATUS.RETRY_PENDING);
         }
 
-        setTimeout(() => {
+        let timerId = null;
+        timerId = setTimeout(() => {
+            this.#retryTimers.delete(timerId);
             if (this.state === QUEUE_STATES.CLOSED || this.state === QUEUE_STATES.PAUSED_ERROR) {
                 return;
             }
-            // 從 retryPendingItems 轉移回 queue
+            // 從 retryPendingItems 轉移回 queue (僅提升到達重試時間之項目)
             const toRequeue = [];
             for (const item of batch) {
-                if (this.retryPendingItems.has(item)) {
+                if (this.retryPendingItems.has(item) && Date.now() >= (item.retryAt || 0)) {
                     toRequeue.push(item);
                 }
             }
@@ -362,6 +389,7 @@ class WriteQueue {
                 this._checkTriggerFlush();
             }
         }, delayMs);
+        this.#retryTimers.add(timerId);
     }
 
     /**
@@ -592,10 +620,31 @@ class WriteQueue {
                     break;
                 }
 
-                // 將 retryPendingItems 推進回隊列
+                // 🌟 P0-1: 嚴格遵守 Retry Backoff，僅提升已經到達重試時間的項目
                 if (this.retryPendingItems.size > 0) {
-                    const toRequeue = Array.from(this.retryPendingItems);
-                    this._requeueRemainingBatchAtHead(toRequeue);
+                    const now = Date.now();
+                    const readyToRequeue = [];
+                    const expiredBudgetItems = [];
+
+                    for (const item of this.retryPendingItems) {
+                        const rAt = item.retryAt || 0;
+                        if (rAt <= now) {
+                            readyToRequeue.push(item);
+                        } else if (rAt > deadlineAt) {
+                            expiredBudgetItems.push(item);
+                        }
+                    }
+
+                    if (expiredBudgetItems.length > 0) {
+                        for (const item of expiredBudgetItems) {
+                            this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                            this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                        }
+                    }
+
+                    if (readyToRequeue.length > 0) {
+                        this._requeueRemainingBatchAtHead(readyToRequeue);
+                    }
                 }
 
                 if (this.queue.length > 0) {
@@ -610,6 +659,20 @@ class WriteQueue {
                         if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
                             break;
                         }
+                    }
+                } else if (this.retryPendingItems.size > 0) {
+                    // 佇列目前為空，但有尚未到達重試時間的 retryPendingItems
+                    // 有界等待至下一次重試到達或 deadline，嚴格禁止 busy-spin 或提前重試
+                    const now = Date.now();
+                    let nextRetryAt = deadlineAt;
+                    for (const item of this.retryPendingItems) {
+                        if (item.retryAt && item.retryAt < nextRetryAt) {
+                            nextRetryAt = item.retryAt;
+                        }
+                    }
+                    const waitMs = Math.min(Math.max(1, nextRetryAt - now), Math.max(0, deadlineAt - now));
+                    if (waitMs > 0) {
+                        await new Promise(r => setTimeout(r, Math.min(waitMs, 50)));
                     }
                 } else if (this.#inFlightItems.size > 0) {
                     await new Promise(r => setTimeout(r, 20));
@@ -635,9 +698,11 @@ class WriteQueue {
         try {
             const result = await Promise.race([drainWorkerPromise, deadlinePromise]);
             if (deadlineTimeoutId) clearTimeout(deadlineTimeoutId);
+            this._clearAllRetryTimers();
             return result;
         } catch (err) {
             if (deadlineTimeoutId) clearTimeout(deadlineTimeoutId);
+            this._clearAllRetryTimers();
             throw err;
         }
     }
@@ -649,6 +714,7 @@ class WriteQueue {
             clearTimeout(this.flushTimer);
             this.flushTimer = null;
         }
+        this._clearAllRetryTimers();
     }
 }
 

@@ -76,33 +76,29 @@
 
 ---
 
-### 6. SQLite Reliability Refactoring v2.7.3 缺陷修正與全量獨立驗證完成 (READY FOR REVIEW)
+### 6. SQLite Reliability Refactoring v2.7.4 強固修正與全量獨立驗證完成 (READY FOR REVIEW)
 - **架構目錄**：`src/database/`
   - [sqlite.config.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js)：集中式 PRAGMA、Queue、Backup、Shutdown 與 PM2 緩衝配置。統一 busy_timeout=10000、foreign_keys=OFF 等核心設定。
   - [retry-policy.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/retry-policy.js)：8 大 SQLite 錯誤分類與指數退避抖動計算。
   - [sqlite.adapter.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js)：
-    - **P1-2 PRAGMA 動態比對與硬性驗證**：初始化時執行 PRAGMA 並動態讀回實際值嚴格比對，不符時拋出 HARD_FAIL 阻止 Adapter 進入 READY。
-    - **靜止狀態追蹤與停機工作閘門**：追蹤 5 大底層計數，提供 `isQuiescent()` 供關閉前強驗證；關閉閘門阻止 GENERAL 任務進入排程。
-    - **私有封裝與 Checkpoint 模式分離**：WeakMap 私有憑證與 TRUNCATE 模式強檢查。
+    - **PRAGMA 動態比對與硬性驗證 (v2.7.3 P1-2)**：初始化時執行 PRAGMA 並動態讀回實際值嚴格比對，不符時拋出 HARD_FAIL 阻止 Adapter 進入 READY。
+    - **初始化失敗連線清理防洩漏 (v2.7.4 P1-2)**：PRAGMA 驗證失敗時安全關閉並清空已開啟的底層 `this.db` 連線。
+    - **有界等待關閉與靜止保護 (v2.7.4 P0-2)**：`close(timeoutMs)` 支援有界等待，未達 `isQuiescent()` 時拋出 `CLOSE_REJECTED`，嚴禁呼叫 `_rawClose()` 摧毀活動連線。
+    - **私有封裝與 Checkpoint 模式分離**：WeakMap 私有憑證與 TRUNCATE 模式 9 項前置強檢查。
   - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
-    - **P0-1 Drain 指標健全性修復**：`getMetrics()` 擴充 `uncommittedErrorCount`、`totalPending`、`totalUncommitted`，UNCOMMITTED_ERROR 絕不誤判為成功排空。
-    - **P0-2 Deadline 交易阻絕**：統一交易准入檢查；Binary Isolation 遞迴切分前瞻性檢查 Deadline，超時後嚴格阻止 Right 啟動新交易，未提交資料按原始 seq 保持 FIFO 回退。
-    - **P0-3 SQLITE_FULL 即刻中止**：Drain Worker 遇 `PAUSED_DISK_FULL` 立即 break 退出，杜絕無限重試。
-    - **P1-1 磁碟滿額拒絕新寫入**：`enqueue()` 攔截 `PAUSED_DISK_FULL`，即刻拒絕並累計 `totalRejected`，不虛增 `totalAccepted`，守恆公式恆成立。
+    - **Drain BUSY Backoff 嚴格遵守與定時器清理 (v2.7.4 P0-1)**：`drain()` 期間嚴格遵循 `retryAt` 指數退避延遲與剩餘 Deadline 預算檢查，不提前暴力重試，結束時清理所有 `#retryTimers`。
+    - **入列拒絕回呼異常隔離 (v2.7.4 P1-1)**：`_safeRejectCallback()` 隔離使用者 callback 例外，防止炸穿入列呼叫端。
+    - **Drain 指標健全性與 Deadline 交易阻絕 (v2.7.3 P0-1 / P0-2 / P0-3)**：`getMetrics()` 納入 `uncommittedErrorCount`、`totalPending`、`totalUncommitted`；Binary Isolation 遞迴前瞻性檢查 Deadline，未提交子批次按原始 `seq` 原子退回隊列頭部；遇 `PAUSED_DISK_FULL` 立即中止 Drain 並拒絕新寫入。
   - [shutdown-handler.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js)：
-    - **P0-1 審核強化**：`drainClean` 要求 `totalUncommitted === 0` 且無錯誤、無滿額；未完全排空時跳過 TRUNCATE Checkpoint 保護 WAL。
+    - **時間預算分配與未提交資料誠實審計 (v2.7.4 P0-2 / P0-3)**：精確計算 `drainTimeoutMs` 與 `remainingCloseBudget`；不論 Graceful 或 Emergency Shutdown，只要 `totalUncommitted > 0` 必誠實回報 `success: false, dataClean: false`。
   - [backup-manager.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)：
     - 完整性檢驗異常防護，`tempDb.close` 異常歸類為 `VERIFY_ERROR`，嚴格禁止刪除候選備份檔。
-  - [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js)：
-    - **P1-3 Callback Exactly-Once**：相容層改用 `p.then(onFulfilled, onRejected)` 分離，Callback 拋出自定義例外絕不重複調用，Promise Rejection 不被吞掉。
-    - **P1-4 Factory 啟動前置保護**：`initDatabaseSubsystemSync` 掛載 `readyPromise`，失敗時自動轉移至 `ADAPTER_STATES.ERROR`。
-  - [index.js (主程式)](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
-    - **P1-2 移除冗餘 PRAGMA**：徹底移除原本零散執行的 raw PRAGMA 語句。
-    - **P1-4 伺服器啟動強等待**：`startServer()` 封裝，強等待 `db.readyPromise`，初始化失敗立即 `process.exit(1)` 終止 HTTP 與 MQTT 啟動。
+  - [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js (主程式)](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
+    - 相容層改用 `p.then(onFulfilled, onRejected)` 分離保證 Callback Exactly-Once；主程式 `startServer()` 與 MQTT 啟動強等待 `db.readyPromise`。
 - **測試驗證 (`tests/database/sqlite_reliability.test.js`)**：
-  - 全套 37 項極限場景已實際使用獨立臨時資料庫執行完畢：**37 tests passed, 0 failed, 總耗時 2709ms**。
-  - 技術說明書：已建立 [SQLITE_REFACTORING_GUIDE_v2.7.3.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE_v2.7.3.md)。
-  - 封裝包：已產出 `Meshtastic-DashBoard_SQLite_Reliability_v2.7.3.zip` 供人工審查。
+  - 全套 **41 項**極限場景已實際使用獨立臨時資料庫執行完畢：**41 tests passed, 0 failed, 總耗時 2852ms**。
+  - 技術說明書：已同步更新至 [SQLITE_REFACTORING_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE.md)。
+  - 封裝包：已產出 `Meshtastic-DashBoard_SQLite_Reliability_v2.7.4.zip` 供人工審查。
 
 ---
 

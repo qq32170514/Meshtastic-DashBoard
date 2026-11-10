@@ -1,5 +1,6 @@
 // src/database/shutdown-handler.js
 const { shutdown: defaultShutdownConfig } = require('./sqlite.config');
+const { ADAPTER_STATES } = require('./sqlite.adapter');
 
 class ShutdownHandler {
     #authority;
@@ -31,13 +32,17 @@ class ShutdownHandler {
             const startTime = Date.now();
             console.log(`🛑 [SHUTDOWN] 接收到信號 ${signal}，啟動安全關閉流程...`);
 
-            const deadlineMs = this.#config.drainTimeoutMs || 8000;
+            // P0-2: 精確計算總時間預算分配 (pm2KillTimeoutMs, drainWaitBufferMs, drainTimeoutMs)
+            const totalBudget = this.#config.pm2KillTimeoutMs || 10000;
+            const waitBufferMs = this.#config.drainWaitBufferMs || 1500;
+            const drainTimeoutMs = Math.min(this.#config.drainTimeoutMs || 8000, Math.max(1000, totalBudget - waitBufferMs));
+
             let drainCap = null;
             let drainClean = false;
 
             // 1. 簽發本次專屬且受限時間之 DrainCapability
             try {
-                drainCap = this.#authority.issueDrainCapability(deadlineMs);
+                drainCap = this.#authority.issueDrainCapability(drainTimeoutMs);
             } catch (authErr) {
                 console.error('❌ [SHUTDOWN] 簽發 DrainCapability 失敗:', authErr.message);
                 throw authErr;
@@ -45,7 +50,7 @@ class ShutdownHandler {
 
             // 2. 執行 WriteQueue 排空 (包含獨立 Deadline Observer 控制)
             try {
-                const drainResult = await this.#writeQueue.drain(drainCap, deadlineMs);
+                const drainResult = await this.#writeQueue.drain(drainCap, drainTimeoutMs);
                 const qMetrics = this.#writeQueue.getMetrics();
                 const adapterStatus = this.#adapter.getActiveStatus();
 
@@ -80,28 +85,45 @@ class ShutdownHandler {
                 console.warn('⚠️ [SHUTDOWN] 由於隊列未乾淨排空或未達靜止，跳過 TRUNCATE Checkpoint 以防止損壞');
             }
 
-            // 4. 關閉 Adapter 連線
+            // 4. 關閉 Adapter 連線 (P0-2: 有界等待，嚴禁無限懸掛)
+            let adapterClosed = false;
+            let closeError = null;
+            const elapsed = Date.now() - startTime;
+            const remainingCloseBudget = Math.max(100, Math.min(waitBufferMs, totalBudget - elapsed));
+
             try {
-                await this.#adapter.close();
+                await this.#adapter.close(remainingCloseBudget);
+                adapterClosed = true;
                 console.log('🔒 [SHUTDOWN] SQLite 連線已安全關閉');
             } catch (closeErr) {
+                closeError = closeErr;
+                adapterClosed = false;
                 console.error('❌ [SHUTDOWN] Adapter 關閉失敗:', closeErr.message);
-                throw closeErr;
             }
 
             const durationMs = Date.now() - startTime;
             const finalMetrics = this.#writeQueue.getMetrics();
-            console.log(`🏁 [SHUTDOWN] 關閉流程完成，耗時 ${durationMs}ms`);
+            const hasUncommittedData = (finalMetrics.totalUncommitted > 0);
+            const overallSuccess = Boolean(drainClean && adapterClosed && !hasUncommittedData);
+            console.log(`🏁 [SHUTDOWN] 關閉流程完成，耗時 ${durationMs}ms (成功: ${overallSuccess}, Adapter關閉: ${adapterClosed}, 資料潔淨: ${!hasUncommittedData})`);
 
             const result = {
-                success: drainClean,
+                success: overallSuccess,
+                adapterClosed: Boolean(adapterClosed),
+                dataClean: Boolean(drainClean && !hasUncommittedData),
+                hasUncommittedData,
                 durationMs,
                 signal,
-                metrics: finalMetrics
+                metrics: finalMetrics,
+                diagnostics: {
+                    adapterStatus: this.#adapter.getActiveStatus(),
+                    queueMetrics: finalMetrics,
+                    closeError: closeError ? closeError.message : null
+                }
             };
 
             if (options.exitProcess !== false && typeof process !== 'undefined' && process.exit) {
-                process.exit(drainClean ? 0 : 1);
+                process.exit(overallSuccess ? 0 : 1);
             }
 
             return result;
@@ -111,8 +133,8 @@ class ShutdownHandler {
     }
 
     /**
-     * 🌟 緊急崩潰關閉處理 (Emergency Crash Shutdown - P0-4)
-     * 絕對不可在 SQLite 底層仍在操作時強制 rawClose()，必須等待有界時間，超時則放棄連線釋放直接診斷轉儲
+     * 🌟 緊急崩潰關閉處理 (Emergency Crash Shutdown - P0-2, P0-3, P0-4)
+     * 同時檢查 Adapter 靜止與 WriteQueue 未提交狀態；未 Quiescent 嚴禁 rawClose()，有未提交資料嚴禁宣告成功
      */
     async handleEmergencyCrash(err, origin = 'uncaughtException', options = {}) {
         console.error(`🚨 [EMERGENCY_SHUTDOWN] 觸發緊急關閉！來源: ${origin} | 錯誤:`, err);
@@ -130,6 +152,10 @@ class ShutdownHandler {
             status = this.#adapter.getActiveStatus();
         }
 
+        const qMetrics = this.#writeQueue.getMetrics();
+        const hasUncommittedData = (qMetrics.totalUncommitted > 0);
+        const dataClean = (!hasUncommittedData);
+
         // 3. 檢查是否達到完整 Quiescent (包含 schedulerPending, activeTransactions, underlyingExecuting)
         if (!this.#adapter.isQuiescent()) {
             console.error('🚨 [EMERGENCY_CLOSE_ABORTED] SQLite Adapter 尚未達到完全靜止狀態，為防記憶體損毀嚴禁呼叫 rawClose()！');
@@ -139,28 +165,54 @@ class ShutdownHandler {
                 error: err?.message || String(err),
                 stack: err?.stack || null,
                 adapterStatus: status,
-                queueMetrics: this.#writeQueue.getMetrics()
+                queueMetrics: qMetrics
             };
             console.error('💥 [CRASH_DIAGNOSTIC_DUMP]', JSON.stringify(dump, null, 2));
 
             if (options.exitProcess !== false && typeof process !== 'undefined' && process.exit) {
                 process.exit(1);
             }
-            return { success: false, forcedExit: true, dump };
+            return {
+                success: false,
+                adapterClosed: false,
+                dataClean: false,
+                hasUncommittedData,
+                forcedExit: true,
+                queueMetrics: qMetrics,
+                dump
+            };
         }
 
-        // 4. 底層無操作且佇列靜止，可安全調用 emergencyClose
+        // 4. 底層無操作且佇列靜止，可安全調用 emergencyClose (P0-3: 誠實回報成功語意)
+        let adapterClosed = false;
+        let closeErrMessage = null;
         try {
             await this.#adapter.emergencyClose();
+            adapterClosed = (this.#adapter.state === ADAPTER_STATES.CLOSED);
             console.log('🔒 [EMERGENCY_SHUTDOWN] SQLite 連線已安全釋放');
         } catch (closeErr) {
+            closeErrMessage = closeErr.message;
             console.error('⚠️ [EMERGENCY_SHUTDOWN] emergencyClose 報錯:', closeErr.message);
         }
 
+        const overallSuccess = Boolean(adapterClosed && dataClean);
+
         if (options.exitProcess !== false && typeof process !== 'undefined' && process.exit) {
-            process.exit(1);
+            process.exit(overallSuccess ? 0 : 1);
         }
-        return { success: true, forcedExit: false };
+        return {
+            success: overallSuccess,
+            adapterClosed,
+            dataClean,
+            hasUncommittedData,
+            forcedExit: false,
+            queueMetrics: qMetrics,
+            diagnostics: {
+                adapterStatus: this.#adapter.getActiveStatus(),
+                queueMetrics: qMetrics,
+                closeError: closeErrMessage
+            }
+        };
     }
 }
 

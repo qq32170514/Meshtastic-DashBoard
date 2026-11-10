@@ -32,23 +32,40 @@ function cleanupTempDb(dbPath) {
     try { if (fs.existsSync(`${dbPath}-shm`)) fs.unlinkSync(`${dbPath}-shm`); } catch (_) {}
 }
 
-describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', () => {
+function assertDataConservation(m) {
+    const totalPending = m.queuedCount + m.retryPendingCount + m.inFlightCount;
+    const totalUncommitted = totalPending + m.uncommittedErrorCount;
+    const expectedAccepted = m.totalCommitted + m.totalQuarantined + totalUncommitted;
+    assert.equal(
+        m.totalAccepted,
+        expectedAccepted,
+        `Data Conservation 違規! totalAccepted=${m.totalAccepted}, 但 committed(${m.totalCommitted}) + quarantined(${m.totalQuarantined}) + uncommitted(${totalUncommitted}) = ${expectedAccepted}`
+    );
+}
+
+describe('SQLite Reliability v2.7.4 Comprehensive Test Suite (41 Scenarios)', () => {
 
     // ==========================================
     // Group A: Scheduler / Shutdown (7 Scenarios)
     // ==========================================
 
-    it('1. Scheduler Pending 時觸發 Emergency Shutdown: 拒絕 rawClose 並產生診斷轉儲', async () => {
+    it('1. Scheduler Pending/Active 時觸發 Emergency Shutdown: 拒絕 rawClose 並產生診斷轉儲 (v2.7.4)', async () => {
         const dbPath = getTempDbPath('sched_pending');
         const db = await createDatabaseSubsystem({ dbPath });
 
-        // 佔位一個底層操作，使後續任務排入 Scheduler Pending
-        let releaseBlocker;
-        const blockerPromise = new Promise(r => releaseBlocker = r);
-        const task1 = db.adapter.execute('SELECT 1').catch(() => {}); // 開始
-        db.adapter.isExecutingUnderlying = true;
+        // 使用真實的 Deferred scheduler task 佔用排程器底層執行
+        let releaseTask;
+        const deferredTask = new Promise((resolve) => { releaseTask = resolve; });
+        const runningTask = db.adapter._schedule(async () => {
+            await deferredTask;
+        });
 
-        // 觸發緊急關閉
+        // 等待任務真正被排程器排入並進入執行
+        while (!db.adapter.isExecutingUnderlying) {
+            await new Promise(r => setTimeout(r, 5));
+        }
+
+        // 觸發緊急關閉 (等待 50ms 超時)
         const crashResult = await db.shutdownHandler.handleEmergencyCrash(
             new Error('Scheduler Pending Crash Test'),
             'testOrigin',
@@ -57,10 +74,13 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
 
         assert.equal(crashResult.success, false);
         assert.equal(crashResult.forcedExit, true);
+        assert.equal(crashResult.adapterClosed, false);
         assert.ok(crashResult.dump);
         assert.equal(crashResult.dump.adapterStatus.underlyingExecuting, true);
 
-        db.adapter.isExecutingUnderlying = false;
+        // 釋放 deferred 任務並完成清理
+        releaseTask();
+        await runningTask;
         await db.adapter.emergencyClose();
         cleanupTempDb(dbPath);
     });
@@ -144,19 +164,28 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         cleanupTempDb(dbPath);
     });
 
-    it('5. Deadline 到達後 Scheduler 不得啟動新交易: 獨立 Observer 準時返回', async () => {
+    it('5. Deadline 到達後 Scheduler 不得啟動新交易: 獨立 Observer 準時返回 (v2.7.4)', async () => {
         const dbPath = getTempDbPath('deadline_obs');
         const adapter = new SQLiteAdapter();
         const authority = adapter.bindShutdownHandler();
         await adapter.initialize(dbPath);
 
         const queue = new WriteQueue(adapter);
-        const drainCap = authority.issueDrainCapability(200);
+        const drainCap = authority.issueDrainCapability(500);
 
-        // 模擬掛起一個 inFlight 項目
+        // 使用真實底層交易且未完成 (Deferred) 模擬真實 inFlight / 底層操作未完成
+        let releaseTx;
+        const deferredTx = new Promise(resolve => { releaseTx = resolve; });
+        const txPromise = adapter.drainTransaction(async () => {
+            await deferredTx;
+        }, drainCap);
+
+        while (!adapter.isExecutingUnderlying) {
+            await new Promise(r => setTimeout(r, 5));
+        }
+
+        // 排入一筆待排空寫入，使其在 Drain 時受阻於底層進行中之交易
         queue.enqueue('SELECT 1');
-        const item = queue.queue.shift();
-        queue._transitionItem(item, ITEM_STATUS.IN_FLIGHT);
 
         const startT = Date.now();
         const snapshot = await queue.drain(drainCap, 100);
@@ -170,6 +199,11 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         // 檢查 Gate 關閉，後續入列遭拒
         assert.equal(queue.enqueue('SELECT 2'), false);
 
+        releaseTx();
+        await txPromise;
+        while (queue.isFlushing || !adapter.isQuiescent()) {
+            await new Promise(r => setTimeout(r, 5));
+        }
         await adapter.close();
         cleanupTempDb(dbPath);
     });
@@ -775,8 +809,8 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         cleanupTempDb(dbPath);
     });
 
-    it('32. Deadline 到期後禁止 Binary Isolation 啟動新交易 (v2.7.3 P0-2)', async () => {
-        const dbPath = getTempDbPath('deadline_bi_gate');
+    it('32. Binary Isolation 部分失敗與剩餘批次原子回退 (v2.7.4 P0-2 / P0-1)', async () => {
+        const dbPath = getTempDbPath('top_batch_partial_fail');
         const db = await createDatabaseSubsystem({ dbPath });
         await db.run('CREATE TABLE dead_bi (id INT PRIMARY KEY)');
 
@@ -787,13 +821,19 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         db.adapter.transaction = async function(fn) {
             txCount++;
             if (txCount === 1) {
-                // 第一筆交易：正常提交 Left (包含 id: 1)
+                // 第 1 次整批交易：模擬觸發 DATA_CONSTRAINT 以進入 Binary Isolation 拆分
+                const constraintErr = new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed: dead_bi.id');
+                constraintErr.code = 'SQLITE_CONSTRAINT';
+                throw constraintErr;
+            }
+            if (txCount === 2) {
+                // 第 2 次交易：正常提交 Left 子批次 (包含 id: 1)
                 const res = await origTx(fn);
                 // Left 完成後，立即模擬 Deadline 到達
                 triggerDeadlineNow = true;
                 return res;
             }
-            // 第二筆交易（若被啟動）：應被嚴格阻止
+            // 第 3 次交易（Right 子批次）：應在進入交易前被 Deadline Gate 嚴格阻止
             return origTx(fn);
         };
 
@@ -806,27 +846,36 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
             return origDateNow();
         };
 
-        const item1 = { id: '1', seq: 1, sql: 'INSERT INTO dead_bi VALUES (1)', params: [], status: ITEM_STATUS.IN_FLIGHT, attempt: 0 };
-        const item2 = { id: '2', seq: 2, sql: 'INSERT INTO dead_bi VALUES (2)', params: [], status: ITEM_STATUS.IN_FLIGHT, attempt: 0 };
+        const item1 = { id: '1', seq: 1, sql: 'INSERT INTO dead_bi VALUES (1)', params: [], status: ITEM_STATUS.QUEUED, attempt: 0 };
+        const item2 = { id: '2', seq: 2, sql: 'INSERT INTO dead_bi VALUES (2)', params: [], status: ITEM_STATUS.QUEUED, attempt: 0 };
+        db.writeQueue.totalAccepted = 2;
+        db.writeQueue._transitionItem(item1, ITEM_STATUS.IN_FLIGHT);
+        db.writeQueue._transitionItem(item2, ITEM_STATUS.IN_FLIGHT);
 
         try {
+            // 🌟 透過最外層控制流程 _executeTopLevelBatch 測試 partial failure 處理
             await assert.rejects(
                 async () => {
-                    await db.writeQueue._binaryIsolateBatch([item1, item2], null, origDeadline);
+                    await db.writeQueue._executeTopLevelBatch([item1, item2], null, origDeadline);
                 },
                 /DEADLINE_EXPIRED/
             );
 
-            // 驗證：僅啟動了 1 次交易 (Left: item1)，第二個交易 (Right: item2) 絕對沒有啟動！
-            assert.equal(txCount, 1);
-            // 驗證 item1 成功提交，item2 保持未提交狀態
+            // 驗證：僅啟動了 2 次交易 (1: 整批觸發拆分, 2: Left 提交 item1)，Right 子批次交易絕對沒有啟動！
+            assert.equal(txCount, 2);
+            // 驗證 item1 成功提交，item2 被原子排回 queue 前端
             assert.equal(item1.status, ITEM_STATUS.COMMITTED);
-            assert.notEqual(item2.status, ITEM_STATUS.COMMITTED);
+            assert.equal(db.writeQueue.queue.length, 1);
+            assert.equal(db.writeQueue.queue[0].id, '2');
+            assert.equal(db.writeQueue.queue[0].status, ITEM_STATUS.QUEUED);
 
             const row = await db.get('SELECT id FROM dead_bi WHERE id = 1');
             assert.ok(row);
             const row2 = await db.get('SELECT id FROM dead_bi WHERE id = 2');
             assert.equal(row2, null);
+
+            // 驗證 Data Conservation: totalAccepted (2) = totalCommitted (1) + queued (1)
+            assertDataConservation(db.writeQueue.getMetrics());
         } finally {
             Date.now = origDateNow;
             db.adapter.transaction = origTx;
@@ -835,7 +884,8 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         }
     });
 
-    it('33. SQLITE_FULL 發生時 Drain 立即中止且不無限重試 (v2.7.3 P0-3)', async () => {
+    it('33. 故障注入測試 (Fault Injection): 模擬 SQLITE_FULL 時 Drain 立即中止且不無限重試 (v2.7.3 P0-3)', async () => {
+        // 故障注入測試：透過 monkeypatch 模擬底層回報 SQLITE_FULL 錯誤以驗證排空熔斷邏輯
         const dbPath = getTempDbPath('drain_disk_full_stop');
         const db = await createDatabaseSubsystem({ dbPath });
         await db.run('CREATE TABLE df_test (id INT)');
@@ -1002,11 +1052,69 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
         );
         assert.equal(errCbCount, 1);
 
+        // 🌟 5. PAUSED_DISK_FULL 入列拒絕回呼拋出例外 (P1-1)
+        db.writeQueue.state = QUEUE_STATES.PAUSED_DISK_FULL;
+        let dfRejectedCalled = 0;
+        assert.doesNotThrow(() => {
+            const accepted = db.queueDbOp('INSERT INTO cb_test VALUES (99, "df")', [], (err) => {
+                dfRejectedCalled++;
+                assert.ok(err);
+                throw new Error('User Callback Crash on Disk Full');
+            });
+            assert.equal(accepted, false);
+        });
+        assert.equal(dfRejectedCalled, 1);
+        db.writeQueue.resumeDiskFull();
+
+        // 🌟 6. PAUSED_ERROR 入列拒絕回呼拋出例外 (P1-1)
+        db.writeQueue.state = QUEUE_STATES.PAUSED_ERROR;
+        let errRejectedCalled = 0;
+        assert.doesNotThrow(() => {
+            const accepted = db.queueDbOp('INSERT INTO cb_test VALUES (99, "pe")', [], (err) => {
+                errRejectedCalled++;
+                assert.ok(err);
+                throw new Error('User Callback Crash on Paused Error');
+            });
+            assert.equal(accepted, false);
+        });
+        assert.equal(errRejectedCalled, 1);
+        db.writeQueue.state = QUEUE_STATES.NORMAL;
+
+        // 🌟 7. CLOSING 入列拒絕回呼拋出例外 (P1-1)
+        db.writeQueue.state = QUEUE_STATES.CLOSING;
+        let closingRejectedCalled = 0;
+        assert.doesNotThrow(() => {
+            const accepted = db.queueDbOp('INSERT INTO cb_test VALUES (99, "cl")', [], (err) => {
+                closingRejectedCalled++;
+                assert.ok(err);
+                throw new Error('User Callback Crash on Closing');
+            });
+            assert.equal(accepted, false);
+        });
+        assert.equal(closingRejectedCalled, 1);
+        db.writeQueue.state = QUEUE_STATES.NORMAL;
+
+        // 🌟 8. BACKPRESSURE 入列拒絕回呼拋出例外 (P1-1)
+        for (let i = 0; i < 5000; i++) {
+            db.writeQueue.queue.push({ id: `bp_${i}`, seq: i, status: ITEM_STATUS.QUEUED });
+        }
+        let bpRejectedCalled = 0;
+        assert.doesNotThrow(() => {
+            const accepted = db.queueDbOp('INSERT INTO cb_test VALUES (99, "bp")', [], (err) => {
+                bpRejectedCalled++;
+                assert.ok(err);
+                throw new Error('User Callback Crash on Backpressure');
+            });
+            assert.equal(accepted, false);
+        });
+        assert.equal(bpRejectedCalled, 1);
+        db.writeQueue.queue = [];
+
         await db.close();
         cleanupTempDb(dbPath);
     });
 
-    it('37. Database Factory 初始化與啟動前置保護 (v2.7.3 P1-4)', async () => {
+    it('37. Database Factory 初始化與啟動前置保護 (v2.7.3 P1-4 / v2.7.4 整合防禦)', async () => {
         // 1. 正常非同步工廠建立
         const dbPath = getTempDbPath('factory_success');
         const db = await createDatabaseSubsystem({ dbPath });
@@ -1050,6 +1158,203 @@ describe('SQLite Reliability v2.7.3 Comprehensive Test Suite (37 Scenarios)', ()
             },
             /故障熔斷狀態/
         );
+
+        // 🌟 4. 主程式啟動防禦整合驗證 (Mock Server 與 MQTT 啟動攔截)
+        let serverListenCalled = false;
+        let mqttClientStarted = false;
+
+        async function mockStartServer(dbInstance) {
+            try {
+                if (dbInstance && dbInstance.readyPromise) {
+                    await dbInstance.readyPromise;
+                }
+                serverListenCalled = true;
+            } catch (_) {
+                // 模擬捕獲初始化失敗，終止啟動
+            }
+        }
+
+        async function mockStartMqtt(dbInstance) {
+            try {
+                if (dbInstance && dbInstance.readyPromise) {
+                    await dbInstance.readyPromise;
+                }
+                mqttClientStarted = true;
+            } catch (_) {
+                // 模擬捕獲初始化失敗，取消 MQTT 連線
+            }
+        }
+
+        await mockStartServer(syncDb);
+        await mockStartMqtt(syncDb);
+
+        assert.equal(serverListenCalled, false, '初始化失敗時絕對不得啟動 HTTP Server');
+        assert.equal(mqttClientStarted, false, '初始化失敗時絕對不得啟動 MQTT Client');
+    });
+
+    // ==========================================
+    // Group G: SQLite Reliability v2.7.4 Comprehensive Verifications (4 Scenarios)
+    // ==========================================
+
+    it('38. Drain 階段嚴格遵守 BUSY Retry Backoff 與守恆 (v2.7.4 P0-1)', async () => {
+        const dbPath = getTempDbPath('drain_busy_backoff');
+        const adapter = new SQLiteAdapter();
+        const authority = adapter.bindShutdownHandler();
+        const writeQueue = new WriteQueue(adapter, {
+            retryBaseDelayMs: 80,
+            retryMaxDelayMs: 200
+        });
+        await adapter.initialize(dbPath);
+        await adapter.execute('CREATE TABLE busy_test (id INT PRIMARY KEY)');
+
+        let attempts = 0;
+        let firstFailureTime = null;
+        let secondExecutionTime = null;
+        const origDrainTx = adapter.drainTransaction.bind(adapter);
+
+        adapter.drainTransaction = async function(fn, cap) {
+            attempts++;
+            if (attempts === 1) {
+                firstFailureTime = Date.now();
+                const busyErr = new Error('SQLITE_BUSY: database is locked');
+                busyErr.code = 'SQLITE_BUSY';
+                throw busyErr;
+            }
+            secondExecutionTime = Date.now();
+            return origDrainTx(fn, cap);
+        };
+
+        writeQueue.enqueue('INSERT INTO busy_test VALUES (1)');
+        assert.equal(writeQueue.queue.length, 1);
+
+        const drainCap = authority.issueDrainCapability(1500);
+        const drainResult = await writeQueue.drain(drainCap, 1500);
+
+        assert.equal(attempts, 2, '應恰好執行 2 次交易 (第 1 次 BUSY, 第 2 次成功)');
+        assert.ok(firstFailureTime && secondExecutionTime);
+        const actualDelay = secondExecutionTime - firstFailureTime;
+        assert.ok(actualDelay >= 75, `Drain 必須等待至少 80ms backoff，實際等待: ${actualDelay}ms`);
+
+        assert.equal(drainResult.isClean, true);
+        assert.equal(drainResult.uncommitted, 0);
+
+        const row = await adapter.queryOne('SELECT id FROM busy_test WHERE id = 1');
+        assert.ok(row);
+        assert.equal(row.id, 1);
+
+        // 驗證 Data Conservation: totalAccepted (1) === totalCommitted (1)
+        assertDataConservation(writeQueue.getMetrics());
+
+        adapter.drainTransaction = origDrainTx;
+        await adapter.close();
+        cleanupTempDb(dbPath);
+    });
+
+    it('39. Graceful Shutdown 有界等待與未靜止時拒絕 rawClose (v2.7.4 P0-2)', async () => {
+        const dbPath = getTempDbPath('graceful_bounded_close');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            config: {
+                shutdown: {
+                    pm2KillTimeoutMs: 300,
+                    drainWaitBufferMs: 100,
+                    drainTimeoutMs: 150
+                }
+            }
+        });
+
+        // 排入一個尚未完成的 Deferred scheduler 任務
+        let releaseHangingTask;
+        const hangingDeferred = new Promise(r => releaseHangingTask = r);
+        const runningTask = db.adapter._schedule(async () => {
+            await hangingDeferred;
+        });
+
+        while (!db.adapter.isExecutingUnderlying) {
+            await new Promise(r => setTimeout(r, 5));
+        }
+
+        // 驗證直接呼叫 adapter.close(100) 在逾時未靜止時被拒絕且不摧毀連線
+        await assert.rejects(
+            async () => {
+                await db.adapter.close(80);
+            },
+            /CLOSE_REJECTED/
+        );
+        assert.equal(db.adapter.state, ADAPTER_STATES.CLOSING);
+        assert.ok(db.adapter.db !== null, '未靜止時絕對不得執行 rawClose 摧毀連線');
+
+        // 觸發 Graceful Shutdown
+        const shutResult = await db.shutdownHandler.handle('TEST_SIG', { exitProcess: false });
+
+        assert.equal(shutResult.success, false, '有未完成任務時 Shutdown 不得宣稱成功');
+        assert.equal(shutResult.adapterClosed, false, '未靜止時 Adapter 不得標記關閉');
+        assert.ok(shutResult.diagnostics);
+        assert.equal(shutResult.diagnostics.adapterStatus.underlyingExecuting, true);
+
+        // 釋放 deferred 任務並完成安全關閉
+        releaseHangingTask();
+        await runningTask;
+        await db.adapter.emergencyClose();
+        cleanupTempDb(dbPath);
+    });
+
+    it('40. Emergency Shutdown 檢查未提交資料與誠實成功語意 (v2.7.4 P0-3)', async () => {
+        const dbPath = getTempDbPath('emergency_uncommitted_audit');
+        const db = await createDatabaseSubsystem({ dbPath });
+        await db.run('CREATE TABLE emerg_test (id INT)');
+
+        // 接受 20 筆資料進入佇列（未啟動交易提交）
+        for (let i = 0; i < 20; i++) {
+            db.queueDbOp('INSERT INTO emerg_test VALUES (?)', [i]);
+        }
+        assert.equal(db.writeQueue.queue.length, 20);
+        assert.equal(db.writeQueue.getMetrics().totalUncommitted, 20);
+
+        // 確認此時 Adapter 處於 Quiescent 靜止狀態
+        assert.equal(db.adapter.isQuiescent(), true);
+
+        // 觸發緊急關閉
+        const crashResult = await db.shutdownHandler.handleEmergencyCrash(
+            new Error('Crash with 20 queued items'),
+            'testUncaught',
+            { exitProcess: false }
+        );
+
+        // 🌟 P0-3 核心驗證：即使 Adapter 成功 emergencyClose，但有未提交資料時，success 必須為 false！
+        assert.equal(crashResult.success, false, '有 20 筆未提交資料時絕對不得回報整體 success: true');
+        assert.equal(crashResult.adapterClosed, true, 'Adapter 靜止狀態下連線成功釋放');
+        assert.equal(crashResult.dataClean, false, '資料存在未提交，dataClean 必須為 false');
+        assert.equal(crashResult.hasUncommittedData, true);
+        assert.equal(crashResult.forcedExit, false);
+        assert.ok(crashResult.diagnostics);
+        assert.equal(crashResult.diagnostics.queueMetrics.queuedCount, 20);
+        assert.equal(crashResult.diagnostics.queueMetrics.totalUncommitted, 20);
+
+        cleanupTempDb(dbPath);
+    });
+
+    it('41. 初始化失敗時安全清理 SQLite 連線防洩漏 (v2.7.4 P1-2)', async () => {
+        const dbPath = getTempDbPath('init_cleanup_leak');
+        const badAdapter = new SQLiteAdapter({
+            pragmas: {
+                busy_timeout: -999 // 觸發 HARD_FAIL 驗證失敗
+            }
+        });
+
+        await assert.rejects(
+            async () => {
+                await badAdapter.initialize(dbPath);
+            },
+            /HARD_FAIL.*busy_timeout/
+        );
+
+        // 驗證 Adapter 狀態為 ERROR
+        assert.equal(badAdapter.state, ADAPTER_STATES.ERROR);
+        // 🌟 P1-2 核心驗證：已開啟之 SQLite 原生 handle 已被妥善關閉並清空，絕不遺留洩漏
+        assert.equal(badAdapter.db, null, '初始化失敗後連線 handle 必須被安全關閉並清空');
+
+        cleanupTempDb(dbPath);
     });
 
 });

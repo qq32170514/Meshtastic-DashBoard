@@ -167,6 +167,17 @@ class SQLiteAdapter {
                     resolve();
                 } catch (pErr) {
                     this.setFatalError(pErr);
+                    // 🌟 P1-2: 連線已開啟但初始化 PRAGMA 驗證失敗，執行連線清理防洩漏
+                    if (this.db) {
+                        const dbToClose = this.db;
+                        this.db = null;
+                        dbToClose.close((closeErr) => {
+                            if (closeErr) {
+                                console.error('⚠️ [ADAPTER_INIT_CLEANUP_WARN] 初始化失敗清理連線時報錯:', closeErr.message);
+                            }
+                        });
+                    }
+                    this.state = ADAPTER_STATES.ERROR;
                     reject(pErr);
                 }
             });
@@ -499,7 +510,7 @@ class SQLiteAdapter {
         }
     }
 
-    close() {
+    close(timeoutMs = null) {
         if (this._closePromise) return this._closePromise;
 
         this._closePromise = (async () => {
@@ -507,12 +518,34 @@ class SQLiteAdapter {
                 this.state = ADAPTER_STATES.CLOSING;
             }
             this.#acceptingNewTasks = false;
-            try {
-                await this._schedulerQueue;
-            } catch (_) {}
+
+            const waitBudget = typeof timeoutMs === 'number' ? timeoutMs : null;
+            if (waitBudget && waitBudget > 0) {
+                let timerId = null;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timerId = setTimeout(() => {
+                        reject(new Error(`[CLOSE_TIMEOUT] Scheduler 隊列未在時限 (${waitBudget}ms) 內清空`));
+                    }, waitBudget);
+                });
+                try {
+                    await Promise.race([
+                        this._schedulerQueue.catch(() => {}),
+                        timeoutPromise
+                    ]);
+                } catch (waitErr) {
+                    console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] ${waitErr.message}`);
+                } finally {
+                    if (timerId) clearTimeout(timerId);
+                }
+            } else {
+                try {
+                    await this._schedulerQueue;
+                } catch (_) {}
+            }
 
             if (!this.isQuiescent()) {
-                throw new Error(`[CLOSE_REJECTED] 尚有在途或排程工作未完成，拒絕關閉連線 (status: ${JSON.stringify(this.getActiveStatus())})`);
+                this._closePromise = null;
+                throw new Error(`[CLOSE_REJECTED] 尚有在途或排程工作未完成，拒絕強制關閉連線 (status: ${JSON.stringify(this.getActiveStatus())})`);
             }
             return await this._rawClose();
         })();
