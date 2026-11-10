@@ -33,7 +33,7 @@ class BackupManager {
     }
 
     /**
-     * 驗證備份檔案完整性 (P1: 完整性三態分類與防誤刪)
+     * 驗證備份檔案完整性 (P1-03: 完整性三態分類、close 錯誤處理與防誤刪)
      */
     async verifyIntegrity(backupFilePath) {
         if (!fs.existsSync(backupFilePath)) {
@@ -52,7 +52,14 @@ class BackupManager {
                     }
 
                     tempDb.all('PRAGMA integrity_check', (checkErr, rows) => {
-                        tempDb.close(() => {
+                        tempDb.close((closeErr) => {
+                            if (closeErr) {
+                                return resolve({
+                                    status: BACKUP_VERIFY_STATUS.VERIFY_ERROR,
+                                    details: `CLOSE_FAILED: ${closeErr.message}`
+                                });
+                            }
+
                             if (checkErr) {
                                 return resolve({
                                     status: BACKUP_VERIFY_STATUS.VERIFY_ERROR,
@@ -95,7 +102,7 @@ class BackupManager {
     }
 
     /**
-     * 執行線上備份 (透過 VACUUM INTO 或 安全複製)
+     * 執行線上備份 (透過 VACUUM INTO 安全快照)
      */
     async performBackup(customFileName = null) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -105,9 +112,7 @@ class BackupManager {
         return this.#adapter.maintenanceTask('ONLINE_BACKUP', async (rawContext) => {
             console.log(`📦 [BACKUP] 開始執行線上備份至: ${targetPath}`);
 
-            // 優先使用 SQLite 官方 VACUUM INTO 安全建立一致性快照
             try {
-                // targetPath 在 Windows 上需將反斜線跳脫或轉為正斜線
                 const safePath = targetPath.replace(/\\/g, '/');
                 await rawContext.execute(`VACUUM INTO '${safePath}'`);
             } catch (vErr) {
@@ -119,11 +124,11 @@ class BackupManager {
             const verify = await this.verifyIntegrity(targetPath);
             if (verify.status !== BACKUP_VERIFY_STATUS.VALID) {
                 console.error(`❌ [BACKUP_VERIFY_FAILED] 備份驗證未通過 (狀態: ${verify.status}):`, verify.details);
-                // 僅在明確 CORRUPTED 時考慮移除，若為 VERIFY_ERROR 則保留檔案供手動分析
+                // 僅在明確 CORRUPTED 時移除壞檔；若為 VERIFY_ERROR 則保留以防誤刪
                 if (verify.status === BACKUP_VERIFY_STATUS.CORRUPTED) {
                     try { fs.unlinkSync(targetPath); } catch (_) {}
                 }
-                throw new Error(`[BACKUP_VERIFY_FAILED] 備份完整性檢查失敗: ${verify.details}`);
+                throw new Error(`[BACKUP_VERIFY_FAILED] 備份完整性檢查失敗 (${verify.status}): ${verify.details}`);
             }
 
             console.log(`✅ [BACKUP] 備份成功並通過完整性檢驗: ${targetPath}`);

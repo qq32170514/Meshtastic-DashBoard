@@ -693,8 +693,7 @@ db.serialize(() => {
     db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 具備完整崩潰一致性防護，且免除每次交易強制磁碟 sync
     db.run(`PRAGMA cache_size = -64000`);    // 64MB 頁面快取（負值代表 KB），大幅減少 4GB 資料庫的冷讀取 I/O
     db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
-    db.run(`PRAGMA mmap_size = 268435456`);  // 256MB mmap 加速讀取
-    db.run(`PRAGMA busy_timeout = 30000`);   // 30秒等待鎖，避免高併發寫入時出現 SQLITE_BUSY 錯誤
+    // PRAGMA 設定由 src/database/sqlite.config.js 統一管理並在 Adapter 初始化時驗證讀回 (P1-05)
     db.run(`PRAGMA wal_autocheckpoint = 1000`); // 每累積 1000 頁自動 checkpoint
 
     db.run(`
@@ -4038,14 +4037,26 @@ async function setupRFListener(io, db) {
                                     hops_away: hopsAway
                                 };
 
-                                db.serialize(() => {
-                                    db.run('BEGIN');
-                                    db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                                        [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
-                                    db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
-                                        [`隧道:${config.label}`, fromId]);
-                                    db.run('COMMIT');
-                                });
+                                // 🛡️ 使用可靠性子系統交易包裝，避免未捕獲錯誤留下懸掛鎖 (P1-04)
+                                if (db && db.adapter && typeof db.adapter.transaction === 'function') {
+                                    db.adapter.transaction(async (tx) => {
+                                        await tx.execute(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                            [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
+                                        await tx.execute(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
+                                            [`隧道:${config.label}`, fromId]);
+                                    }).catch((txErr) => {
+                                        console.error(`❌ [隧道資料庫寫入異常] ${config.label}:`, txErr.message);
+                                    });
+                                } else {
+                                    db.serialize(() => {
+                                        db.run('BEGIN');
+                                        db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                            [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
+                                        db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
+                                            [`隧道:${config.label}`, fromId]);
+                                        db.run('COMMIT');
+                                    });
+                                }
                                 batchEmit('raw_packet', packetData);
                             }
                         }

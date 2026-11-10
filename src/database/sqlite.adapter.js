@@ -21,7 +21,7 @@ const AUTH_TYPES = {
 
 const ALLOWED_CHECKPOINT_MODES = ['PASSIVE', 'FULL', 'RESTART', 'TRUNCATE'];
 
-// 🌟 模組私有 WeakMap：憑證完全不可偽造，外部絕對不可見
+// 🌟 模組私有 WeakMap：憑證完全不可偽造，外部絕對不可見 (P0-5)
 const issuedDrainCapabilities = new WeakMap();
 
 function validateDrainCapability(capability, adapter) {
@@ -47,7 +47,9 @@ function validateDrainCapability(capability, adapter) {
 class SQLiteAdapter {
     #shutdownBound = false;
     #schedulerPendingCount = 0;
+    #schedulerActiveCount = 0;
     #activeTransactions = 0;
+    #acceptingNewTasks = true;
     #fatalErrorListeners = [];
     #pragmas;
 
@@ -58,13 +60,14 @@ class SQLiteAdapter {
         this.lastError = null;
         this._schedulerQueue = Promise.resolve();
         this._closePromise = null;
+        this._initPromise = null;
         this.isExecutingUnderlying = false;
         this.maintenanceInProgress = false;
         this.#pragmas = { ...defaultPragmas, ...(config.pragmas || {}) };
     }
 
     /**
-     * 🌟 一次性子系統內部安全綁定 (One-time Subsystem Handshake - P0-1)
+     * 🌟 一次性子系統內部安全綁定 (One-time Subsystem Handshake - P0-5)
      * 僅允許在 createDatabaseSubsystem() 裝配時綁定一次，重複調用立即拋錯
      */
     bindShutdownHandler() {
@@ -109,12 +112,38 @@ class SQLiteAdapter {
         }
     }
 
+    /**
+     * 停止接收一般工作閘門 (P0-3, P0-4)
+     */
+    stopAcceptingNewTasks() {
+        this.#acceptingNewTasks = false;
+    }
+
+    /**
+     * 判定 Adapter 是否已完全達到 Quiescent 靜止狀態 (P0-4)
+     */
+    isQuiescent() {
+        return (
+            !this.isExecutingUnderlying &&
+            this.#schedulerPendingCount === 0 &&
+            this.#schedulerActiveCount === 0 &&
+            this.#activeTransactions === 0 &&
+            !this.maintenanceInProgress
+        );
+    }
+
+    /**
+     * 取得 Adapter 完整執行狀態快照 (P0-3, P0-4)
+     */
     getActiveStatus() {
         return {
-            underlyingExecuting: this.isExecutingUnderlying,
             schedulerPending: this.#schedulerPendingCount,
+            schedulerActive: this.#schedulerActiveCount,
+            underlyingExecuting: this.isExecutingUnderlying,
             activeTransactions: this.#activeTransactions,
             maintenanceInProgress: this.maintenanceInProgress,
+            acceptingNewTasks: this.#acceptingNewTasks,
+            isQuiescent: this.isQuiescent(),
             state: this.state
         };
     }
@@ -219,6 +248,11 @@ class SQLiteAdapter {
                 return Promise.reject(new Error(`Adapter 處於故障熔斷狀態: ${this.lastError?.message}`));
             }
 
+            // P0-3: 停止接收新一般工作閘門
+            if (!this.#acceptingNewTasks && authType !== AUTH_TYPES.DRAIN && authType !== AUTH_TYPES.CHECKPOINT) {
+                return Promise.reject(new Error(`[GATE_CLOSED] Adapter 已停止接受 ${authType} 新工作`));
+            }
+
             // 1. 入列時權限檢驗
             if (authType === AUTH_TYPES.DRAIN) {
                 const auth = validateDrainCapability(capability, this);
@@ -238,36 +272,41 @@ class SQLiteAdapter {
 
             const scheduledTask = this._schedulerQueue.then(async () => {
                 this.#schedulerPendingCount--;
+                this.#schedulerActiveCount++;
 
-                // 2. 真正開始執行前的二次檢驗 (Execution Hook)
-                if (this.state === ADAPTER_STATES.ERROR) {
-                    throw new Error(`[SCHEDULER_ABORT] Adapter 進入 ERROR 狀態: ${this.lastError?.message}`);
-                }
-                if (this.state === ADAPTER_STATES.CLOSED) {
-                    throw new Error('[SCHEDULER_ABORT] Adapter 已關閉');
-                }
-
-                if (this.state === ADAPTER_STATES.CLOSING) {
-                    if (authType === AUTH_TYPES.GENERAL) {
-                        throw new Error('[SCHEDULER_SHUTDOWN_ABORT] Adapter 正在關閉，已排隊任務退回');
-                    }
-                    if (authType === AUTH_TYPES.MAINTENANCE) {
-                        throw new Error('[MAINTENANCE_ABORTED_BY_SHUTDOWN] Adapter 正在關閉，已排隊維護任務中止');
-                    }
-                }
-
-                if (authType === AUTH_TYPES.DRAIN || authType === AUTH_TYPES.CHECKPOINT) {
-                    const recheck = validateDrainCapability(capability, this);
-                    if (!recheck.valid) {
-                        throw new Error(`[SCHEDULER_AUTH_EXPIRED] 憑證在執行時已失效: ${recheck.reason}`);
-                    }
-                }
-
-                this.isExecutingUnderlying = true;
                 try {
-                    return await taskFn();
+                    // 2. 真正開始執行前的二次檢驗 (Execution Hook)
+                    if (this.state === ADAPTER_STATES.ERROR) {
+                        throw new Error(`[SCHEDULER_ABORT] Adapter 進入 ERROR 狀態: ${this.lastError?.message}`);
+                    }
+                    if (this.state === ADAPTER_STATES.CLOSED) {
+                        throw new Error('[SCHEDULER_ABORT] Adapter 已關閉');
+                    }
+
+                    if (this.state === ADAPTER_STATES.CLOSING) {
+                        if (authType === AUTH_TYPES.GENERAL) {
+                            throw new Error('[SCHEDULER_SHUTDOWN_ABORT] Adapter 正在關閉，已排隊任務退回');
+                        }
+                        if (authType === AUTH_TYPES.MAINTENANCE) {
+                            throw new Error('[MAINTENANCE_ABORTED_BY_SHUTDOWN] Adapter 正在關閉，已排隊維護任務中止');
+                        }
+                    }
+
+                    if (authType === AUTH_TYPES.DRAIN || authType === AUTH_TYPES.CHECKPOINT) {
+                        const recheck = validateDrainCapability(capability, this);
+                        if (!recheck.valid) {
+                            throw new Error(`[SCHEDULER_AUTH_EXPIRED] 憑證在執行時已失效: ${recheck.reason}`);
+                        }
+                    }
+
+                    this.isExecutingUnderlying = true;
+                    try {
+                        return await taskFn();
+                    } finally {
+                        this.isExecutingUnderlying = false;
+                    }
                 } finally {
-                    this.isExecutingUnderlying = false;
+                    this.#schedulerActiveCount--;
                 }
             });
 
@@ -380,7 +419,7 @@ class SQLiteAdapter {
     }
 
     /**
-     * 🌟 Checkpoint 具備模式白名單與執行當下 9 項前置條件強驗證 (P0-3, P1-1)
+     * 🌟 Checkpoint 具備模式白名單與執行當下 9 項前置條件強驗證 (P1-2)
      */
     checkpoint(mode = 'PASSIVE', capability = null, queueMetricsProvider = null) {
         const upperMode = String(mode).toUpperCase();
@@ -397,11 +436,13 @@ class SQLiteAdapter {
                 if (!auth.valid || !auth.record.drainCompleted) {
                     throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] TRUNCATE 必須出示已完成 Drain 之有效憑證`);
                 }
-                if (queueMetricsProvider) {
-                    const metrics = queueMetricsProvider();
-                    if (metrics.totalUncommitted > 0 || metrics.inFlightCount > 0) {
-                        throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] 隊列尚有未結資料 (uncommitted: ${metrics.totalUncommitted}, inFlight: ${metrics.inFlightCount})`);
-                    }
+                if (!queueMetricsProvider || typeof queueMetricsProvider !== 'function') {
+                    throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] TRUNCATE 要求 queueMetricsProvider 為必填參數函式`);
+                }
+
+                const metrics = queueMetricsProvider();
+                if (metrics.totalUncommitted > 0 || metrics.inFlightCount > 0) {
+                    throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] 隊列尚有未結資料 (uncommitted: ${metrics.totalUncommitted}, inFlight: ${metrics.inFlightCount})`);
                 }
                 if (this.maintenanceInProgress) {
                     throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] 尚有維護任務運行中，禁止 TRUNCATE`);
@@ -409,9 +450,15 @@ class SQLiteAdapter {
                 if (this.#activeTransactions > 0) {
                     throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] 尚有在途交易進行中，禁止 TRUNCATE`);
                 }
+                if (this.#schedulerPendingCount > 0) {
+                    throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] Scheduler 尚有待排程工作，禁止 TRUNCATE`);
+                }
             } else if (upperMode === 'FULL' || upperMode === 'RESTART') {
                 if (this.#activeTransactions > 0) {
                     throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] 尚有在途交易進行中，禁止 ${upperMode}`);
+                }
+                if (this.#schedulerPendingCount > 0) {
+                    throw new Error(`[CHECKPOINT_PRECONDITION_FAILED] Scheduler 尚有待排程工作，禁止 ${upperMode}`);
                 }
             }
 
@@ -430,6 +477,7 @@ class SQLiteAdapter {
     setFatalError(err) {
         this.state = ADAPTER_STATES.ERROR;
         this.lastError = err;
+        this.#acceptingNewTasks = false;
         // 🌟 立即可靠通知所有註冊之監聽器 (P0-5)
         for (const listener of this.#fatalErrorListeners) {
             try {
@@ -445,12 +493,13 @@ class SQLiteAdapter {
             if (this.state !== ADAPTER_STATES.ERROR) {
                 this.state = ADAPTER_STATES.CLOSING;
             }
+            this.#acceptingNewTasks = false;
             try {
                 await this._schedulerQueue;
             } catch (_) {}
 
-            if (this.isExecutingUnderlying || this.#activeTransactions > 0) {
-                throw new Error('[CLOSE_REJECTED] 尚有底層 SQLite C 呼叫在執行中，拒絕關閉連線');
+            if (!this.isQuiescent()) {
+                throw new Error(`[CLOSE_REJECTED] 尚有在途或排程工作未完成，拒絕關閉連線 (status: ${JSON.stringify(this.getActiveStatus())})`);
             }
             return await this._rawClose();
         })();
@@ -459,8 +508,8 @@ class SQLiteAdapter {
     }
 
     emergencyClose() {
-        if (this.isExecutingUnderlying || this.#activeTransactions > 0) {
-            throw new Error('[EMERGENCY_CLOSE_REJECTED] 底層操作執行中，禁止呼叫 emergencyClose');
+        if (!this.isQuiescent()) {
+            throw new Error(`[EMERGENCY_CLOSE_REJECTED] Adapter 尚未達到靜止狀態 (isQuiescent: false, status: ${JSON.stringify(this.getActiveStatus())})`);
         }
         return this._rawClose();
     }

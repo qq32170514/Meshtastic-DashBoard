@@ -76,29 +76,35 @@
 
 ---
 
-### 6. SQLite Reliability Refactoring v2.7.1 實作與全面驗證完成
+### 6. SQLite Reliability Refactoring v2.7.2 最終修正與全量驗證完成 (READY FOR REVIEW)
 - **架構目錄**：`src/database/`
   - [sqlite.config.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js)：集中式 PRAGMA、Queue、Backup、Shutdown 與 PM2 緩衝配置。
-  - [retry-policy.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/retry-policy.js)：8 大 SQLite 錯誤分類 (`DATA_CONSTRAINT`, `RETRYABLE_BUSY`, `DISK_FULL`, `FATAL_CORRUPT`, `IOERR_TRANSIENT`, `IOERR_PERMANENT`, `ROLLBACK_FAILURE`, `UNKNOWN`) 與指數退避抖動計算。
+  - [retry-policy.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/retry-policy.js)：8 大 SQLite 錯誤分類與指數退避抖動計算。
   - [sqlite.adapter.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js)：
-    - **P0-1 封裝**：採用模組私有 `WeakMap` 與一次性 `bindShutdownHandler()` 握手，對外零暴露權限物件。
-    - **P0-2 安全追蹤**：追蹤 `isExecutingUnderlying`、`#schedulerPendingCount`、`#activeTransactions`。
-    - **P0-3 Checkpoint 安全**：模式白名單，TRUNCATE/FULL/RESTART 強檢驗在途交易與排空憑證，遇 `busy === 1` 拋出 `[CHECKPOINT_BUSY_BLOCKED]`。
-    - **P0-5 熔斷機制**：`setFatalError` 即刻通知監聽器，中斷已排程工作。
+    - **P0-3 / P0-4 靜止狀態追蹤**：全面追蹤 `#schedulerPendingCount`、`#schedulerActiveCount`、`underlyingExecuting`、`#activeTransactions`、`maintenanceInProgress`，提供 `isQuiescent()` 供關閉前強驗證。
+    - **P0-3 停機工作閘門**：進入關閉時設置 `_shutdownGateClosed` 與 `stopAcceptingNewTasks()`，全面阻止 `GENERAL` 任務進入排程。
+    - **P0-5 封裝**：採用模組私有 `WeakMap` 與一次性 `bindShutdownHandler()` 握手，對外零暴露權限物件。
+    - **P1-2 Checkpoint 模式分離**：PASSIVE / FULL / RESTART / TRUNCATE 具備各自獨立授權矩陣，TRUNCATE 必須強制提供 `queueMetricsProvider` 且在未排空時拒絕；遇到 `busy === 1` 拋出 `CHECKPOINT_BUSY_BLOCKED` 拒絕宣告成功。
   - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
-    - **P0-4 FIFO Binary Isolation**：批次失敗時遞迴切分 Left 與 Right，Left 優先執行；若遇中斷則使用 `_requeueBatchAtHead` 連同 Right 保持原始順序退回隊列頭部。
-    - **P0-4 單一歸屬與資料守恆**：Item 具備互斥 6 大狀態，守恆公式 `totalAccepted = totalCommitted + queuedCount + retryPendingCount + inFlightCount + totalAbandoned` 恆成立。
-    - **P0-5 錯誤連動**：Adapter 進入 `ERROR` 立即連動為 `PAUSED_ERROR`，拒絕新寫入並計入 `totalRejected`。
+    - **P0-1 FIFO 順序保持**：二分法子層不自行退回部分批次，遇非約束錯誤統一由頂層 `_executeTopLevelBatch` 捕獲，透過 `_requeueRemainingBatchAtHead` 按原始 `seq` 一次性原子退回隊列頭部，徹底根除順序顛倒。
+    - **P0-2 容器物理互斥與單一歸屬**：Item 具備互斥 6 大狀態容器 (`queue`, `inFlightItems`, `retryPendingItems`, `quarantinedItems`, `uncommittedErrors`, `committed`)，所有狀態轉移統一經由 `_transitionItem`，守恆公式恆成立。
+    - **P0-3 獨立 Deadline Observer**：`drain()` 同時啟動 Worker Promise 與 Deadline Timer Promise，Timer 到期時回傳即時未提交快照與 Adapter Quiescent 狀態，逾時決不誤判為正常完成。
+    - **P1-01 UNKNOWN 熔斷保留**：非預期錯誤立即中止二分拆分，實體封存未提交項目至 `uncommittedErrors`。
+    - **P1-02 Callback Exactly-Once**：集中式 `_invokeCallback` 防重機制，使用者回呼保證僅被執行一次。
+    - **並發 flush 鏈式等待**：`#currentFlushPromise` 確保並行或自動觸發的 flush 能被正確等待與排空。
   - [shutdown-handler.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js)：
-    - **P0-1 私有 Field**：`#authority` 完全私有。
-    - **P0-2 安全緊急關閉**：`handleEmergencyCrash` 具備 1000ms 有界等待；超時底層仍在操作時**嚴禁呼叫 `_rawClose()`**，生成結構化診斷轉儲並 exit(1)。
-    - **P0-6 停機排空**：受控簽發 `DrainCapability`，排空驗證乾淨後才執行 TRUNCATE checkpoint 與連線關閉。
+    - **P0-4 安全緊急關閉**：`handleEmergencyCrash` 具備 1000ms 有界等待；超時且未達 `isQuiescent` 時**嚴禁呼叫 `_rawClose()`**，生成結構化診斷轉儲並以非零狀態碼安全退出。
+    - **P0-5 私有 Field**：`#authority` 完全私有，受控簽發 `DrainCapability`。
   - [backup-manager.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)：
-    - 採用 `VACUUM INTO` 建立一致性熱快照。
-    - 完整性三態分類 (`VALID`, `CORRUPTED`, `VERIFY_ERROR`)，遇 `VERIFY_ERROR` 嚴格禁止刪除檔案。
-  - [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js)：子系統工廠 `createDatabaseSubsystem` (異步) 與 `initDatabaseSubsystemSync` (同步)，回傳完整向後相容之 `dbCompat` 介面 (`run`, `get`, `all`, `serialize`, `close`, `queueDbOp`, `flushDbQueue`)。
+    - **P1-03 完整性檢驗異常防護**：`tempDb.close` 異常安全歸類為 `VERIFY_ERROR`，嚴格禁止刪除候選備份檔以防誤刪。
+  - [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js)：子系統工廠 `createDatabaseSubsystem` (異步) 與 `initDatabaseSubsystemSync` (同步)，保證 `adapter.initialize(dbPath)` 與 PRAGMA 驗證完整完成後才提供服務。
+  - [index.js (主程式)](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
+    - **P1-04**：TCP 隧道等既有寫入路徑改用 `db.adapter.transaction` 自動託管交易。
+    - **P1-05**：移除多餘且零散的 `PRAGMA busy_timeout = 30000`，統一由配置檔管理。
 - **測試驗證 (`tests/database/sqlite_reliability.test.js`)**：
-  - 全套 23 項核心場景已實際使用獨立臨時資料庫執行完畢：**23 tests passed, 0 failed**。
+  - 全套 30 項極限場景已實際使用獨立臨時資料庫執行完畢：**30 tests passed, 0 failed, 總耗時 2698ms**。
+  - 技術說明書：已建立 [SQLITE_REFACTORING_GUIDE_v2.7.2.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE_v2.7.2.md)。
+  - 封裝包：已產出 `Meshtastic-DashBoard_SQLite_Reliability_v2.7.2.zip` 供人工審查。
 
 ---
 

@@ -19,7 +19,7 @@ class ShutdownHandler {
     }
 
     /**
-     * 優雅關閉 (Graceful Shutdown - P0-1, P0-6)
+     * 🌟 優雅關閉 (Graceful Shutdown - P0-3, P0-5, P0-6)
      */
     handle(signal = 'SIGINT', options = {}) {
         if (this.#shutdownPromise) {
@@ -43,22 +43,24 @@ class ShutdownHandler {
                 throw authErr;
             }
 
-            // 2. 執行 WriteQueue 排空
+            // 2. 執行 WriteQueue 排空 (包含獨立 Deadline Observer 控制)
             try {
-                await this.#writeQueue.drain(drainCap, deadlineMs);
+                const drainResult = await this.#writeQueue.drain(drainCap, deadlineMs);
                 const qMetrics = this.#writeQueue.getMetrics();
-                if (qMetrics.totalUncommitted === 0 && qMetrics.inFlightCount === 0) {
+                const adapterStatus = this.#adapter.getActiveStatus();
+
+                if (drainResult.isClean && !drainResult.deadlineExpired && qMetrics.totalUncommitted === 0 && adapterStatus.isQuiescent) {
                     drainClean = true;
                     this.#authority.markDrainCompleted(drainCap);
                     console.log('✅ [SHUTDOWN] 隊列資料已全數安全寫入並排空');
                 } else {
-                    console.warn(`⚠️ [SHUTDOWN] 隊列未完全排空 (未提交: ${qMetrics.totalUncommitted}, 在途: ${qMetrics.inFlightCount})`);
+                    console.warn(`⚠️ [SHUTDOWN] 隊列未完全排空 (未提交: ${qMetrics.totalUncommitted}, 在途: ${qMetrics.inFlightCount}, Quiescent: ${adapterStatus.isQuiescent})`);
                 }
             } catch (drainErr) {
                 console.error('⚠️ [SHUTDOWN] 隊列排空階段遭遇異常或超時:', drainErr.message);
             }
 
-            // 3. 執行 TRUNCATE Checkpoint (僅在排空乾淨且具有完成憑證時)
+            // 3. 執行 TRUNCATE Checkpoint (僅在排空乾淨且具備完成憑證與前置條件時)
             if (drainClean && this.#authority.isDrainCompleted(drainCap)) {
                 try {
                     console.log('🔄 [SHUTDOWN] 執行 wal_checkpoint(TRUNCATE)...');
@@ -68,10 +70,10 @@ class ShutdownHandler {
                     console.error('⚠️ [SHUTDOWN] Checkpoint TRUNCATE 失敗:', cpErr.message);
                 }
             } else {
-                console.warn('⚠️ [SHUTDOWN] 由於隊列未乾淨排空，跳過 TRUNCATE Checkpoint 以防止損壞');
+                console.warn('⚠️ [SHUTDOWN] 由於隊列未乾淨排空或未達靜止，跳過 TRUNCATE Checkpoint 以防止損壞');
             }
 
-            // 4. 關閉 Adapter
+            // 4. 關閉 Adapter 連線
             try {
                 await this.#adapter.close();
                 console.log('🔒 [SHUTDOWN] SQLite 連線已安全關閉');
@@ -102,27 +104,28 @@ class ShutdownHandler {
     }
 
     /**
-     * 緊急崩潰關閉處理 (Emergency Crash Shutdown - P0-2)
+     * 🌟 緊急崩潰關閉處理 (Emergency Crash Shutdown - P0-4)
      * 絕對不可在 SQLite 底層仍在操作時強制 rawClose()，必須等待有界時間，超時則放棄連線釋放直接診斷轉儲
      */
     async handleEmergencyCrash(err, origin = 'uncaughtException', options = {}) {
         console.error(`🚨 [EMERGENCY_SHUTDOWN] 觸發緊急關閉！來源: ${origin} | 錯誤:`, err);
 
-        // 1. 立即停止 WriteQueue 接收新寫入
+        // 1. 立即停止 Adapter 接受新工作閘門與 WriteQueue
+        this.#adapter.stopAcceptingNewTasks();
         this.#writeQueue.close();
 
-        // 2. 有界等待底層操作結束 (最多等待 emergencyWaitMs, 預設 1000ms)
+        // 2. 有界等待底層操作與 Scheduler 靜止 (最多等待 emergencyWaitMs, 預設 1000ms)
         const waitDeadline = Date.now() + (this.#config.emergencyWaitMs || 1000);
         let status = this.#adapter.getActiveStatus();
 
-        while ((status.underlyingExecuting || status.activeTransactions > 0) && Date.now() < waitDeadline) {
+        while (!this.#adapter.isQuiescent() && Date.now() < waitDeadline) {
             await new Promise(r => setTimeout(r, 50));
             status = this.#adapter.getActiveStatus();
         }
 
-        // 3. 檢查是否仍有底層操作執行中
-        if (status.underlyingExecuting || status.activeTransactions > 0) {
-            console.error('🚨 [EMERGENCY_CLOSE_ABORTED] SQLite 底層仍在執行操作，為防記憶體損毀嚴禁呼叫 rawClose()！');
+        // 3. 檢查是否達到完整 Quiescent (包含 schedulerPending, activeTransactions, underlyingExecuting)
+        if (!this.#adapter.isQuiescent()) {
+            console.error('🚨 [EMERGENCY_CLOSE_ABORTED] SQLite Adapter 尚未達到完全靜止狀態，為防記憶體損毀嚴禁呼叫 rawClose()！');
             const dump = {
                 timestamp: new Date().toISOString(),
                 origin,
@@ -139,7 +142,7 @@ class ShutdownHandler {
             return { success: false, forcedExit: true, dump };
         }
 
-        // 4. 底層無操作，可安全調用 emergencyClose
+        // 4. 底層無操作且佇列靜止，可安全調用 emergencyClose
         try {
             await this.#adapter.emergencyClose();
             console.log('🔒 [EMERGENCY_SHUTDOWN] SQLite 連線已安全釋放');
