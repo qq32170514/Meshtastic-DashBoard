@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+announcement.json
+!announcement.example.json
 *.env
 *.env.txt
 *.pem

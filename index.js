@@ -495,6 +495,10 @@ const dbQueueMetrics = {
 };
 
 function queueDbOp(sql, params, callback) {
+    if (db && typeof db.queueDbOp === 'function') {
+        return db.queueDbOp(sql, params, callback);
+    }
+
     // 🛡️ 背壓防護 (Backpressure): 超過上限時記錄警示，避免記憶體溢位 (OOM)
     if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
         console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
@@ -521,6 +525,9 @@ function queueDbOp(sql, params, callback) {
 }
 
 function flushDbQueue() {
+    if (db && typeof db.flushDbQueue === 'function') {
+        return db.flushDbQueue();
+    }
     if (dbQueueTimer) {
         clearTimeout(dbQueueTimer);
         dbQueueTimer = null;
@@ -674,12 +681,10 @@ if (process.env.TURSO_URL) {
     };
     console.log(`☁️ 已連線至 Turso 雲端資料庫`);
 } else {
-    const sqlite3 = require('sqlite3').verbose();
+    const { initDatabaseSubsystemSync } = require('./src/database');
     const dbPath = path.join(__dirname, 'meshtastic.db');
-    db = new sqlite3.Database(dbPath, (err) => {
-        if (err) console.error('❌ 本地資料庫連線失敗:', err.message);
-        else console.log(`🗄️ 本地資料庫連線成功: ${dbPath}`);
-    });
+    db = initDatabaseSubsystemSync({ dbPath });
+    console.log(`🗄️ 本地資料庫連線初始化成功 (SQLite Reliability v2.7.1): ${dbPath}`);
 }
 
 db.serialize(() => {
@@ -1551,6 +1556,59 @@ app.post('/api/coverage/rebuild', (req, res) => {
     });
     res.json({ success: true, message: '全台電波覆蓋烘焙排程已在背景啟動' });
 });
+
+// 📢 動態公告與即時橫幅 (支援 announcement.json 存檔免重開熱更新)
+const ANNOUNCEMENT_FILE = path.join(__dirname, 'announcement.json');
+const ANNOUNCEMENT_EXAMPLE = path.join(__dirname, 'announcement.example.json');
+
+function getAnnouncementData() {
+    let target = ANNOUNCEMENT_FILE;
+    if (!fs.existsSync(target)) {
+        if (fs.existsSync(ANNOUNCEMENT_EXAMPLE)) {
+            try {
+                fs.copyFileSync(ANNOUNCEMENT_EXAMPLE, ANNOUNCEMENT_FILE);
+            } catch (_) {}
+            target = ANNOUNCEMENT_EXAMPLE;
+        } else {
+            return {
+                banner: { enabled: false, text: '', type: 'info', link: '', linkText: '' },
+                modal: { enabled: false, version: '3.1.0', title: '', content: '' }
+            };
+        }
+    }
+    try {
+        return JSON.parse(fs.readFileSync(target, 'utf8'));
+    } catch (err) {
+        console.error('❌ 讀取 announcement.json 失敗:', err.message);
+        return {
+            banner: { enabled: false, text: '', type: 'info', link: '', linkText: '' },
+            modal: { enabled: false, version: '3.1.0', title: '', content: '' }
+        };
+    }
+}
+
+// 📢 API: 取得當前公告與橫幅設定
+app.get('/api/announcement', (req, res) => {
+    res.json(getAnnouncementData());
+});
+
+// 📢 即時熱重載：監聽 announcement.json 變更並即時 WebSocket 廣播
+let announcementDebounceTimer = null;
+try {
+    const watchDir = __dirname;
+    fs.watch(watchDir, (eventType, filename) => {
+        if (filename && filename.includes('announcement.json')) {
+            clearTimeout(announcementDebounceTimer);
+            announcementDebounceTimer = setTimeout(() => {
+                const updatedData = getAnnouncementData();
+                console.log('📢 [即時熱更新] 偵測到 announcement.json 存檔更新，已自動推播至所有線上用戶！');
+                io.emit('announcement:update', updatedData);
+            }, 300);
+        }
+    });
+} catch (err) {
+    console.warn('⚠️ announcement.json 檔案監聽器啟動異常:', err.message);
+}
 
 // 🚀 核心升級：網格化覆蓋率聚合 API
 // 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
@@ -4537,9 +4595,13 @@ function handleShutdown(signal) {
     } catch (err) {
         console.error('Failed to log shutdown event:', err);
     }
-    setTimeout(() => {
-        process.exit(0);
-    }, 500);
+    if (db && db.shutdownHandler) {
+        db.shutdownHandler.handle(signal, { exitProcess: true });
+    } else {
+        setTimeout(() => {
+            process.exit(0);
+        }, 500);
+    }
 }
 
 process.on('SIGINT', () => handleShutdown('SIGINT'));
@@ -4547,5 +4609,14 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 process.on('message', (msg) => {
     if (msg === 'shutdown') {
         handleShutdown('PM2_SHUTDOWN');
+    }
+});
+
+process.on('uncaughtException', (err, origin) => {
+    console.error('💥 [FATAL_CRASH] 未捕獲之異常:', err);
+    if (db && db.shutdownHandler) {
+        db.shutdownHandler.handleEmergencyCrash(err, origin, { exitProcess: true });
+    } else {
+        process.exit(1);
     }
 });

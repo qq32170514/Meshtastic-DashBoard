@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
-import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart2, BarChart3, ChevronDown, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2 } from 'lucide-react';
+import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart2, BarChart3, ChevronDown, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2, ExternalLink } from 'lucide-react';
 import 'leaflet/dist/leaflet.css';
 import { MapContainer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import { AppTileLayer } from './mapTiles';
@@ -865,10 +865,67 @@ function App() {
   // 封包過濾狀態
   const [nodeListSearchQuery, setNodeListSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState('base');
-  const [showAnnouncement, setShowAnnouncement] = useState(() => {
-    return localStorage.getItem('hideAnnouncement_v3_1') !== 'true';
-  });
+
+  // 📢 動態伺服器公告與即時橫幅 (支援 announcement.json 存檔免重啟熱更新)
+  interface AnnouncementConfig {
+    banner: {
+      enabled: boolean;
+      type?: 'info' | 'warning' | 'alert' | 'success';
+      text: string;
+      link?: string;
+      linkText?: string;
+    };
+    modal: {
+      enabled: boolean;
+      version: string;
+      title: string;
+      content: string;
+    };
+  }
+
+  const [announcementConfig, setAnnouncementConfig] = useState<AnnouncementConfig | null>(null);
+  const [showAnnouncement, setShowAnnouncement] = useState<boolean>(false);
   const [hideAnnouncementNextTime, setHideAnnouncementNextTime] = useState(false);
+  const [isBannerDismissed, setIsBannerDismissed] = useState<boolean>(() => {
+    return sessionStorage.getItem('dismissed_banner') === 'true';
+  });
+
+  useEffect(() => {
+    // 初始載入動態公告
+    fetch('/api/announcement')
+      .then(res => res.json())
+      .then((data: AnnouncementConfig) => {
+        if (data && typeof data === 'object') {
+          setAnnouncementConfig(data);
+          if (data.modal && data.modal.enabled) {
+            const ver = data.modal.version || '3.1.0';
+            const dismissed = localStorage.getItem('hideAnnouncement_' + ver) === 'true';
+            if (!dismissed) setShowAnnouncement(true);
+          }
+        }
+      })
+      .catch(() => {});
+
+    // 即時 WebSocket 熱重載推播監聽
+    const onAnnouncementUpdate = (data: AnnouncementConfig) => {
+      console.log('📢 收到伺服器公告熱更新:', data);
+      setAnnouncementConfig(data);
+      // 若橫幅內容有更新，重設 session 關閉狀態以便提醒
+      setIsBannerDismissed(false);
+      sessionStorage.removeItem('dismissed_banner');
+
+      if (data.modal && data.modal.enabled) {
+        const ver = data.modal.version || '3.1.0';
+        const dismissed = localStorage.getItem('hideAnnouncement_' + ver) === 'true';
+        if (!dismissed) setShowAnnouncement(true);
+      }
+    };
+
+    socket.on('announcement:update', onAnnouncementUpdate);
+    return () => {
+      socket.off('announcement:update', onAnnouncementUpdate);
+    };
+  }, []);
 
   // --- SNR 加權動態 Hop 覆蓋範圍模擬器狀態 ---
   const [simState, setSimState] = useState({ sourceNodeId: '', maxHops: 3, minSnr: -20 });
@@ -1992,6 +2049,64 @@ function App() {
 
       {!appLoading && (
         <div className="flex-1 flex flex-col">
+          {/* 📢 站長即時動態公告橫幅 (Top Announcement Banner) */}
+          {announcementConfig?.banner?.enabled && !isBannerDismissed && announcementConfig.banner.text && (() => {
+            const b = announcementConfig.banner;
+            const isAlert = b.type === 'alert';
+            const isWarning = b.type === 'warning';
+            const isSuccess = b.type === 'success';
+
+            const bgStyle = isAlert
+              ? (darkMode ? 'bg-rose-950/70 border-rose-800/80 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-900')
+              : isWarning
+                ? (darkMode ? 'bg-amber-950/70 border-amber-800/80 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-900')
+                : isSuccess
+                  ? (darkMode ? 'bg-emerald-950/70 border-emerald-800/80 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-900')
+                  : (darkMode ? 'bg-cyan-950/70 border-cyan-800/80 text-cyan-200' : 'bg-cyan-50 border-cyan-200 text-cyan-900');
+
+            const badgeStyle = isAlert
+              ? 'bg-rose-500/20 text-rose-300 border-rose-500/30'
+              : isWarning
+                ? 'bg-amber-500/20 text-amber-300 border-amber-500/30'
+                : isSuccess
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                  : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/30';
+
+            return (
+              <div className={`w-full border-b px-4 py-2.5 backdrop-blur-md shadow-sm transition-all duration-300 flex items-center justify-between gap-3 text-xs z-[20] ${bgStyle}`}>
+                <div className="max-w-7xl mx-auto w-full flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 overflow-hidden">
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider border shrink-0 flex items-center gap-1 ${badgeStyle}`}>
+                      <Megaphone size={11} className="animate-pulse" />
+                      公告
+                    </span>
+                    <span className="font-medium truncate">{b.text}</span>
+                    {b.link && (
+                      <a
+                        href={b.link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline font-bold hover:opacity-80 shrink-0 ml-1 inline-flex items-center gap-1"
+                      >
+                        {b.linkText || '查看詳情'} <ExternalLink size={11} />
+                      </a>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => {
+                      setIsBannerDismissed(true);
+                      sessionStorage.setItem('dismissed_banner', 'true');
+                    }}
+                    className="shrink-0 p-1 rounded-lg hover:bg-black/10 dark:hover:bg-white/10 transition-colors opacity-70 hover:opacity-100"
+                    title="關閉此公告橫幅"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
           <main className="flex-1 w-full">
             <ErrorBoundary title="切換分頁時發生組件異常 (Tab Execution Error)">
             {activeTab === 'analytics' && (
@@ -4413,13 +4528,13 @@ function App() {
           </footer>
         </div>
       )}
-      {!appLoading && showAnnouncement && (
+      {!appLoading && showAnnouncement && announcementConfig?.modal?.enabled !== false && (
         <div className="fixed inset-0 z-[3000] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setShowAnnouncement(false)}></div>
           <div className={`relative w-full max-w-lg rounded-2xl shadow-2xl border p-6 flex flex-col gap-4 ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
             <div className="flex justify-between items-center border-b pb-3 border-slate-200 dark:border-slate-800">
               <h2 className="text-lg font-black text-cyan-500 flex items-center gap-2">
-                <Megaphone size={24} /> {ANNOUNCEMENT_TITLE}
+                <Megaphone size={24} /> {announcementConfig?.modal?.title || ANNOUNCEMENT_TITLE}
               </h2>
               <button onClick={() => setShowAnnouncement(false)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors">
                 <X size={24} />
@@ -4427,7 +4542,7 @@ function App() {
             </div>
 
             <div className={`whitespace-pre-wrap text-sm leading-relaxed max-h-[60vh] overflow-y-auto pr-2 scrollbar-thin ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
-              {ANNOUNCEMENT_TEXT}
+              {announcementConfig?.modal?.content || ANNOUNCEMENT_TEXT}
             </div>
 
             <div className="flex justify-between items-center pt-4 border-t border-slate-200 dark:border-slate-800 mt-2">
@@ -4438,10 +4553,11 @@ function App() {
                   checked={hideAnnouncementNextTime}
                   onChange={(e) => {
                     setHideAnnouncementNextTime(e.target.checked);
+                    const ver = announcementConfig?.modal?.version || '3.1.0';
                     if (e.target.checked) {
-                      localStorage.setItem('hideAnnouncement_v3_1', 'true');
+                      localStorage.setItem('hideAnnouncement_' + ver, 'true');
                     } else {
-                      localStorage.removeItem('hideAnnouncement_v3_1');
+                      localStorage.removeItem('hideAnnouncement_' + ver);
                     }
                   }}
                 />
