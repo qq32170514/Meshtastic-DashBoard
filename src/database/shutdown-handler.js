@@ -82,6 +82,7 @@ class ShutdownHandler {
             let checkpointError = null;
 
             let adapterClosed = false;
+            let closeTimedOut = false;
             let closeError = null;
 
             // 1. 簽發本次專屬且受限於共用 Deadline 之 DrainCapability
@@ -199,11 +200,14 @@ class ShutdownHandler {
                 console.warn('⚠️ [SHUTDOWN] 由於隊列未乾淨排空或未達靜止，跳過 TRUNCATE Checkpoint 以防止損壞');
             }
 
-            // 4. 階段三：關閉 Adapter 連線 (嚴格使用剩餘共用預算，絕不保底加時、絕不對活動連線執行 rawClose)
+            // 4. 階段三：關閉 Adapter 連線 (嚴格使用剩餘共用預算與單一絕對 Deadline，絕不保底加時、絕不對活動連線執行 rawClose)
             const remainingForClose = getRemainingBudget();
             if (remainingForClose <= 0 || checkpointTimedOut) {
                 deadlineExpired = true;
                 adapterClosed = false;
+                if (!checkpointTimedOut) {
+                    closeTimedOut = true;
+                }
                 const reasonMsg = checkpointTimedOut
                     ? '[CLOSE_SKIPPED_CHECKPOINT_TIMEOUT] Checkpoint 超時未完成，禁止強制關閉仍在活動中之 SQLite 連線'
                     : `[CLOSE_TIMEOUT] Shutdown Deadline 已到期 (剩餘: ${remainingForClose}ms)，跳過 Close 階段`;
@@ -211,13 +215,22 @@ class ShutdownHandler {
                 console.error(`❌ [SHUTDOWN] ${reasonMsg}`);
             } else {
                 try {
-                    await this.#adapter.close(remainingForClose);
-                    adapterClosed = (this.#adapter.state === ADAPTER_STATES.CLOSED);
+                    await this.#adapter.close({
+                        timeoutMs: remainingForClose,
+                        deadlineAt: shutdownDeadlineAt
+                    });
+                    const postCloseStatus = this.#adapter.getActiveStatus();
+                    adapterClosed = Boolean(
+                        this.#adapter.state === ADAPTER_STATES.CLOSED &&
+                        !postCloseStatus.nativeClosePending
+                    );
                     console.log('🔒 [SHUTDOWN] SQLite 連線已安全關閉');
                 } catch (closeErr) {
                     closeError = closeErr;
                     adapterClosed = false;
-                    if (String(closeErr.message || '').includes('CLOSE_TIMEOUT') || getRemainingBudget() <= 0) {
+                    const errMsg = String(closeErr.message || '');
+                    if (errMsg.includes('CLOSE_TIMEOUT') || errMsg.includes('NATIVE_CLOSE_TIMEOUT') || getRemainingBudget() <= 0) {
+                        closeTimedOut = true;
                         deadlineExpired = true;
                     }
                     console.error('❌ [SHUTDOWN] Adapter 關閉失敗:', closeErr.message);
@@ -227,6 +240,13 @@ class ShutdownHandler {
             const durationMs = Date.now() - startTime;
             const finalMetrics = this.#writeQueue.getMetrics();
             const finalAdapterStatus = this.#adapter.getActiveStatus();
+            const nativeClosePending = Boolean(finalAdapterStatus.nativeClosePending);
+            closeTimedOut = Boolean(closeTimedOut || finalAdapterStatus.closeTimedOut);
+            adapterClosed = Boolean(
+                adapterClosed &&
+                this.#adapter.state === ADAPTER_STATES.CLOSED &&
+                !nativeClosePending
+            );
             const hasUncommittedData = (finalMetrics.totalUncommitted > 0);
             const overallSuccess = Boolean(
                 drainClean &&
@@ -234,14 +254,18 @@ class ShutdownHandler {
                 !checkpointTimedOut &&
                 !checkpointError &&
                 !deadlineExpired &&
+                !closeTimedOut &&
+                !nativeClosePending &&
                 adapterClosed &&
                 !hasUncommittedData
             );
-            console.log(`🏁 [SHUTDOWN] 關閉流程完成，耗時 ${durationMs}ms (成功: ${overallSuccess}, Checkpoint完成: ${checkpointCompleted}, Adapter關閉: ${adapterClosed}, 資料潔淨: ${!hasUncommittedData})`);
+            console.log(`🏁 [SHUTDOWN] 關閉流程完成，耗時 ${durationMs}ms (成功: ${overallSuccess}, Checkpoint完成: ${checkpointCompleted}, Adapter關閉: ${adapterClosed}, NativeClosePending: ${nativeClosePending}, 資料潔淨: ${!hasUncommittedData})`);
 
             const result = {
                 success: overallSuccess,
                 adapterClosed: Boolean(adapterClosed),
+                nativeClosePending: Boolean(nativeClosePending),
+                closeTimedOut: Boolean(closeTimedOut),
                 dataClean: Boolean(drainClean && !hasUncommittedData),
                 hasUncommittedData,
                 checkpointCompleted: Boolean(checkpointCompleted),
@@ -253,6 +277,9 @@ class ShutdownHandler {
                 diagnostics: {
                     adapterStatus: finalAdapterStatus,
                     queueMetrics: finalMetrics,
+                    nativeClosePending: Boolean(nativeClosePending),
+                    closeTimedOut: Boolean(closeTimedOut),
+                    adapterClosed: Boolean(adapterClosed),
                     checkpoint: {
                         attempted: checkpointAttempted,
                         completed: checkpointCompleted,
@@ -277,9 +304,9 @@ class ShutdownHandler {
     }
 
     /**
-     * 🌟 緊急崩潰關閉處理 (Emergency Crash Shutdown - v2.7.5 P1)
+     * 🌟 緊急崩潰關閉處理 (Emergency Crash Shutdown - v2.7.5 P1 & v2.7.6 P0-2)
      * 同時檢查 Adapter 靜止、WriteQueue In-Flight 與 Flush Worker 狀態；
-     * 嚴格分離「連線是否可安全關閉」、「是否存在未提交資料」與「是否達成資料完整性」
+     * 全程共用單一絕對 emergencyDeadlineAt 約束靜止等待與原生 db.close(callback)
      */
     async handleEmergencyCrash(err, origin = 'uncaughtException', options = {}) {
         console.error(`🚨 [EMERGENCY_SHUTDOWN] 觸發緊急關閉！來源: ${origin} | 錯誤:`, err);
@@ -288,11 +315,21 @@ class ShutdownHandler {
         this.#adapter.stopAcceptingNewTasks();
         this.#writeQueue.close();
 
-        // 2. 有界等待底層操作、Scheduler、Queue In-Flight 與 Flush Worker 靜止
-        const waitDeadline = Date.now() + (this.#config.emergencyWaitMs || 1000);
+        // 2. 建立單一絕對 Emergency Deadline，有界等待底層操作、Scheduler、Queue In-Flight 與 Flush Worker 靜止
+        const emergencyBudgetMs = typeof this.#config.emergencyWaitMs === 'number'
+            ? this.#config.emergencyWaitMs
+            : 1000;
+        const emergencyDeadlineAt = Date.now() + emergencyBudgetMs;
+        const getRemainingEmergencyBudget = () => emergencyDeadlineAt - Date.now();
 
-        while (!this._canSafelyEmergencyClose() && Date.now() < waitDeadline) {
-            await new Promise(r => setTimeout(r, 25));
+        while (
+            !this._canSafelyEmergencyClose() &&
+            !this.#adapter.getActiveStatus().nativeClosePending &&
+            Date.now() < emergencyDeadlineAt
+        ) {
+            const remainingWait = getRemainingEmergencyBudget();
+            if (remainingWait <= 0) break;
+            await new Promise(r => setTimeout(r, Math.min(25, remainingWait)));
         }
 
         const status = this.#adapter.getActiveStatus();
@@ -303,8 +340,20 @@ class ShutdownHandler {
         const hasUncommittedData = (qMetrics.totalUncommitted > 0);
         const dataClean = (!hasUncommittedData);
 
+        const safeToJoinExistingNativeClose = Boolean(
+            status.nativeClosePending &&
+            qMetrics.inFlightCount === 0 &&
+            !flushWorkerActive &&
+            status.schedulerPending === 0 &&
+            status.schedulerActive === 0 &&
+            status.activeTransactions === 0 &&
+            !status.underlyingExecuting &&
+            !status.maintenanceInProgress &&
+            !status.checkpointInProgress
+        );
+
         // 3. 檢查 7 項安全關閉准入條件 (Adapter Quiescent + Queue In-Flight 為 0 + Flush Worker 未執行)
-        if (!this._canSafelyEmergencyClose()) {
+        if (!this._canSafelyEmergencyClose() && !safeToJoinExistingNativeClose) {
             console.error('🚨 [EMERGENCY_CLOSE_ABORTED] SQLite Adapter 或 WriteQueue In-Flight / Flush Worker 尚未達到完全靜止狀態，為防記憶體損毀或競態嚴禁呼叫 emergencyClose()！');
             const dump = {
                 timestamp: new Date().toISOString(),
@@ -325,6 +374,8 @@ class ShutdownHandler {
             return {
                 success: false,
                 adapterClosed: false,
+                nativeClosePending: Boolean(status.nativeClosePending),
+                closeTimedOut: Boolean(status.closeTimedOut),
                 dataClean: false,
                 hasUncommittedData,
                 queueMetrics: qMetrics,
@@ -339,28 +390,58 @@ class ShutdownHandler {
                     flushWorkerActive: Boolean(flushWorkerActive),
                     schedulerPending: status.schedulerPending,
                     schedulerActive: status.schedulerActive,
-                    closeError: '[EMERGENCY_CLOSE_ABORTED] Adapter 或 WriteQueue In-Flight / Flush Worker 尚有在途操作未靜止'
+                    nativeClosePending: Boolean(status.nativeClosePending),
+                    closeTimedOut: Boolean(status.closeTimedOut),
+                    adapterClosed: false,
+                    closeError: '[EMERGENCY_CLOSE_ABORTED] Adapter 或 WriteQueue In-Flight / Flush Worker 尚有在途操作未靜止',
+                    deadlineAt: emergencyDeadlineAt,
+                    remainingBudgetMs: getRemainingEmergencyBudget()
                 }
             };
         }
 
-        // 4. 底層無操作、Queue 無 In-Flight 且 Flush Worker 靜止，可安全調用 emergencyClose
+        // 4. 底層無操作、Queue 無 In-Flight 且 Flush Worker 靜止，受共用 emergencyDeadlineAt 限制調用 emergencyClose
         let adapterClosed = false;
+        let closeTimedOut = false;
         let closeErrMessage = null;
+        const remainingForEmergencyClose = getRemainingEmergencyBudget();
+
         try {
-            await this.#adapter.emergencyClose({
-                inFlightCount: qMetrics.inFlightCount,
-                flushWorkerActive: Boolean(flushWorkerActive)
-            });
-            adapterClosed = (this.#adapter.state === ADAPTER_STATES.CLOSED);
+            await this.#adapter.emergencyClose(
+                {
+                    inFlightCount: qMetrics.inFlightCount,
+                    flushWorkerActive: Boolean(flushWorkerActive)
+                },
+                {
+                    timeoutMs: remainingForEmergencyClose,
+                    deadlineAt: emergencyDeadlineAt
+                }
+            );
+            const postCloseStatus = this.#adapter.getActiveStatus();
+            adapterClosed = Boolean(
+                this.#adapter.state === ADAPTER_STATES.CLOSED &&
+                !postCloseStatus.nativeClosePending
+            );
             console.log('🔒 [EMERGENCY_SHUTDOWN] SQLite 連線已安全釋放');
         } catch (closeErr) {
             closeErrMessage = closeErr.message;
+            adapterClosed = false;
+            const errMsg = String(closeErr.message || '');
+            if (errMsg.includes('CLOSE_TIMEOUT') || errMsg.includes('NATIVE_CLOSE_TIMEOUT') || getRemainingEmergencyBudget() <= 0) {
+                closeTimedOut = true;
+            }
             console.error('⚠️ [EMERGENCY_SHUTDOWN] emergencyClose 報錯:', closeErr.message);
         }
 
         const finalStatus = this.#adapter.getActiveStatus();
-        const overallSuccess = Boolean(adapterClosed && dataClean);
+        const nativeClosePending = Boolean(finalStatus.nativeClosePending);
+        closeTimedOut = Boolean(closeTimedOut || finalStatus.closeTimedOut);
+        adapterClosed = Boolean(
+            adapterClosed &&
+            this.#adapter.state === ADAPTER_STATES.CLOSED &&
+            !nativeClosePending
+        );
+        const overallSuccess = Boolean(adapterClosed && !nativeClosePending && !closeTimedOut && dataClean);
 
         if (options.exitProcess !== false && typeof process !== 'undefined' && process.exit) {
             process.exit(overallSuccess ? 0 : 1);
@@ -368,6 +449,8 @@ class ShutdownHandler {
         return {
             success: overallSuccess,
             adapterClosed: Boolean(adapterClosed),
+            nativeClosePending: Boolean(nativeClosePending),
+            closeTimedOut: Boolean(closeTimedOut),
             dataClean: Boolean(dataClean),
             hasUncommittedData,
             queueMetrics: qMetrics,
@@ -381,7 +464,12 @@ class ShutdownHandler {
                 flushWorkerActive: Boolean(flushWorkerActive),
                 schedulerPending: finalStatus.schedulerPending,
                 schedulerActive: finalStatus.schedulerActive,
-                closeError: closeErrMessage
+                nativeClosePending: Boolean(nativeClosePending),
+                closeTimedOut: Boolean(closeTimedOut),
+                adapterClosed: Boolean(adapterClosed),
+                closeError: closeErrMessage,
+                deadlineAt: emergencyDeadlineAt,
+                remainingBudgetMs: getRemainingEmergencyBudget()
             }
         };
     }

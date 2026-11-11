@@ -54,6 +54,9 @@ class SQLiteAdapter {
     #pragmas;
     #checkpointInProgress = false;
     #databaseFactory = null;
+    #nativeClosePromise = null;
+    #nativeClosePending = false;
+    #closeTimedOut = false;
 
     constructor(config = {}) {
         this.instanceId = crypto.randomUUID();
@@ -61,6 +64,7 @@ class SQLiteAdapter {
         this.state = ADAPTER_STATES.NEW;
         this.lastError = null;
         this.lastCleanupError = null;
+        this.lastCloseError = null;
         this._schedulerQueue = Promise.resolve();
         this._closePromise = null;
         this._initPromise = null;
@@ -126,7 +130,7 @@ class SQLiteAdapter {
     }
 
     /**
-     * 判定 Adapter 是否已完全達到 Quiescent 靜止狀態 (P0-4, v2.7.5 P0)
+     * 判定 Adapter 是否已完全達到 Quiescent 靜止狀態 (P0-4, v2.7.5 P0, v2.7.6 P0)
      */
     isQuiescent() {
         return (
@@ -135,12 +139,13 @@ class SQLiteAdapter {
             this.#schedulerActiveCount === 0 &&
             this.#activeTransactions === 0 &&
             !this.maintenanceInProgress &&
-            !this.#checkpointInProgress
+            !this.#checkpointInProgress &&
+            !this.#nativeClosePending
         );
     }
 
     /**
-     * 取得 Adapter 完整執行狀態快照 (P0-3, P0-4, v2.7.5 P0)
+     * 取得 Adapter 完整執行狀態快照 (P0-3, P0-4, v2.7.5 P0, v2.7.6 P0)
      */
     getActiveStatus() {
         return {
@@ -152,6 +157,10 @@ class SQLiteAdapter {
             checkpointInProgress: this.#checkpointInProgress,
             acceptingNewTasks: this.#acceptingNewTasks,
             isQuiescent: this.isQuiescent(),
+            nativeClosePending: this.#nativeClosePending,
+            closeTimedOut: this.#closeTimedOut,
+            adapterClosed: this.state === ADAPTER_STATES.CLOSED,
+            lastCloseError: this.lastCloseError ? this.lastCloseError.message : null,
             state: this.state
         };
     }
@@ -352,6 +361,9 @@ class SQLiteAdapter {
             if (this.state === ADAPTER_STATES.ERROR) {
                 return Promise.reject(new Error(`Adapter 處於故障熔斷狀態: ${this.lastError?.message}`));
             }
+            if (this.#nativeClosePending) {
+                return Promise.reject(new Error('[ADAPTER_CLOSING_NATIVE_PENDING] 原生資料庫關閉進行中，禁止任何新操作入列'));
+            }
 
             // P0-3: 停止接收新一般工作閘門
             if (!this.#acceptingNewTasks && authType !== AUTH_TYPES.DRAIN && authType !== AUTH_TYPES.CHECKPOINT) {
@@ -386,6 +398,9 @@ class SQLiteAdapter {
                     }
                     if (this.state === ADAPTER_STATES.CLOSED) {
                         throw new Error('[SCHEDULER_ABORT] Adapter 已關閉');
+                    }
+                    if (this.#nativeClosePending) {
+                        throw new Error('[SCHEDULER_ABORT] 原生資料庫關閉進行中，中止已排隊任務');
                     }
 
                     if (this.state === ADAPTER_STATES.CLOSING) {
@@ -423,6 +438,7 @@ class SQLiteAdapter {
     _rawExecute(sql, params = []) {
         return new Promise((resolve, reject) => {
             if (!this.db) return reject(new Error('[DB_NULL] 連線尚未建立或已關閉'));
+            if (this.#nativeClosePending) return reject(new Error('[DB_CLOSING_NATIVE_PENDING] 原生資料庫關閉進行中，禁止重新使用連線'));
             this.db.run(sql, params, function (err) {
                 if (err) reject(err);
                 else resolve({ lastID: this.lastID, changes: this.changes });
@@ -433,6 +449,7 @@ class SQLiteAdapter {
     _rawQuery(sql, params = []) {
         return new Promise((resolve, reject) => {
             if (!this.db) return reject(new Error('[DB_NULL] 連線尚未建立或已關閉'));
+            if (this.#nativeClosePending) return reject(new Error('[DB_CLOSING_NATIVE_PENDING] 原生資料庫關閉進行中，禁止重新使用連線'));
             this.db.all(sql, params, (err, rows) => {
                 if (err) reject(err);
                 else resolve(rows || []);
@@ -443,6 +460,7 @@ class SQLiteAdapter {
     _rawQueryOne(sql, params = []) {
         return new Promise((resolve, reject) => {
             if (!this.db) return reject(new Error('[DB_NULL] 連線尚未建立或已關閉'));
+            if (this.#nativeClosePending) return reject(new Error('[DB_CLOSING_NATIVE_PENDING] 原生資料庫關閉進行中，禁止重新使用連線'));
             this.db.get(sql, params, (err, row) => {
                 if (err) reject(err);
                 else resolve(row || null);
@@ -651,87 +669,246 @@ class SQLiteAdapter {
         }
     }
 
-    close(timeoutMs = null) {
+    _resolveCloseDeadline(options = null) {
+        let timeoutMs = null;
+        let deadlineAt = null;
+        if (typeof options === 'number') {
+            timeoutMs = options;
+            deadlineAt = Date.now() + options;
+        } else if (options && typeof options === 'object') {
+            if (typeof options.deadlineAt === 'number') {
+                deadlineAt = options.deadlineAt;
+            }
+            if (typeof options.timeoutMs === 'number') {
+                timeoutMs = options.timeoutMs;
+                if (deadlineAt === null) {
+                    deadlineAt = Date.now() + options.timeoutMs;
+                }
+            }
+        }
+        return { timeoutMs, deadlineAt };
+    }
+
+    async _awaitNativeCloseWithDeadline(deadlineAt = null) {
+        if (this.state === ADAPTER_STATES.CLOSED && !this.#nativeClosePending && !this.db) {
+            return;
+        }
+
+        if (deadlineAt !== null && !this.#nativeClosePending && this.state !== ADAPTER_STATES.CLOSED) {
+            const remainingBeforeStart = deadlineAt - Date.now();
+            if (remainingBeforeStart <= 0) {
+                this.#closeTimedOut = true;
+                throw new Error(`[CLOSE_TIMEOUT] 進入原生 db.close() 前已超過 Close Deadline (剩餘: ${remainingBeforeStart}ms, status: ${JSON.stringify(this.getActiveStatus())})`);
+            }
+        }
+
+        const nativeClosePromise = this._rawClose();
+        nativeClosePromise.catch(() => {});
+
+        if (deadlineAt === null) {
+            return await nativeClosePromise;
+        }
+
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+            if (this.state === ADAPTER_STATES.CLOSED && !this.#nativeClosePending) {
+                return await nativeClosePromise;
+            }
+            this.#closeTimedOut = true;
+            throw new Error(`[CLOSE_TIMEOUT] [NATIVE_CLOSE_TIMEOUT] 原生 db.close(callback) 未在 Deadline 內完成 (剩餘: ${remainingMs}ms, nativeClosePending: ${this.#nativeClosePending}, status: ${JSON.stringify(this.getActiveStatus())})`);
+        }
+
+        return await new Promise((resolve, reject) => {
+            const timerId = setTimeout(() => {
+                this.#closeTimedOut = true;
+                reject(new Error(`[CLOSE_TIMEOUT] [NATIVE_CLOSE_TIMEOUT] 原生 db.close(callback) 未在剩餘時限 (${remainingMs}ms) 內完成 (nativeClosePending: ${this.#nativeClosePending}, status: ${JSON.stringify(this.getActiveStatus())})`));
+            }, remainingMs);
+
+            nativeClosePromise.then(
+                (res) => {
+                    clearTimeout(timerId);
+                    resolve(res);
+                },
+                (err) => {
+                    clearTimeout(timerId);
+                    reject(err);
+                }
+            );
+        });
+    }
+
+    close(options = null) {
+        if (this.state === ADAPTER_STATES.CLOSED && !this.#nativeClosePending && !this.db) {
+            return Promise.resolve();
+        }
         if (this._closePromise) return this._closePromise;
 
-        this._closePromise = (async () => {
-            if (this.state !== ADAPTER_STATES.ERROR) {
-                this.state = ADAPTER_STATES.CLOSING;
-            }
-            this.#acceptingNewTasks = false;
+        const { deadlineAt } = this._resolveCloseDeadline(options);
 
-            const waitBudget = typeof timeoutMs === 'number' ? timeoutMs : null;
-            if (waitBudget !== null) {
-                if (waitBudget > 0) {
-                    let timerId = null;
-                    const timeoutPromise = new Promise((_, reject) => {
-                        timerId = setTimeout(() => {
-                            reject(new Error(`[CLOSE_TIMEOUT] Scheduler 隊列未在時限 (${waitBudget}ms) 內清空`));
-                        }, waitBudget);
-                    });
-                    try {
-                        await Promise.race([
-                            this._schedulerQueue.catch(() => {}),
-                            timeoutPromise
-                        ]);
-                    } catch (waitErr) {
-                        console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] ${waitErr.message}`);
-                    } finally {
-                        if (timerId) clearTimeout(timerId);
+        this._closePromise = (async () => {
+            try {
+                if (this.state !== ADAPTER_STATES.ERROR && this.state !== ADAPTER_STATES.CLOSED) {
+                    this.state = ADAPTER_STATES.CLOSING;
+                }
+                this.#acceptingNewTasks = false;
+
+                // 若先前已啟動原生 db.close(callback) 但呼叫端曾超時，直接重用既有 #nativeClosePromise 等待，絕不重複呼叫 db.close()
+                if (this.#nativeClosePending) {
+                    return await this._awaitNativeCloseWithDeadline(deadlineAt);
+                }
+
+                if (deadlineAt !== null) {
+                    const waitBudget = deadlineAt - Date.now();
+                    if (waitBudget > 0) {
+                        let timerId = null;
+                        const timeoutPromise = new Promise((_, reject) => {
+                            timerId = setTimeout(() => {
+                                this.#closeTimedOut = true;
+                                reject(new Error(`[CLOSE_TIMEOUT] Scheduler 隊列未在時限 (${waitBudget}ms) 內清空`));
+                            }, waitBudget);
+                        });
+                        try {
+                            await Promise.race([
+                                this._schedulerQueue.catch(() => {}),
+                                timeoutPromise
+                            ]);
+                        } catch (waitErr) {
+                            console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] ${waitErr.message}`);
+                        } finally {
+                            if (timerId) clearTimeout(timerId);
+                        }
+                    } else {
+                        this.#closeTimedOut = true;
+                        console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] [CLOSE_TIMEOUT] 剩餘關閉時間預算不足 (${waitBudget}ms)，不啟動額外等待`);
                     }
                 } else {
-                    console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] [CLOSE_TIMEOUT] 剩餘關閉時間預算不足 (${waitBudget}ms)，不啟動額外等待`);
+                    try {
+                        await this._schedulerQueue;
+                    } catch (_) {}
                 }
-            } else {
-                try {
-                    await this._schedulerQueue;
-                } catch (_) {}
-            }
 
-            if (!this.isQuiescent()) {
-                this._closePromise = null;
-                throw new Error(`[CLOSE_REJECTED] 尚有在途或排程工作未完成，拒絕強制關閉連線 (status: ${JSON.stringify(this.getActiveStatus())})`);
+                if (!this.isQuiescent()) {
+                    if (deadlineAt !== null && Date.now() >= deadlineAt) {
+                        this.#closeTimedOut = true;
+                    }
+                    throw new Error(`[CLOSE_REJECTED]${this.#closeTimedOut ? ' [CLOSE_TIMEOUT]' : ''} 尚有在途或排程工作未完成，拒絕強制關閉連線 (status: ${JSON.stringify(this.getActiveStatus())})`);
+                }
+
+                return await this._awaitNativeCloseWithDeadline(deadlineAt);
+            } finally {
+                if (this.state !== ADAPTER_STATES.CLOSED) {
+                    this._closePromise = null;
+                }
             }
-            return await this._rawClose();
         })();
 
         return this._closePromise;
     }
 
-    emergencyClose(queueSafetyState = null) {
-        if (queueSafetyState && typeof queueSafetyState === 'object') {
-            if (queueSafetyState.inFlightCount > 0 || queueSafetyState.flushWorkerActive) {
-                throw new Error(`[EMERGENCY_CLOSE_REJECTED] WriteQueue 尚有 In-Flight 項目或 Flush Worker 運行中 (inFlight: ${queueSafetyState.inFlightCount}, flushWorkerActive: ${Boolean(queueSafetyState.flushWorkerActive)})`);
+    emergencyClose(queueSafetyState = null, options = null) {
+        if (this.state === ADAPTER_STATES.CLOSED && !this.#nativeClosePending && !this.db) {
+            return Promise.resolve();
+        }
+
+        let resolvedSafetyState = queueSafetyState;
+        let resolvedOptions = options;
+        if (typeof queueSafetyState === 'number') {
+            resolvedSafetyState = null;
+            resolvedOptions = queueSafetyState;
+        } else if (
+            queueSafetyState &&
+            typeof queueSafetyState === 'object' &&
+            options === null &&
+            ('timeoutMs' in queueSafetyState || 'deadlineAt' in queueSafetyState) &&
+            !('inFlightCount' in queueSafetyState) &&
+            !('flushWorkerActive' in queueSafetyState)
+        ) {
+            resolvedSafetyState = null;
+            resolvedOptions = queueSafetyState;
+        }
+
+        if (!this.#nativeClosePending) {
+            if (resolvedSafetyState && typeof resolvedSafetyState === 'object') {
+                if (resolvedSafetyState.inFlightCount > 0 || resolvedSafetyState.flushWorkerActive) {
+                    return Promise.reject(new Error(`[EMERGENCY_CLOSE_REJECTED] WriteQueue 尚有 In-Flight 項目或 Flush Worker 運行中 (inFlight: ${resolvedSafetyState.inFlightCount}, flushWorkerActive: ${Boolean(resolvedSafetyState.flushWorkerActive)})`));
+                }
+            }
+            if (!this.isQuiescent()) {
+                return Promise.reject(new Error(`[EMERGENCY_CLOSE_REJECTED] Adapter 尚未達到靜止狀態 (isQuiescent: false, status: ${JSON.stringify(this.getActiveStatus())})`));
             }
         }
-        if (!this.isQuiescent()) {
-            throw new Error(`[EMERGENCY_CLOSE_REJECTED] Adapter 尚未達到靜止狀態 (isQuiescent: false, status: ${JSON.stringify(this.getActiveStatus())})`);
+
+        if (this.state !== ADAPTER_STATES.ERROR && this.state !== ADAPTER_STATES.CLOSED) {
+            this.state = ADAPTER_STATES.CLOSING;
         }
-        return this._rawClose();
+        this.#acceptingNewTasks = false;
+
+        const { deadlineAt } = this._resolveCloseDeadline(resolvedOptions ?? queueSafetyState);
+        return this._awaitNativeCloseWithDeadline(deadlineAt);
     }
 
     _rawClose() {
-        return new Promise((resolve, reject) => {
-            if (this.isExecutingUnderlying || this.#activeTransactions > 0 || this.#checkpointInProgress || this.maintenanceInProgress) {
-                return reject(new Error('[RAW_CLOSE_REJECTED] 底層操作運行中禁止調用 _rawClose()'));
-            }
-            if (!this.db) {
-                this.state = ADAPTER_STATES.CLOSED;
-                return resolve();
-            }
-            this.db.close((err) => {
-                if (err) {
-                    console.error('❌ [ADAPTER] db.close() 釋放連線時報錯:', err.message);
-                    this.state = ADAPTER_STATES.ERROR;
-                    this.lastError = err;
+        if (this.state === ADAPTER_STATES.CLOSED && !this.#nativeClosePending && !this.db) {
+            return Promise.resolve();
+        }
+        if (this.#nativeClosePromise) {
+            return this.#nativeClosePromise;
+        }
+        if (this.isExecutingUnderlying || this.#activeTransactions > 0 || this.#checkpointInProgress || this.maintenanceInProgress) {
+            return Promise.reject(new Error('[RAW_CLOSE_REJECTED] 底層操作運行中禁止調用 _rawClose()'));
+        }
+        if (!this.db) {
+            this.#nativeClosePending = false;
+            this.#closeTimedOut = false;
+            this.state = ADAPTER_STATES.CLOSED;
+            return Promise.resolve();
+        }
+
+        if (this.state !== ADAPTER_STATES.ERROR) {
+            this.state = ADAPTER_STATES.CLOSING;
+        }
+        this.#acceptingNewTasks = false;
+        this.#nativeClosePending = true;
+
+        const dbToClose = this.db;
+        let settled = false;
+
+        this.#nativeClosePromise = new Promise((resolve, reject) => {
+            try {
+                dbToClose.close((err) => {
+                    if (settled) return;
+                    settled = true;
+                    this.#nativeClosePending = false;
+
+                    if (err) {
+                        console.error('❌ [ADAPTER] db.close() 釋放連線時報錯:', err.message);
+                        this.lastCloseError = err;
+                        this.lastError = err;
+                        this.state = ADAPTER_STATES.ERROR;
+                        this._closePromise = null;
+                        return reject(err);
+                    }
+
+                    this.db = null;
+                    this.#closeTimedOut = false;
+                    this.state = ADAPTER_STATES.CLOSED;
                     this._closePromise = null;
-                    return reject(err);
-                }
-                this.state = ADAPTER_STATES.CLOSED;
-                this.db = null;
-                resolve();
-            });
+                    resolve();
+                });
+            } catch (syncErr) {
+                if (settled) return;
+                settled = true;
+                this.#nativeClosePending = false;
+                this.lastCloseError = syncErr;
+                this.lastError = syncErr;
+                this.state = ADAPTER_STATES.ERROR;
+                this._closePromise = null;
+                reject(syncErr);
+            }
         });
+
+        this.#nativeClosePromise.catch(() => {});
+        return this.#nativeClosePromise;
     }
 }
 

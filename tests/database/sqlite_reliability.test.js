@@ -43,7 +43,7 @@ function assertDataConservation(m) {
     );
 }
 
-describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', () => {
+describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', () => {
 
     // ==========================================
     // Group A: Scheduler / Shutdown (7 Scenarios)
@@ -1361,7 +1361,7 @@ describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', ()
     // Group H: SQLite Reliability v2.7.5 Final Hardening & Verification (3 Scenarios)
     // ==========================================
 
-    it('42. Checkpoint Timeout 與 Shutdown 共用 Deadline (v2.7.5 P0)', async () => {
+    it('42. Checkpoint Task Execution Delay Simulation 與 Shutdown 共用 Deadline (v2.7.5 P0 / v2.7.6 修正)', async () => {
         const dbPath = getTempDbPath('checkpoint_shared_deadline');
         const db = await createDatabaseSubsystem({
             dbPath,
@@ -1379,7 +1379,8 @@ describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', ()
         db.queueDbOp('INSERT INTO cp_deadline_test VALUES (1)');
         db.queueDbOp('INSERT INTO cp_deadline_test VALUES (2)');
 
-        // 2. 攔截底層 PRAGMA wal_checkpoint(TRUNCATE)，以 Deferred 模擬 Checkpoint 長時間阻塞超過共用 Deadline
+        // 2. 攔截 Adapter 內部 _rawQueryOne，以 Deferred 模擬 Checkpoint Task 在 Adapter 執行層等待超過共用 Deadline
+        //    (註：此為 Checkpoint Task Execution Delay Simulation，驗證 Adapter/ShutdownHandler 共用 Deadline 與狀態保護，非 C++ native thread 阻塞)
         let releaseCheckpoint;
         const checkpointDeferred = new Promise((resolve) => { releaseCheckpoint = resolve; });
         let checkpointStarted = false;
@@ -1405,9 +1406,9 @@ describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', ()
         const shutResult = await db.shutdownHandler.handle('SIGTERM', { exitProcess: false });
         const elapsed = Date.now() - startT;
 
-        // 4. 驗證 Shutdown 在總時間預算 (約 220ms) 內返回，未在 Close 階段額外保底等待 100ms
+        // 4. 驗證 Shutdown 在總時間預算 (220ms，容許合理計時器誤差 200ms~255ms) 內返回，未在 Close 階段額外保底等待 100ms
         assert.equal(checkpointStarted, true, 'Drain 正常完成後應進入 TRUNCATE Checkpoint');
-        assert.ok(elapsed >= 170 && elapsed < 320, `Shutdown 必須受單一共用 Deadline (220ms) 約束準時返回，實際耗時: ${elapsed}ms`);
+        assert.ok(elapsed >= 200 && elapsed <= 255, `Shutdown 必須受單一共用 Deadline (220ms) 約束準時返回 (200~255ms)，實際耗時: ${elapsed}ms`);
 
         // 5. 驗證結果明確標記 Checkpoint Timeout，且不得誤判為成功
         assert.equal(shutResult.success, false, 'Checkpoint 超時時 Shutdown 絕對不得回報成功');
@@ -1607,6 +1608,270 @@ describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', ()
         assert.match(badAdapter.lastCleanupError.message, /Simulated native close cleanup error/);
 
         cleanupTempDb(dbPath);
+    });
+
+    // ==========================================
+    // Group I: SQLite Reliability v2.7.6 Native Close Deadline Hardening (2 Scenarios)
+    // ==========================================
+
+    it('45. Native Close Callback Deadline — Native Close Callback Delay Simulation (v2.7.6 P0-1 & P0-3)', async () => {
+        const dbPath = getTempDbPath('graceful_native_close_deadline');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            config: {
+                shutdown: {
+                    pm2KillTimeoutMs: 220,
+                    drainTimeoutMs: 120,
+                    drainWaitBufferMs: 80
+                }
+            }
+        });
+        await db.run('CREATE TABLE close_deadline_test (id INT PRIMARY KEY)');
+
+        // 1. 排入 2 筆資料，確保 Graceful Shutdown 的 Drain 與 TRUNCATE Checkpoint 正常完成並進入 Close 階段
+        db.queueDbOp('INSERT INTO close_deadline_test VALUES (1)');
+        db.queueDbOp('INSERT INTO close_deadline_test VALUES (2)');
+
+        // 2. Native Close Callback Delay Simulation:
+        //    攔截底層 db.close(callback)，以 Deferred 延遲 JS close callback 完成時點
+        let releaseNativeCloseCallback;
+        const nativeCloseDeferred = new Promise((resolve) => { releaseNativeCloseCallback = resolve; });
+        let closeCallCount = 0;
+        let savedCloseCallback = null;
+        const realUnderlyingDb = db.adapter.db;
+        const origDbClose = realUnderlyingDb.close.bind(realUnderlyingDb);
+
+        realUnderlyingDb.close = (cb) => {
+            closeCallCount++;
+            savedCloseCallback = cb;
+            // 先執行底層真實 close 釋放 OS 檔案鎖，再透過 Deferred 控制 callback 回傳給 Adapter 的時間點
+            origDbClose(async (err) => {
+                await nativeCloseDeferred;
+                if (typeof cb === 'function') {
+                    cb(err);
+                }
+            });
+        };
+
+        // 3. 觸發 Graceful Shutdown，驗證等待時間受單一共用 Deadline (220ms) 約束
+        const startT = Date.now();
+        const shutResult = await db.shutdownHandler.handle('SIGTERM', { exitProcess: false });
+        const elapsed = Date.now() - startT;
+
+        assert.equal(closeCallCount, 1, 'db.close(callback) 必須已被呼叫且僅呼叫一次');
+        assert.ok(elapsed >= 200 && elapsed <= 255, `Graceful Shutdown 等待 native close 必須受單一 Deadline (220ms) 約束 (200~255ms)，實際耗時: ${elapsed}ms`);
+
+        // 4. 驗證超時當下嚴格區分 closeTimedOut / nativeClosePending / adapterClosed
+        assert.equal(shutResult.success, false, 'Native close 超時未完成時 Shutdown 絕對不得回報成功');
+        assert.equal(shutResult.checkpointCompleted, true, '進入 Close 前 Drain 與 Checkpoint 已完成');
+        assert.equal(shutResult.adapterClosed, false, 'closeTimedOut 不代表 adapterClosed，必須為 false');
+        assert.equal(shutResult.nativeClosePending, true, '必須明確標記 nativeClosePending: true');
+        assert.equal(shutResult.closeTimedOut, true, '必須明確標記 closeTimedOut: true');
+        assert.equal(shutResult.deadlineExpired, true, '必須標記共用 Deadline 已到期');
+        assert.ok(shutResult.diagnostics);
+        assert.equal(shutResult.diagnostics.nativeClosePending, true);
+        assert.equal(shutResult.diagnostics.closeTimedOut, true);
+        assert.equal(shutResult.diagnostics.adapterClosed, false);
+        assert.match(shutResult.diagnostics.closeError, /NATIVE_CLOSE_TIMEOUT/);
+
+        const statusDuringPending = db.adapter.getActiveStatus();
+        assert.equal(db.adapter.state, ADAPTER_STATES.CLOSING, 'Callback 返回前 Adapter 必須維持 CLOSING 狀態');
+        assert.equal(statusDuringPending.nativeClosePending, true);
+        assert.equal(statusDuringPending.closeTimedOut, true);
+        assert.equal(statusDuringPending.adapterClosed, false);
+        assert.equal(statusDuringPending.isQuiescent, false, 'nativeClosePending 期間 Adapter 不得回報 Quiescent');
+
+        // 5. 驗證不得提前將 db handle 設為 null，且嚴格拒絕任何新資料庫操作
+        assert.ok(db.adapter.db !== null, 'Native close callback 完成前不得提前清除 db handle');
+        await assert.rejects(
+            async () => { await db.adapter.execute('INSERT INTO close_deadline_test VALUES (3)'); },
+            /ADAPTER_CLOSING_NATIVE_PENDING|GATE_CLOSED|ADAPTER_CLOSING/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.query('SELECT * FROM close_deadline_test'); },
+            /ADAPTER_CLOSING_NATIVE_PENDING|GATE_CLOSED|ADAPTER_CLOSING/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.transaction(async () => {}); },
+            /ADAPTER_CLOSING_NATIVE_PENDING|GATE_CLOSED|ADAPTER_CLOSING/
+        );
+        await assert.rejects(
+            async () => { await db.adapter._rawQueryOne('SELECT 1'); },
+            /DB_CLOSING_NATIVE_PENDING/
+        );
+
+        // 6. Case A & Case D 驗證：Close Timeout 後再次呼叫 close() 或 emergencyClose() 絕對不得重複呼叫底層 db.close()
+        await assert.rejects(
+            async () => { await db.adapter.close(25); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose(null, 25); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        assert.equal(closeCallCount, 1, '重複呼叫 close() 或 emergencyClose() 絕對不得第二次呼叫原生 db.close()');
+
+        // 7. Case B 驗證：釋放 Deferred close callback，驗證 Adapter 正確轉移為 CLOSED 且不重複結算
+        const waitFinalClose = db.adapter.close(500);
+        releaseNativeCloseCallback();
+        await waitFinalClose;
+
+        // 測試若無良 callback 被重複觸發也不會破壞狀態或重複結算
+        if (typeof savedCloseCallback === 'function') {
+            savedCloseCallback(new Error('Duplicate callback invocation should be ignored'));
+        }
+
+        const finalStatus = db.adapter.getActiveStatus();
+        assert.equal(closeCallCount, 1, '全流程原生 db.close() 呼叫次數必須嚴格為 1');
+        assert.equal(db.adapter.state, ADAPTER_STATES.CLOSED, 'Callback 成功返回後才可標記為 CLOSED');
+        assert.equal(db.adapter.db, null, 'Callback 成功返回後才清空 db handle');
+        assert.equal(finalStatus.nativeClosePending, false);
+        assert.equal(finalStatus.closeTimedOut, false);
+        assert.equal(finalStatus.adapterClosed, true);
+
+        cleanupTempDb(dbPath);
+    });
+
+    it('46. Emergency Native Close Callback Deadline 與錯誤狀態轉移驗證 (v2.7.6 P0-2 & P0-3)', async () => {
+        // --- Part A: Emergency Shutdown Native Close Callback Delay Simulation ---
+        const dbPath = getTempDbPath('emergency_native_close_deadline');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            config: {
+                shutdown: {
+                    emergencyWaitMs: 120
+                }
+            }
+        });
+        await db.run('CREATE TABLE emerg_close_deadline (id INT PRIMARY KEY)');
+
+        let releaseEmergencyCloseCb;
+        const emergencyCloseDeferred = new Promise((resolve) => { releaseEmergencyCloseCb = resolve; });
+        let closeCallCount = 0;
+        const realUnderlyingDb = db.adapter.db;
+        const origDbClose = realUnderlyingDb.close.bind(realUnderlyingDb);
+
+        realUnderlyingDb.close = (cb) => {
+            closeCallCount++;
+            origDbClose(async (err) => {
+                await emergencyCloseDeferred;
+                if (typeof cb === 'function') {
+                    cb(err);
+                }
+            });
+        };
+
+        // 1. 觸發 handleEmergencyCrash，驗證受共用 emergencyWaitMs (120ms) 約束，不會無限等待
+        const startT = Date.now();
+        const crashResult = await db.shutdownHandler.handleEmergencyCrash(
+            new Error('Simulated Fatal Exception'),
+            'uncaughtException',
+            { exitProcess: false }
+        );
+        const elapsed = Date.now() - startT;
+
+        assert.equal(closeCallCount, 1, 'Emergency Close 必須呼叫且僅呼叫一次原生 db.close()');
+        assert.ok(elapsed >= 100 && elapsed <= 165, `handleEmergencyCrash 必須受 emergencyWaitMs (120ms) 約束準時返回 (100~165ms)，實際耗時: ${elapsed}ms`);
+
+        // 2. 驗證超時後狀態誠實回報：adapterClosed 為 false、nativeClosePending 為 true、closeTimedOut 為 true
+        assert.equal(crashResult.success, false, 'Native close 超時未返回時 Emergency Shutdown 不得宣稱成功');
+        assert.equal(crashResult.adapterClosed, false, 'Callback 未返回前 adapterClosed 必須維持 false');
+        assert.equal(crashResult.nativeClosePending, true, '必須回報 nativeClosePending: true');
+        assert.equal(crashResult.closeTimedOut, true, '必須回報 closeTimedOut: true');
+        assert.equal(crashResult.forcedExit, false);
+
+        // 3. 驗證 Diagnostics 完整保留 native close pending 與 timeout 診斷資訊
+        assert.ok(crashResult.diagnostics);
+        assert.equal(crashResult.diagnostics.nativeClosePending, true);
+        assert.equal(crashResult.diagnostics.closeTimedOut, true);
+        assert.equal(crashResult.diagnostics.adapterClosed, false);
+        assert.match(crashResult.diagnostics.closeError, /NATIVE_CLOSE_TIMEOUT/);
+        assert.equal(crashResult.diagnostics.adapterStatus.nativeClosePending, true);
+        assert.equal(crashResult.diagnostics.adapterStatus.state, ADAPTER_STATES.CLOSING);
+
+        // 4. 驗證後續再次呼叫 emergencyClose / close 不會再次觸發底層 db.close()，且禁止重用連線
+        assert.ok(db.adapter.db !== null, 'Native close pending 期間不得提前清空 db reference');
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose(null, 20); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.close(20); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        assert.equal(closeCallCount, 1, '後續 emergencyClose/close 不得重複呼叫原生 db.close()');
+
+        await assert.rejects(
+            async () => { await db.adapter.execute('INSERT INTO emerg_close_deadline VALUES (1)'); },
+            /ADAPTER_CLOSING_NATIVE_PENDING|GATE_CLOSED|ADAPTER_CLOSING/
+        );
+        await assert.rejects(
+            async () => { await db.adapter._rawExecute('INSERT INTO emerg_close_deadline VALUES (1)'); },
+            /DB_CLOSING_NATIVE_PENDING/
+        );
+
+        // 5. 當延遲的 native callback 最終成功返回時，驗證 Adapter 正確更新為 CLOSED
+        const finalClosePromise = db.adapter.emergencyClose();
+        releaseEmergencyCloseCb();
+        await finalClosePromise;
+
+        assert.equal(closeCallCount, 1);
+        assert.equal(db.adapter.state, ADAPTER_STATES.CLOSED);
+        assert.equal(db.adapter.db, null);
+        assert.equal(db.adapter.getActiveStatus().nativeClosePending, false);
+        assert.equal(db.adapter.getActiveStatus().adapterClosed, true);
+        cleanupTempDb(dbPath);
+
+        // --- Part B (Case C): Native Close Callback 延遲後回傳 Error 之狀態保護驗證 ---
+        const errDbPath = getTempDbPath('emergency_native_close_error');
+        const errDb = await createDatabaseSubsystem({ dbPath: errDbPath });
+        await errDb.run('CREATE TABLE close_err_test (id INT)');
+
+        let releaseErrCloseCb;
+        const errCloseDeferred = new Promise((resolve) => { releaseErrCloseCb = resolve; });
+        let errCloseCallCount = 0;
+        const realErrDb = errDb.adapter.db;
+        const origErrDbClose = realErrDb.close.bind(realErrDb);
+
+        realErrDb.close = (cb) => {
+            errCloseCallCount++;
+            origErrDbClose(async () => {
+                await errCloseDeferred;
+                if (typeof cb === 'function') {
+                    cb(new Error('SQLITE_BUSY: unable to close due to unfinalized statements'));
+                }
+            });
+        };
+
+        // 先讓呼叫端等待超時
+        await assert.rejects(
+            async () => { await errDb.adapter.emergencyClose(null, 30); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        assert.equal(errDb.adapter.state, ADAPTER_STATES.CLOSING);
+        assert.equal(errDb.adapter.getActiveStatus().nativeClosePending, true);
+        assert.equal(errDb.adapter.getActiveStatus().closeTimedOut, true);
+
+        // 釋放 callback 並使其回傳錯誤
+        releaseErrCloseCb();
+        await assert.rejects(
+            async () => { await errDb.adapter.close(); },
+            /SQLITE_BUSY: unable to close/
+        );
+
+        const errStatus = errDb.adapter.getActiveStatus();
+        assert.equal(errCloseCallCount, 1, '即使回傳錯誤亦不得重複呼叫 db.close()');
+        assert.equal(errDb.adapter.state, ADAPTER_STATES.ERROR, 'Native close 失敗時必須進入 ERROR 狀態，不得標記為 CLOSED');
+        assert.equal(errStatus.adapterClosed, false, 'Native close 失敗時 adapterClosed 必須為 false');
+        assert.equal(errStatus.nativeClosePending, false, 'Callback 已返回，nativeClosePending 應更新為 false');
+        assert.match(errStatus.lastCloseError, /SQLITE_BUSY: unable to close/, '必須保留 native close 錯誤資訊');
+        assert.match(errDb.adapter.lastError.message, /SQLITE_BUSY: unable to close/);
+        await assert.rejects(
+            async () => { await errDb.adapter.query('SELECT 1'); },
+            /故障熔斷狀態|SQLITE_BUSY/
+        );
+
+        cleanupTempDb(errDbPath);
     });
 
 });
