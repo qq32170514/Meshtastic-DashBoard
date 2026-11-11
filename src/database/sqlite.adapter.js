@@ -672,14 +672,14 @@ class SQLiteAdapter {
     _resolveCloseDeadline(options = null) {
         let timeoutMs = null;
         let deadlineAt = null;
-        if (typeof options === 'number') {
+        if (typeof options === 'number' && Number.isFinite(options)) {
             timeoutMs = options;
             deadlineAt = Date.now() + options;
         } else if (options && typeof options === 'object') {
-            if (typeof options.deadlineAt === 'number') {
+            if (typeof options.deadlineAt === 'number' && Number.isFinite(options.deadlineAt)) {
                 deadlineAt = options.deadlineAt;
             }
-            if (typeof options.timeoutMs === 'number') {
+            if (typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs)) {
                 timeoutMs = options.timeoutMs;
                 if (deadlineAt === null) {
                     deadlineAt = Date.now() + options.timeoutMs;
@@ -838,12 +838,11 @@ class SQLiteAdapter {
             }
         }
 
-        if (this.state !== ADAPTER_STATES.ERROR && this.state !== ADAPTER_STATES.CLOSED) {
-            this.state = ADAPTER_STATES.CLOSING;
-        }
-        this.#acceptingNewTasks = false;
-
         const { deadlineAt } = this._resolveCloseDeadline(resolvedOptions ?? queueSafetyState);
+        if (deadlineAt === null || !Number.isFinite(deadlineAt)) {
+            return Promise.reject(new Error('[EMERGENCY_CLOSE_DEADLINE_REQUIRED] emergencyClose() 必須由呼叫端提供有效的 deadlineAt 或 timeoutMs，禁止無限期等待'));
+        }
+
         return this._awaitNativeCloseWithDeadline(deadlineAt);
     }
 

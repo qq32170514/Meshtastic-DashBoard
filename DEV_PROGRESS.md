@@ -76,7 +76,7 @@
 
 ---
 
-### 6. SQLite Reliability Refactoring v2.7.6 原生關閉 Deadline 強固修正與全量獨立驗證完成 (READY FOR REVIEW)
+### 6. SQLite Reliability Refactoring v2.7.7 Final Closure 最終收尾與全量獨立驗證完成 (READY FOR REVIEW)
 - **架構目錄**：`src/database/`
   - [sqlite.config.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js)：集中式 PRAGMA、Queue、Backup、Shutdown 與 PM2 緩衝配置。統一 busy_timeout=10000、foreign_keys=OFF 等核心設定。
   - [retry-policy.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/retry-policy.js)：8 大 SQLite 錯誤分類與指數退避抖動計算。
@@ -84,7 +84,7 @@
     - **PRAGMA 動態比對與硬性驗證 (v2.7.3 P1-2)**：初始化時執行 PRAGMA 並動態讀回實際值嚴格比對，不符時拋出 HARD_FAIL 阻止 Adapter 進入 READY。
     - **初始化失敗等待原生 Close 完成與錯誤隔離 (v2.7.5 P1)**：PRAGMA 驗證失敗時立即清空 `this.db = null` 並真正等待原生 `db.close(callback)` 完成後才 reject 原始初始化錯誤；若清理過程報錯則獨立記錄於 `lastCleanupError`，絕不覆蓋原始錯誤。
     - **Checkpoint 共用 Deadline 保護與執行狀態追蹤 (v2.7.5 P0)**：`checkpoint()` 支援 `{ timeoutMs, deadlineAt }` 並追蹤 `#checkpointInProgress`；若超時返回仍保留底層在途狀態，防止後續 Close 誤判為 Quiescent 或呼叫 `_rawClose()`。
-    - **Native Close 共用單一絕對 Deadline 與單次呼叫保證 (v2.7.6 P0-1 / P0-2 / P0-3)**：`close()` 與 `emergencyClose()` 透過 `_resolveCloseDeadline()` 及 `_awaitNativeCloseWithDeadline(deadlineAt)`，將 Scheduler 等待與原生 `db.close(callback)` 納入同一個絕對 Deadline 約束；`_rawClose()` 以 `#nativeClosePromise` 確保 `db.close()` 最多僅呼叫一次，嚴格區分 `closeTimedOut`、`nativeClosePending` 與 `adapterClosed`，並在 callback 完成前維持 `CLOSING`、保留 `this.db` 追蹤及拒絕一切新資料庫操作。
+    - **Native Close 共用單一絕對 Deadline、單次呼叫保證與 `emergencyClose()` 強制 Deadline (v2.7.6 P0 / v2.7.7 P1)**：`close()` 與 `emergencyClose()` 透過 `_resolveCloseDeadline()` 及 `_awaitNativeCloseWithDeadline(deadlineAt)`，將 Scheduler 等待與原生 `db.close(callback)` 納入同一個絕對 Deadline 約束；`emergencyClose()` 強制要求呼叫端提供有效 `deadlineAt` 或 `timeoutMs`（缺失時以 `EMERGENCY_CLOSE_DEADLINE_REQUIRED` 安全拒絕）；`_rawClose()` 以 `#nativeClosePromise` 確保 `db.close()` 最多僅呼叫一次，嚴格區分 `closeTimedOut`、`nativeClosePending` 與 `adapterClosed`。
   - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
     - **Flush Worker 唯讀活動狀態查詢 (v2.7.5 P1)**：提供 `isFlushWorkerActive()` 與 `getMetrics().flushWorkerActive`，消除 `IN_FLIGHT` 轉移至 Scheduler 登記間的競態盲區。
     - **Drain BUSY Backoff 嚴格遵守與定時器清理 (v2.7.4 P0-1)**：`drain()` 期間嚴格遵循 `retryAt` 指數退避延遲與剩餘 Deadline 預算檢查，不提前暴力重試，結束時清理所有 `#retryTimers`。
@@ -97,9 +97,9 @@
   - [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js (主程式)](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
     - 相容層改用 `p.then(onFulfilled, onRejected)` 分離保證 Callback Exactly-Once；主程式 `startServer()` 與 MQTT 啟動強等待 `db.readyPromise`。
 - **測試驗證 (`tests/database/sqlite_reliability.test.js`)**：
-  - 全套 **46 項**極限場景已實際使用獨立臨時資料庫執行完畢：**46 tests passed, 0 failed, 總耗時 3382.28ms**。
-  - 技術說明書：已同步更新至 [SQLITE_REFACTORING_GUIDE_v2.7.6.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE_v2.7.6.md) 與 [SQLITE_REFACTORING_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE.md)。
-  - **已知物理限制**：Caller Timeout 不等於 Native Close Completed，亦不等於底層 SQLite C++ 原生操作已取消；`closeTimedOut === true` 不代表 `adapterClosed === true`；`this.db = null` 不等於 native handle 已釋放（須待 `db.close` callback 完成）；記憶體佇列無法防止突發斷電或 `SIGKILL` 導致的未提交資料遺失；`READY FOR REVIEW` 不等於 `READY FOR PRODUCTION`。
+  - 全套 **46 項**極限場景已實際使用獨立臨時資料庫執行完畢：**46 tests passed, 0 failed, 總耗時 3435.33ms**。
+  - 技術說明書：已同步更新至 [SQLITE_REFACTORING_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/SQLITE_REFACTORING_GUIDE.md) (`v2.7.7 — Final Closure`)。
+  - **已知物理限制**：Caller Timeout $\neq$ Native Close Completed；Memory Queue cannot guarantee protection against sudden power loss or SIGKILL；READY FOR REVIEW $\neq$ READY FOR PRODUCTION。
 
 ---
 

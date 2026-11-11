@@ -43,7 +43,7 @@ function assertDataConservation(m) {
     );
 }
 
-describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', () => {
+describe('SQLite Reliability v2.7.7 Comprehensive Test Suite (46 Scenarios)', () => {
 
     // ==========================================
     // Group A: Scheduler / Shutdown (7 Scenarios)
@@ -81,7 +81,7 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         // 釋放 deferred 任務並完成清理
         releaseTask();
         await runningTask;
-        await db.adapter.emergencyClose();
+        await db.adapter.emergencyClose(1000);
         cleanupTempDb(dbPath);
     });
 
@@ -95,14 +95,14 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
 
         await assert.rejects(
             async () => {
-                await db.adapter.emergencyClose();
+                await db.adapter.emergencyClose(1000);
             },
             /EMERGENCY_CLOSE_REJECTED/
         );
 
         db.adapter.isExecutingUnderlying = false;
         assert.equal(db.adapter.isQuiescent(), true);
-        await db.adapter.emergencyClose();
+        await db.adapter.emergencyClose(1000);
         cleanupTempDb(dbPath);
     });
 
@@ -1295,7 +1295,7 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         // 釋放 deferred 任務並完成安全關閉
         releaseHangingTask();
         await runningTask;
-        await db.adapter.emergencyClose();
+        await db.adapter.emergencyClose(1000);
         cleanupTempDb(dbPath);
     });
 
@@ -1441,7 +1441,7 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         }
         db.adapter._rawQueryOne = origRawQueryOne;
         db.adapter._rawClose = origRawClose;
-        await db.adapter.emergencyClose();
+        await db.adapter.emergencyClose(1000);
         cleanupTempDb(dbPath);
     });
 
@@ -1529,7 +1529,7 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         // 8. 恢復方法並完成最終清理
         db.adapter.transaction = origTransaction;
         db.adapter.emergencyClose = origEmergencyClose;
-        await db.adapter.emergencyClose();
+        await db.adapter.emergencyClose(1000);
         cleanupTempDb(dbPath);
     });
 
@@ -1611,7 +1611,7 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
     });
 
     // ==========================================
-    // Group I: SQLite Reliability v2.7.6 Native Close Deadline Hardening (2 Scenarios)
+    // Group I: SQLite Reliability v2.7.6 / v2.7.7 Native Close Deadline Hardening & Final Closure (2 Scenarios)
     // ==========================================
 
     it('45. Native Close Callback Deadline — Native Close Callback Delay Simulation (v2.7.6 P0-1 & P0-3)', async () => {
@@ -1732,8 +1732,8 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         cleanupTempDb(dbPath);
     });
 
-    it('46. Emergency Native Close Callback Deadline 與錯誤狀態轉移驗證 (v2.7.6 P0-2 & P0-3)', async () => {
-        // --- Part A: Emergency Shutdown Native Close Callback Delay Simulation ---
+    it('46. Emergency Native Close Callback Deadline 與 Delayed Native Close Callback Error Handling — Callback Error Injection Simulation (v2.7.6 P0-2 / v2.7.7 P1 & P2)', async () => {
+        // --- Part A: Emergency Close Deadline 強制要求與 Native Close Callback Delay Simulation ---
         const dbPath = getTempDbPath('emergency_native_close_deadline');
         const db = await createDatabaseSubsystem({
             dbPath,
@@ -1760,6 +1760,28 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
                 }
             });
         };
+
+        // 0-A. v2.7.7 P1 驗證：不提供 Deadline (無 timeoutMs 且無 deadlineAt) 時，emergencyClose() 必須明確拒絕且不呼叫 db.close()
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose(); },
+            /EMERGENCY_CLOSE_DEADLINE_REQUIRED/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose({ inFlightCount: 0, flushWorkerActive: false }); },
+            /EMERGENCY_CLOSE_DEADLINE_REQUIRED/
+        );
+        assert.equal(closeCallCount, 0, '缺少 Deadline 拒絕時不得呼叫底層 db.close()');
+        assert.equal(db.adapter.state, ADAPTER_STATES.READY, '缺少 Deadline 被拒時 Adapter 維持 READY 狀態');
+
+        // 0-B. v2.7.7 P1 驗證：傳入已過期之 deadlineAt 時，不得無限等待且不得啟動底層 db.close()
+        const expiredStart = Date.now();
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose({ deadlineAt: Date.now() - 50 }); },
+            /CLOSE_TIMEOUT/
+        );
+        const expiredElapsed = Date.now() - expiredStart;
+        assert.ok(expiredElapsed < 25, `已過期 Deadline 必須立即失敗返回 (<25ms)，實際耗時: ${expiredElapsed}ms`);
+        assert.equal(closeCallCount, 0, '進入前 Deadline 已過期不得啟動底層 db.close()');
 
         // 1. 觸發 handleEmergencyCrash，驗證受共用 emergencyWaitMs (120ms) 約束，不會無限等待
         const startT = Date.now();
@@ -1789,10 +1811,24 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         assert.equal(crashResult.diagnostics.adapterStatus.nativeClosePending, true);
         assert.equal(crashResult.diagnostics.adapterStatus.state, ADAPTER_STATES.CLOSING);
 
-        // 4. 驗證後續再次呼叫 emergencyClose / close 不會再次觸發底層 db.close()，且禁止重用連線
+        // 4. 驗證已有 nativeClosePending 時：無 Deadline 拒絕、已過期 Deadline 立即返回、timeoutMs 轉換、指定 deadlineAt 皆重用 #nativeClosePromise 且不重複呼叫 db.close()
         assert.ok(db.adapter.db !== null, 'Native close pending 期間不得提前清空 db reference');
         await assert.rejects(
+            async () => { await db.adapter.emergencyClose(); },
+            /EMERGENCY_CLOSE_DEADLINE_REQUIRED/
+        );
+        const pendingExpiredStart = Date.now();
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose(null, { deadlineAt: Date.now() - 10 }); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        assert.ok(Date.now() - pendingExpiredStart < 25, '已有 nativeClosePending 且 Deadline 已過期時不得繼續等待');
+        await assert.rejects(
             async () => { await db.adapter.emergencyClose(null, 20); },
+            /NATIVE_CLOSE_TIMEOUT/
+        );
+        await assert.rejects(
+            async () => { await db.adapter.emergencyClose(null, { deadlineAt: Date.now() + 20 }); },
             /NATIVE_CLOSE_TIMEOUT/
         );
         await assert.rejects(
@@ -1810,8 +1846,8 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
             /DB_CLOSING_NATIVE_PENDING/
         );
 
-        // 5. 當延遲的 native callback 最終成功返回時，驗證 Adapter 正確更新為 CLOSED
-        const finalClosePromise = db.adapter.emergencyClose();
+        // 5. 當延遲的 native callback 最終成功返回時，提供有效 deadlineAt 驗證 Adapter 正確更新為 CLOSED
+        const finalClosePromise = db.adapter.emergencyClose(null, { deadlineAt: Date.now() + 500 });
         releaseEmergencyCloseCb();
         await finalClosePromise;
 
@@ -1822,7 +1858,10 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         assert.equal(db.adapter.getActiveStatus().adapterClosed, true);
         cleanupTempDb(dbPath);
 
-        // --- Part B (Case C): Native Close Callback 延遲後回傳 Error 之狀態保護驗證 ---
+        // --- Part B (Case C): Delayed Native Close Callback Error Handling (Callback Error Injection Simulation) ---
+        // 註：此段先呼叫真實 origErrDbClose() 釋放底層檔案控制代碼，再透過 Deferred 延遲 callback 並注入模擬之 SQLITE_BUSY 錯誤，
+        //     旨在驗證 Adapter 收到延遲的 close callback error 時之 ERROR 狀態轉移與錯誤保留邏輯 (Callback Error Injection Simulation)，
+        //     而非在 SQLite C++ 引擎內部實際製造未 finalize statement 的原生 SQLITE_BUSY 鎖定。
         const errDbPath = getTempDbPath('emergency_native_close_error');
         const errDb = await createDatabaseSubsystem({ dbPath: errDbPath });
         await errDb.run('CREATE TABLE close_err_test (id INT)');
@@ -1838,12 +1877,12 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
             origErrDbClose(async () => {
                 await errCloseDeferred;
                 if (typeof cb === 'function') {
-                    cb(new Error('SQLITE_BUSY: unable to close due to unfinalized statements'));
+                    cb(new Error('Simulated callback error: SQLITE_BUSY: unable to close due to unfinalized statements'));
                 }
             });
         };
 
-        // 先讓呼叫端等待超時
+        // 先以 timeoutMs=30 讓呼叫端等待超時
         await assert.rejects(
             async () => { await errDb.adapter.emergencyClose(null, 30); },
             /NATIVE_CLOSE_TIMEOUT/
@@ -1852,20 +1891,20 @@ describe('SQLite Reliability v2.7.6 Comprehensive Test Suite (46 Scenarios)', ()
         assert.equal(errDb.adapter.getActiveStatus().nativeClosePending, true);
         assert.equal(errDb.adapter.getActiveStatus().closeTimedOut, true);
 
-        // 釋放 callback 並使其回傳錯誤
+        // 釋放 callback 並注入模擬錯誤
         releaseErrCloseCb();
         await assert.rejects(
             async () => { await errDb.adapter.close(); },
-            /SQLITE_BUSY: unable to close/
+            /Simulated callback error: SQLITE_BUSY: unable to close/
         );
 
         const errStatus = errDb.adapter.getActiveStatus();
         assert.equal(errCloseCallCount, 1, '即使回傳錯誤亦不得重複呼叫 db.close()');
-        assert.equal(errDb.adapter.state, ADAPTER_STATES.ERROR, 'Native close 失敗時必須進入 ERROR 狀態，不得標記為 CLOSED');
-        assert.equal(errStatus.adapterClosed, false, 'Native close 失敗時 adapterClosed 必須為 false');
+        assert.equal(errDb.adapter.state, ADAPTER_STATES.ERROR, 'Native close callback 回報失敗時必須進入 ERROR 狀態，不得標記為 CLOSED');
+        assert.equal(errStatus.adapterClosed, false, 'Native close callback 回報失敗時 adapterClosed 必須為 false');
         assert.equal(errStatus.nativeClosePending, false, 'Callback 已返回，nativeClosePending 應更新為 false');
-        assert.match(errStatus.lastCloseError, /SQLITE_BUSY: unable to close/, '必須保留 native close 錯誤資訊');
-        assert.match(errDb.adapter.lastError.message, /SQLITE_BUSY: unable to close/);
+        assert.match(errStatus.lastCloseError, /Simulated callback error: SQLITE_BUSY: unable to close/, '必須保留 close callback 錯誤資訊');
+        assert.match(errDb.adapter.lastError.message, /Simulated callback error: SQLITE_BUSY: unable to close/);
         await assert.rejects(
             async () => { await errDb.adapter.query('SELECT 1'); },
             /故障熔斷狀態|SQLITE_BUSY/
