@@ -1,328 +1,215 @@
-# Meshtastic-DashBoard 4.1.0 — SQLite Reliability Refactoring 技術實施說明書 (v2.7.4 強固修正與全量獨立驗證版)
+# Meshtastic-DashBoard 4.1.0 — SQLite Reliability Refactoring 技術實施說明書 (v2.7.5 Final Hardening & Verification)
 
-> **文件版本**：v2.7.4 (Comprehensive Hardening & Independent Verification Edition)  
+> **文件版本**：v2.7.5 — READY FOR REVIEW (`READY FOR REVIEW` 不等於 `READY FOR PRODUCTION`)  
 > **更新時間**：2026-11-11  
 > **適用環境**：`d:\meshtastic\Meshtastic-DashBoard-Dev` (嚴格隔離於開發環境)  
-> **執行狀態**：全套核心程式碼已於 `src/database/` 實作並完成 v2.7.1 ~ v2.7.4 歷次審查缺陷修正，41 項獨立場景單元/整合測試全數真實執行通過（**41 passed, 0 failed**，總耗時約 2.85 秒）。Prod 環境與正式 4.5GB 資料庫維持絕對零接觸。
+> **執行狀態**：全套核心程式碼已於 `src/database/` 完成 v2.7.5 最後一輪三項強固修正（P0 共用 Shutdown Deadline 與 Checkpoint 超時保護、P1 Emergency Shutdown Queue In-Flight 競態防護、P1 Initialization Failure 等待原生 close callback 完成），44 項獨立臨時資料庫測試全數通過（**44 passed, 0 failed, 0 skipped**，總耗時 2945.78ms）。Prod 環境與正式約 4.5GB 資料庫維持絕對零接觸。
 
 ---
 
 ## 目錄
-1. [架構重構願景與不可違反之環境限制](#1-架構重構願景與不可違反之環境限制)
-2. [v2.7.3 -> v2.7.4 深度強固問題診斷](#2-v273---v274-深度強固問題診斷)
-3. [v2.7.4 修正內容詳解 (P0 / P1)](#3-v274-修正內容詳解-p0--p1)
-   - 3.1 P0-1: Drain 階段嚴格遵守 BUSY Retry Backoff 與定時器清理
-   - 3.2 P0-2: Graceful Shutdown 有界等待預算分配與未靜止拒絕 rawClose
-   - 3.3 P0-3: Emergency Shutdown 未提交資料審計與誠實成功語意
-   - 3.4 P1-1: 入列拒絕回呼異常隔離 (_safeRejectCallback)
-   - 3.5 P1-2: Adapter 初始化 PRAGMA 驗證失敗時安全關閉底層連線防洩漏
-4. [v2.7.3 既有核心修正回顧 (P0-1 ~ P1-4)](#4-v273-既有核心修正回顧-p0-1--p1-4)
-5. [實際修改的程式碼檔案清單](#5-實際修改的程式碼檔案清單)
-6. [各模組職責邊界與架構設計](#6-各模組職責邊界與架構設計)
-7. [Data Conservation 完整守恆公式與容器狀態](#7-data-conservation-完整守恆公式與容器狀態)
-8. [Shutdown 與 Deadline 行為規範](#8-shutdown-與-deadline-行為規範)
-9. [PRAGMA 最終設定表與設計依據](#9-pragma-最終設定表與設計依據)
-10. [Callback Exactly-Once 適用範圍與契約](#10-callback-exactly-once-適用範圍與契約)
-11. [41 項測試場景真實執行驗收報告](#11-41-項測試場景真實執行驗收報告)
-12. [已知限制與未驗證項目](#12-已知限制與未驗證項目)
-13. [最終自我審查結論與交付狀態](#13-最終自我審查結論與交付狀態)
+1. [任務目標與不可違反限制](#1-任務目標與不可違反限制)
+2. [v2.7.4 三項問題根因分析](#2-v274-三項問題根因分析)
+3. [v2.7.5 強固修正實作詳解](#3-v275-強固修正實作詳解)
+   - 3.1 P0: Graceful Shutdown 全流程共用單一絕對 Deadline 與 Checkpoint 超時保護
+   - 3.2 P1: Emergency Shutdown 加入 Queue In-Flight 與 Flush Worker 競態保護
+   - 3.3 P1: Initialization Failure 等待 Native Close Callback 完成與錯誤隔離
+4. [Shutdown 全流程時間預算分析](#4-shutdown-全流程時間預算分析)
+5. [修改檔案清單與實際程式碼位置](#5-修改檔案清單與實際程式碼位置)
+6. [Data Conservation 與可靠性誠實契約](#6-data-conservation-與可靠性誠實契約)
+7. [44 項測試場景真實執行驗收報告](#7-44-項測試場景真實執行驗收報告)
+8. [尚未解決的問題與物理限制](#8-尚未解決的問題與物理限制)
+9. [最終驗收條件檢核表](#9-最終驗收條件檢核表)
 
 ---
 
-## 1. 架構重構願景與不可違反之環境限制
+## 1. 任務目標與不可違反限制
 
-### 1.1 絕對紅線與環境隔離約束
-1. **開發環境隔離**：所有程式碼變更、編譯、單元測試與排程檢驗嚴格限制在 `d:\meshtastic\Meshtastic-DashBoard-Dev`。**嚴禁**修改、寫入、發布至 Prod 目錄（`d:\meshtastic\Meshtastic-DashBoard-Prod`），嚴格禁止重啟或操作生產環境 PM2 服務。
-2. **Schema 絕對凍結**：不新增、修改、更動或刪除任何既有 SQLite 資料庫表結構、欄位、型態或約束。
-3. **套件依賴凍結**：維持現有 `sqlite3 ^5.1.6`，不得引進 Redis、Kafka 或其他額外外部基礎設施。
-4. **外部協定零破壞**：保持現有 RESTful API、Socket.IO 事件、MQTT 解碼流程、RF 隧道、React 前端與 Turso 雲端鏡像協定完全相容。
-5. **正式資料庫零接觸**：嚴格禁止直接讀取、修改、VACUUM 或重建正式的約 4.5GB 資料庫（`meshtastic.db`），所有單元測試與故障注入測試一律使用獨立臨時資料庫（`meshtastic_test_*.db`），並在測試結束後徹底清理檔案與 WAL。
-6. **物理特性誠實宣告**：未經 `COMMIT` 的記憶體暫存資料絕不宣稱安全保存；記憶體隊列無法抵禦突發斷電或 `kill -9` 強制終止。所有測試結果必須有真實執行紀錄，不得虛報 PASS。
-7. **設計優先準則**：
-   $$\text{資料完整性} > \text{資料可追溯性} > \text{故障不丟失} > \text{Shutdown安全} > \text{Backup安全} > \text{穩定性} > \text{效能}$$
+### 1.1 專案與環境紅線
+1. **SQLite 驅動與 Schema 凍結**：維持 `sqlite3 ^5.1.6`，不新增、刪除或修改任何資料表、欄位、索引及約束。
+2. **外部介面相容**：不改變現有 REST API、Socket.IO、MQTT、RF Tunnel、Turso 架構及前端介面。
+3. **開發與正式環境嚴格隔離**：所有修改與測試僅在 `d:\meshtastic\Meshtastic-DashBoard-Dev` 執行；嚴禁修改正式環境目錄（`d:\meshtastic\Meshtastic-DashBoard-Prod`）、嚴禁執行 PM2 restart 或部署操作、嚴禁讀取或測試正式約 4.5GB SQLite 資料庫。
+4. **獨立臨時資料庫測試**：所有 44 項測試均使用獨立臨時 SQLite 檔案（`meshtastic_test_*.db`），測試結束後安全釋放連線並清除 DB、WAL 與 SHM 檔案。
 
----
-
-## 2. v2.7.3 -> v2.7.4 深度強固問題診斷
-
-在完成 v2.7.3 的 37 項測試後，進一步針對關機時序邊界、重試退避與資源清理進行深度審查，識別並修正以下五項強固議題：
-
-1. **P0-1（Drain 階段忽略 BUSY Retry Backoff 立即重試）**：在 v2.7.3 中，`drain()` 迴圈看到 `retryPendingItems.size > 0` 時直接將所有項目立即移回 `queue` 頂部，忽略了 `_scheduleRetry()` 計算的 `retryAt` 指數退避時間，導致關機排空遭遇 `SQLITE_BUSY` 時退化為無退避的緊密重試迴圈，且未追蹤並清理殘留的 `#retryTimers`。
-2. **P0-2（Graceful Shutdown 呼叫 `adapter.close()` 缺乏有界超時保護）**：在 `ShutdownHandler.handle()` 中，當 `drain()` 因底層慢操作逾時返回後，第四步直接呼叫無參數 `await this.#adapter.close()`，而 `close()` 內部無條件 `await this._schedulerQueue`，若底層任務一直懸掛將導致 Graceful Shutdown 永久卡死且無法輸出關閉診斷報告。
-3. **P0-3（Emergency Shutdown 在有未提交資料時仍可能回報 `success: true`）**：`handleEmergencyCrash()` 只要 `adapter.isQuiescent()` 為真且 `emergencyClose()` 成功，便回傳 `success: true`，未檢查 `writeQueue` 中是否仍有尚未提交的 `queuedCount` / `totalUncommitted` 資料，違反「未 COMMIT 資料絕不宣稱安全保存」的誠實語意。
-4. **P1-1（`enqueue()` 拒絕分支直接呼叫使用者 Callback 未隔離例外）**：當隊列處於 `PAUSED_DISK_FULL`、`PAUSED_ERROR`、`CLOSING` 或 `BACKPRESSURE` 時，`enqueue()` 同步呼叫使用者傳入的 `callback(err)`；若使用者回呼內部拋出例外，會直接炸穿 `enqueue()` 呼叫堆疊。
-5. **P1-2（`SQLiteAdapter.initialize()` 在 PRAGMA 驗證失敗時未關閉已開啟的底層連線）**：當 `new sqlite3.Database(dbPath)` 開啟檔案成功，但隨後的 `_applyAndVerifyPragmas()` 觸發 `HARD_FAIL` 拋錯時，`this.db` 尚未關閉即拒絕 Promise，在 Windows 下可能殘留檔案控制代碼（File Handle Leak）。
+### 1.2 核心可靠性誠實原則
+- `COMMITTED` 僅代表 SQLite transaction 確實成功提交。
+- `Adapter Quiescent` 不等於 `WriteQueue` 沒有未提交資料，也不等於 `Flush Worker` 沒有在途 `IN_FLIGHT` 項目。
+- JavaScript 物件清空（`this.db = null`）僅代表 JS reference 已移除，**不等於** SQLite native handle 已釋放；唯有原生 `db.close(callback)` 完成後才代表底層資源釋放。
+- `Promise.race` Timeout 僅代表呼叫端停止等待並返回超時診斷，**不等於**底層正在執行的 SQLite native C++ operation 已被取消。
+- 嚴禁對仍有活動操作（包含逾時但尚未結束之 Checkpoint 或 Transaction）的 SQLite connection 執行 `_rawClose()`。
+- Shutdown 任一階段超時絕不描述為正常完成（`success: false`）。
+- 記憶體佇列（Memory Queue）無法防止突發斷電、`SIGKILL`（`kill -9`）或作業系統崩潰造成的未提交資料遺失。
 
 ---
 
-## 3. v2.7.4 修正內容詳解 (P0 / P1)
+## 2. v2.7.4 三項問題根因分析
 
-### 3.1 P0-1: Drain 階段嚴格遵守 BUSY Retry Backoff 與定時器清理
-- **修改檔案**：[`src/database/write-queue.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)
-- **實施細節**：
-  1. 在 `_scheduleRetry(batch, delayMs, deadlineAt)` 中為每個項目寫入 `item.retryAt = Date.now() + delayMs`，並將建立的 `timerId` 加入私有集合 `this.#retryTimers`。
-  2. 在 `drain()` 迴圈中檢查 `retryPendingItems` 時：
-     - 僅當 `item.retryAt <= now` 時才將項目移入 `readyToRequeue` 並排回隊列頭部。
-     - 若 `item.retryAt > deadlineAt`（退避時間已超過關機截止期限），立即將該項目轉移至 `UNCOMMITTED_ERROR` 並觸發失敗回呼，絕不無效等待或盲目重試。
-     - 若 `this.queue.length === 0` 但仍有尚未到期的 `retryPendingItems`，計算距離最近一次 `nextRetryAt` 的等待時間，執行有界睡眠（`Math.min(waitMs, 50)`），嚴格禁止 Busy-spin 或提前暴力重試。
-  3. 在 `drain()` 結束與 `close()` 時調用 `_clearAllRetryTimers()` 徹底清理所有重試定時器。
+### 2.1 P0 根因：Graceful Shutdown 的 Checkpoint 缺乏共用 Deadline 保護且 Close 具有 100ms 保底
+1. **Checkpoint 無時間上限**：在 v2.7.4 中，`ShutdownHandler.handle()` 雖對 `writeQueue.drain()` 與 `adapter.close(timeoutMs)` 設有超時控制，但中間的 `await this.#adapter.checkpoint('TRUNCATE', ...)` 未傳入剩餘時間預算，且 `SQLiteAdapter.checkpoint()` 無超時保護。若 `wal_checkpoint(TRUNCATE)` 在排程器等待或底層執行時受阻，整個 Shutdown 流程將無限期卡在 Checkpoint 階段。
+2. **Close 階段 100ms 保底突破總預算**：v2.7.4 在計算 Close 預算時使用了 `Math.max(100, Math.min(waitBufferMs, totalBudget - elapsed))`。當前面階段已耗盡 `totalBudget`（剩餘時間 $\le 0$）時，仍強制給予 100ms 等待，且 `SQLiteAdapter.close(timeoutMs)` 對 `timeoutMs <= 0` 未走立即超時分支，導致總關機時間可能超過 `pm2KillTimeoutMs`。
 
-### 3.2 P0-2: Graceful Shutdown 有界等待預算分配與未靜止拒絕 rawClose
-- **修改檔案**：[`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js)、[`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js)
-- **實施細節**：
-  1. `ShutdownHandler.handle()` 根據 `pm2KillTimeoutMs` (預設 10000ms)、`drainWaitBufferMs` (預設 1500ms) 與 `drainTimeoutMs` (預設 8000ms) 精確計算排空時間與剩餘連線關閉預算 `remainingCloseBudget`。
-  2. `SQLiteAdapter.close(timeoutMs)` 支援傳入有界等待毫秒數，透過 `Promise.race([this._schedulerQueue, timeoutPromise])` 等待排程器收斂。
-  3. 等待結束後嚴格檢查 `if (!this.isQuiescent())`，若仍有底層操作或排程任務未完成，重置 `this._closePromise = null` 並拋出 `[CLOSE_REJECTED]`，**絕不呼叫 `_rawClose()` 摧毀活動連線**。
+### 2.2 P1 根因：Emergency Shutdown 對 Queue In-Flight 與 Flush Worker 的競態窗口檢查不足
+1. **Queue 與 Adapter 之間的微任務競態窗口**：當 `WriteQueue.flush()` 啟動時，會先將 `this.isFlushing` 設為 `true` 並將批次項目由 `QUEUED` 轉移至 `IN_FLIGHT`（`#inFlightItems`），隨後呼叫 `_executeTopLevelBatch()` $\to$ `_commitOrIsolate()` $\to$ `adapter.transaction()` $\to$ `adapter._schedule()`。在 `adapter._schedule()` 內部 `awaitInit.then(...)` 實際遞增 `#schedulerPendingCount` 之前的微任務窗口內，`adapter.isQuiescent()` 仍回報為 `true`。
+2. **單看 Adapter Quiescent 導致誤關連線**：v2.7.4 的 `handleEmergencyCrash()` 僅以 `this.#adapter.isQuiescent()` 作為是否呼叫 `emergencyClose()` 的准入條件，未檢查 `writeQueue.inFlightCount === 0` 與 `!writeQueue.isFlushWorkerActive()`，在此競態窗口下可能誤判為可關閉資料庫。
 
-### 3.3 P0-3: Emergency Shutdown 未提交資料審計與誠實成功語意
-- **修改檔案**：[`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js)
-- **實施細節**：
-  1. 在 `handleEmergencyCrash()` 與 `handle()` 中同時核算 `qMetrics = this.#writeQueue.getMetrics()` 之 `hasUncommittedData = (qMetrics.totalUncommitted > 0)` 與 `dataClean = !hasUncommittedData`。
-  2. 即使 Adapter 已達 `isQuiescent()` 並成功執行 `emergencyClose()` 釋放連線（`adapterClosed: true`），只要 `hasUncommittedData === true`，整體回傳之 `success` 必定為 `false`、`dataClean` 必定為 `false`，並附帶完整 `diagnostics` 結構。
-
-### 3.4 P1-1: 入列拒絕回呼異常隔離 (`_safeRejectCallback`)
-- **修改檔案**：[`src/database/write-queue.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)
-- **實施細節**：
-  新增 `_safeRejectCallback(callback, err)`，以 `try / catch` 包覆所有入列拒絕路徑（`PAUSED_DISK_FULL`、`PAUSED_ERROR`、`CLOSING`、`BACKPRESSURE`）的使用者回呼調用，確保使用者 callback 拋出異常時被安全捕獲記錄，不影響佇列狀態與計數守恆。
-
-### 3.5 P1-2: Adapter 初始化 PRAGMA 驗證失敗時安全關閉底層連線防洩漏
-- **修改檔案**：[`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js)
-- **實施細節**：
-  在 `initialize(dbPath)` 中，當 `_applyAndVerifyPragmas()` 拋出異常時，立即將已開啟的 `this.db` 取出並設為 `null`，呼叫 `dbToClose.close()` 安全釋放底層 SQLite 檔案控制代碼，再將狀態設為 `ADAPTER_STATES.ERROR`。
+### 2.3 P1 根因：SQLite Initialization Failure Cleanup 未等待原生 `db.close` Callback 完成
+1. **過早 Reject 初始化 Promise**：在 v2.7.4 的 `SQLiteAdapter.initialize()` 中，當 `new sqlite3.Database(dbPath)` 成功開啟連線，但隨後的 `_applyAndVerifyPragmas()` 拋出驗證失敗（`HARD_FAIL`）時，catch 區塊呼叫了 `dbToClose.close((closeErr) => { ... })`，卻未 `await` 該非同步 callback 完成便立即執行 `reject(pErr)`。
+2. **JS Reference 清空不等於 Native Handle 釋放**：在 `dbToClose.close()` 的 callback 觸發前，僅有 `this.db = null`（JS 引用清空），底層 C++ SQLite connection 與 Windows File Handle 尚未真正完成關閉釋放。
 
 ---
 
-## 4. v2.7.3 既有核心修正回顧 (P0-1 ~ P1-4)
+## 3. v2.7.5 強固修正實作詳解
 
-1. **P0-1（Drain 不將 UNCOMMITTED_ERROR 誤判為成功）**：`getMetrics()` 完整納入 `uncommittedErrorCount`、`totalPending` 與 `totalUncommitted`。當 `totalUncommitted > 0` 時，`drain()` 回傳 `isClean: false`，`ShutdownHandler` 跳過 `TRUNCATE` Checkpoint 保護 WAL。
-2. **P0-2（Deadline 到期後禁止 Binary Isolation 啟動新交易）**：在 `_commitOrIsolate()` 與 `_binaryIsolateBatch()` 的 Left / Right 子批次啟動前強制檢查 `deadlineAt`。一旦超時立即拋出 `DEADLINE_EXPIRED`，由最外層 `_executeTopLevelBatch()` 捕獲並將尚未提交的剩餘子批次透過 `_requeueRemainingBatchAtHead(remaining)` 按原始 `seq` 原子退回隊列頭部。
-3. **P0-3（SQLITE_FULL 發生時 Drain 立即中止）**：遭遇 `SQLITE_FULL` 時隊列轉為 `PAUSED_DISK_FULL`，Drain Worker 迴圈立即 `break` 退出，杜絕無限重試。
-4. **P1-1（PAUSED_DISK_FULL 狀態下嚴格拒絕新寫入）**：`enqueue()` 攔截 `PAUSED_DISK_FULL`，僅遞增 `totalRejected`，不增加 `totalAccepted`。
-5. **P1-2（統一 PRAGMA 設定、執行與動態讀回驗證）**：以 `src/database/sqlite.config.js` 為唯一設定來源，初始化時讀回比對 8 項 PRAGMA（5 項硬性、3 項軟性），並移除主程式 `index.js` 中的冗餘 raw PRAGMA。
-6. **P1-3（相容層 Callback Exactly-Once 防重與例外隔離）**：`src/database/index.js` 的 `run` / `get` / `all` / `close` 採用 `.then(onFulfilled, onRejected)` 雙參數分離模式，防止使用者 callback 拋錯時觸發二次呼叫。
-7. **P1-4（Database Factory 啟動前置保護）**：`initDatabaseSubsystemSync` 掛載 `readyPromise`，主程式 `index.js` 在 `startServer()` 與 `startMqttClient()` 前強等待 `await db.readyPromise`，初始化失敗時終止啟動。
+### 3.1 P0: Graceful Shutdown 全流程共用單一絕對 Deadline 與 Checkpoint 超時保護
+- **修改檔案**：
+  - [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js#L49-L263)
+  - [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L516-L652)
+- **修正重點**：
+  1. **單一絕對 Deadline**：於 `ShutdownHandler.handle()` 啟動時建立唯一基準：
+     ```javascript
+     const startTime = Date.now();
+     const totalShutdownBudget = typeof this.#config.pm2KillTimeoutMs === 'number'
+         ? this.#config.pm2KillTimeoutMs
+         : 10000;
+     const shutdownDeadlineAt = startTime + totalShutdownBudget;
+     const getRemainingBudget = () => shutdownDeadlineAt - Date.now();
+     ```
+  2. **三階段全面受控**：
+     - **階段一（Drain）**：計算 `remainingForDrain = getRemainingBudget()`。若 $\le 0$ 直接標記 `deadlineExpired = true` 跳過 Drain；否則以 `Math.min(configuredDrainTimeout, maxDrainBudget, remainingForDrain)` 執行排空。
+     - **階段二（TRUNCATE Checkpoint）**：僅在 6 項資料安全前置條件（`drainClean`、有效完成憑證、`totalUncommitted === 0`、`uncommittedErrorCount === 0`、`inFlightCount === 0`、`activeTransactions === 0`、`isQuiescent`）全數成立時才評估 Checkpoint。進入前計算 `remainingForCheckpoint = getRemainingBudget()`；若 $\le 0$ 直接標記 `checkpointTimedOut = true`、`deadlineExpired = true`；否則將 `{ timeoutMs: remainingForCheckpoint, deadlineAt: shutdownDeadlineAt }` 傳入 `adapter.checkpoint()`。
+     - **階段三（Adapter Close）**：計算 `remainingForClose = getRemainingBudget()`，**徹底移除 100ms 保底**。若 `remainingForClose <= 0` 或 `checkpointTimedOut === true`，直接進入 Timeout 處理（`adapterClosed = false`），**絕不啟動下一階段等待，更不對仍在執行 Checkpoint 的底層連線呼叫 `_rawClose()`**。
+  3. **Adapter Checkpoint 內部執行追蹤與超時保護**：
+     - `SQLiteAdapter` 新增私有狀態 `#checkpointInProgress`，納入 `isQuiescent()` 與 `getActiveStatus()`。
+     - 若 `checkpoint()` 超時返回，僅代表等待逾時（拋出 `[CHECKPOINT_TIMEOUT]`），底層仍在執行的 `PRAGMA wal_checkpoint(TRUNCATE)` 會維持 `#checkpointInProgress = true`、`isExecutingUnderlying = true`、`#schedulerActiveCount = 1`，確保後續邏輯與診斷能精確得知底層操作尚未結束，且 `_rawClose()` 亦強制拒絕 `this.#checkpointInProgress === true` 的關閉請求。
+
+### 3.2 P1: Emergency Shutdown 加入 Queue In-Flight 與 Flush Worker 競態保護
+- **修改檔案**：
+  - [`src/database/write-queue.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js#L68-L135)
+  - [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js#L22-L44)
+  - [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L654-L664)
+- **修正重點**：
+  1. **Flush Worker 唯讀狀態查詢**：在 `WriteQueue` 新增 `isFlushWorkerActive()` 方法（綜合檢查 `this.isFlushing`、`this.isDraining` 與 `this.#currentFlushPromise !== null`），並將 `flushWorkerActive` 納入 `getMetrics()`。
+  2. **7 項 Emergency Close 准入條件 (`_canSafelyEmergencyClose()`)**：
+     在 `ShutdownHandler` 中，唯有同時滿足以下 7 項條件才允許呼叫 `emergencyClose()`：
+     - `this.#adapter.isQuiescent()` 為 `true`
+     - `qMetrics.inFlightCount === 0`（Queue 無任何 In-Flight 項目）
+     - `!flushWorkerActive`（Flush / Drain Worker 未在執行）
+     - `status.schedulerPending === 0`
+     - `status.schedulerActive === 0`
+     - `status.activeTransactions === 0`
+     - `!status.underlyingExecuting && !status.maintenanceInProgress && !status.checkpointInProgress`
+  3. **三維語意嚴格分離**：
+     - **連線是否可安全關閉 (`adapterClosed`)**：由上述 7 項在途執行條件決定。若佇列僅有 `queuedCount > 0` 或 `retryPendingCount > 0`（位於記憶體中、未進入 `IN_FLIGHT` 且無活動 Worker），SQLite 連線並未在使用中，因此允許安全釋放連線（`adapterClosed: true`）。
+     - **是否存在未提交資料 (`hasUncommittedData`)**：由 `qMetrics.totalUncommitted > 0` 決定。
+     - **是否達成資料完整性 (`dataClean` / `success`)**：只要 `hasUncommittedData === true`，`dataClean` 與 `success` 必定為 `false`，絕不因連線成功關閉而謊稱資料完整保存。
+
+### 3.3 P1: Initialization Failure 等待 Native Close Callback 完成與錯誤隔離
+- **修改檔案**：
+  - [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L156-L259)
+- **修正重點**：
+  1. **區分連線開啟狀態 (`dbOpened`)**：
+     - 若 `sqlite3.Database` 建構子 open callback 本身回傳 `err`（`dbOpened === false`），底層連線並未開啟成功：立即將 `this.db = null`、設定 `ADAPTER_STATES.ERROR` 並 reject，避免對未開啟連線重複呼叫 `close()`。
+     - 若 `sqlite3.Database` 已成功開啟（`dbOpened === true`），但隨後的 `_applyAndVerifyPragmas()` 執行或讀回驗證失敗：
+       1. 保存原始初始化錯誤 `pErr`，設定 `this.setFatalError(pErr)` 與 `this.state = ADAPTER_STATES.ERROR`。
+       2. 立即將 `this.db = null` 抽離，避免外部在清理期間取得連線引用。
+       3. 呼叫 `await this._cleanupFailedInitConnection(dbToClose, pErr)`，**真正等待原生 `dbToClose.close(callback)` 完成**。
+       4. 若 `close(callback)` 發生錯誤，將其獨立記錄於 `this.lastCleanupError`（及 `pErr.cleanupError`），**絕不覆蓋原始 `pErr` 與 `this.lastError`**。
+       5. 待 `close(callback)` 完成後，才執行 `reject(pErr)`。
 
 ---
 
-## 5. 實際修改的程式碼檔案清單
+## 4. Shutdown 全流程時間預算分析
 
-| 檔案相對路徑 | 模組 | v2.7.1 ~ v2.7.4 累計核心實作與修正內容 |
-| :--- | :--- | :--- |
-| [`src/database/sqlite.config.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js) | Config | 集中定義 8 項 PRAGMA、WriteQueue、Backup 與 Shutdown 時間預算設定 |
-| [`src/database/retry-policy.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/retry-policy.js) | RetryPolicy | 8 大 SQLite 錯誤分類（含 `DATA_CONSTRAINT`, `RETRYABLE_BUSY`, `DISK_FULL`, `FATAL_CORRUPT`, `UNKNOWN` 等）與指數退避抖動計算 |
-| [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js) | SQLiteAdapter | WeakMap 私有 `DrainCapability` 授權、PRAGMA 動態讀回驗證、初始化失敗連線清理（v2.7.4 P1-2）、`isQuiescent()` 追蹤、有界 `close(timeoutMs)`（v2.7.4 P0-2）與 9 項 TRUNCATE 前置安全檢查 |
-| [`src/database/write-queue.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js) | WriteQueue | 6 大互斥容器資料守恆、FIFO 二分拆分隔離、Deadline 交易阻絕、Drain BUSY Backoff 嚴格等待與定時器清理（v2.7.4 P0-1）、`_safeRejectCallback`（v2.7.4 P1-1） |
-| [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js) | ShutdownHandler | 時間預算分配與有界關閉等待（v2.7.4 P0-2）、未提交資料誠實審計（v2.7.4 P0-3）、未排空跳過 TRUNCATE、Emergency Shutdown 靜止檢查與診斷轉儲 |
-| [`src/database/backup-manager.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js) | BackupManager | `VACUUM INTO` 線上快照、三態完整性檢驗（`VALID`, `CORRUPTED`, `VERIFY_ERROR`）、`VERIFY_ERROR` 100% 保留候選檔案 |
-| [`src/database/index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) | Facade / Factory | 相容層 Exactly-Once 回呼防重、`createDatabaseSubsystem` 與 `initDatabaseSubsystemSync` (`readyPromise`) |
-| [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) | 主程式 | 移除冗餘 raw PRAGMA；`startServer()` 與 MQTT 啟動強等待 `db.readyPromise` |
-| [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js) | 測試套件 | Group A ~ Group G 共 **41 項**獨立臨時庫單元與整合驗證測試 |
-
----
-
-## 6. 各模組職責邊界與架構設計
-
-```mermaid
-flowchart TD
-    subgraph Ingestion["寫入准入層 (Ingestion)"]
-        API[業務呼叫 / MQTT] --> Compat["相容層 dbCompat"]
-        Compat --> WQ["WriteQueue.enqueue()"]
-        WQ --"PAUSED_DISK_FULL / PAUSED_ERROR / GATE_CLOSED / BACKPRESSURE"--> Rej["拒絕寫入 (totalRejected++)\n_safeRejectCallback 隔離異常"]
-        WQ --"准入通過"--> Acc["接受寫入 (totalAccepted++)"]
-    end
-
-    subgraph QueueMgmt["隊列管理與容器 (Queue Management)"]
-        Acc --> Q["this.queue (FIFO)"]
-        Q --> FlushWorker["Flush / Drain Worker"]
-        FlushWorker --"開始批次"--> InFlight["inFlightItems"]
-        InFlight --"SQLITE_BUSY (遵守 retryAt 退避)"--> RetrySet["retryPendingItems"]
-        InFlight --"SQLITE_CONSTRAINT"--> Quarantine["quarantinedItems"]
-        InFlight --"SQLITE_UNKNOWN / 超出預算"--> Uncommitted["uncommittedErrors"]
-    end
-
-    subgraph AdmissionControl["交易准入與執行 (Admission Control)"]
-        FlushWorker --> AdmissionCheck{"交易准入檢查\n1. Deadline 到期?\n2. Gate 關閉?\n3. Disk Full?"}
-        AdmissionCheck --"拒絕 (拋出異常)"--> RequeueHead["_requeueRemainingBatchAtHead\n按 seq 保持原始序退回隊列前端"]
-        AdmissionCheck --"通過"--> Sched["SQLiteAdapter.transaction() / drainTransaction()"]
-        Sched --> SQLiteEngine[("底層 SQLite3 Engine\n(WAL Mode)")]
-        SQLiteEngine --"COMMIT 成功"--> Committed["totalCommitted++"]
-    end
-
-    subgraph LifeCycle["生命週期協調 (Lifecycle & Shutdown)"]
-        Shutdown["ShutdownHandler"] --> Drain["WriteQueue.drain(drainCap, drainTimeoutMs)"]
-        Drain --> Audit{"健全性審核\ntotalUncommitted == 0?\n!hasUncommittedErrors?\n!isDiskFull & isQuiescent?"}
-        Audit --"全部成立"--> Clean["markDrainCompleted\n執行 wal_checkpoint(TRUNCATE)"]
-        Audit --"任一不成立"--> Dirty["跳過 TRUNCATE Checkpoint\n保護 WAL 資料"]
-        Clean --> BoundedClose["adapter.close(remainingCloseBudget)"]
-        Dirty --> BoundedClose
-    end
+```text
+startTime                                                              shutdownDeadlineAt
+    ├─────────────────────────────── totalShutdownBudget ───────────────────────────────┤
+    │                                                                                   │
+    ├── Stage 1: WriteQueue Drain ──┼── Stage 2: Checkpoint ──┼── Stage 3: Close ───────┤
+         budget <= min(               budget =                  budget =
+           drainTimeoutMs,            shutdownDeadlineAt        shutdownDeadlineAt
+           totalBudget - waitBuffer,  - Date.now()              - Date.now()
+           remainingBudget            (若 <= 0 直接 Timeout)     (無 100ms 保底，<= 0 直接跳過)
+         )
 ```
 
----
-
-## 7. Data Conservation 完整守恆公式與容器狀態
-
-在 SQLite Reliability v2.7.4 中，所有進入系統的寫入請求皆遵循嚴格的兩層物理守恆定律：
-
-### 7.1 第一層：准入請求分離
-$$\text{totalSubmitted} = \text{totalAccepted} + \text{totalRejected}$$
-$$\text{totalRejected} \cap \text{totalAccepted} = \emptyset$$
-
-### 7.2 第二層：已接受資料狀態守恆公式
-$$\text{totalAccepted} = \text{totalCommitted} + \text{totalQuarantined} + \text{totalUncommitted}$$
-
-其中未提交資料展開為：
-$$\text{totalUncommitted} = \text{totalPending} + \text{uncommittedErrorCount}$$
-$$\text{totalPending} = \text{queuedCount} + \text{retryPendingCount} + \text{inFlightCount}$$
-
-- **`queuedCount`**：`this.queue.length`（等待批次排程）。
-- **`retryPendingCount`**：`this.retryPendingItems.size`（等待退避重試時間 `retryAt` 到期）。
-- **`inFlightCount`**：`this.#inFlightItems.size`（正在執行 SQLite 交易）。
-- **`uncommittedErrorCount`**：`this.uncommittedErrors.length`（遭遇致命/未知錯誤或退避超出關機預算而實體留存於記憶體中的項目）。
-- **`conservationCheck`**：`getMetrics()` 即時計算 `this.totalAccepted === (this.totalCommitted + totalPending + this.totalQuarantined + uncommittedErrorCount)`，在所有正常與異常路徑下恆為 `true`。
+| 情境 | Drain 階段耗時 | Checkpoint 階段預算與行為 | Close 階段預算與行為 | 總耗時與最終狀態 |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. 正常排空關機** | $5\text{ms}$ (`drainClean: true`) | 取得剩餘預算 $\approx 9995\text{ms}$，實際約 $2\text{ms}$ 完成 `TRUNCATE` | 取得剩餘預算 $\approx 9993\text{ms}$，實際約 $1\text{ms}$ 完成 `close()` | $\approx 8\text{ms} \ll T_{\text{total}}$，`success: true` |
+| **2. Drain 超時** | 耗盡 `drainTimeoutMs` (`drainClean: false`) | 因 `drainClean === false` 跳過 `TRUNCATE` | 取得剩餘預算 `shutdownDeadlineAt - now`，等待排程收斂；若仍未靜止則 `CLOSE_REJECTED` | $\le T_{\text{total}}$，`success: false, adapterClosed: false` |
+| **3. Checkpoint 超時 (Test 42)** | $5\text{ms}$ (`drainClean: true`) | 取得剩餘預算 $T_{\text{rem}}$；到期時拋出 `CHECKPOINT_TIMEOUT` (`checkpointTimedOut: true`) | 因 `checkpointTimedOut` 且 `remainingBudget <= 0`，**0ms 立即跳過 Close**，不呼叫 `_rawClose()` | $\approx T_{\text{total}}$（無額外 100ms 溢出），`success: false, checkpointTimedOut: true, adapterClosed: false` |
+| **4. 進入前預算已耗盡** | `remaining <= 0` 直接跳過 | `remaining <= 0` 直接跳過 | `remaining <= 0` 直接跳過 | $0\text{ms}$ 額外等待，`deadlineExpired: true, success: false` |
 
 ---
 
-## 8. Shutdown 與 Deadline 行為規範
+## 5. 修改檔案清單與實際程式碼位置
 
-| 階段 / 情境 | 觸發條件 | 執行行為 | 交易與連線防護 |
-| :--- | :--- | :--- | :--- |
-| **Normal Shutdown** | SIGTERM, SIGINT, 手動關閉 | 關閉停機閘門，拒絕新寫入；依時間預算啟動 `drain()` | 若 `totalUncommitted === 0` 且 `isQuiescent`，執行 `wal_checkpoint(TRUNCATE)`，再以剩餘預算呼叫 `adapter.close(remainingCloseBudget)` |
-| **Drain BUSY Backoff** | 排空期間遭遇 `SQLITE_BUSY` | 記錄 `retryAt = now + delayMs`，排入 `retryPendingItems` | 嚴格等待至 `retryAt` 到期才重新排回隊列；若 `retryAt > deadlineAt` 則轉入 `UNCOMMITTED_ERROR` |
-| **Deadline 逾時** | Drain 耗時超過 `drainTimeoutMs` | 獨立 Observer 準時返回，標記 `deadlineExpired: true, isClean: false` | **立即阻止所有新 Transaction 啟動**；Binary Isolation 遞迴在啟動 Right 前中斷，未提交子批次按 `seq` 原子退回隊列前端 |
-| **Close 逾時未靜止** | `adapter.close(timeoutMs)` 到期時仍有在途任務 | 拋出 `[CLOSE_REJECTED]`，`adapterClosed: false` | **嚴禁呼叫 `_rawClose()`** 摧毀活動連線，回報 `success: false` 並附帶 `diagnostics` |
-| **Emergency Crash** | 未捕獲例外、嚴重崩潰 | 呼叫 `handleEmergencyCrash()`，給予最多 1000ms 有界等待 | 未達 `isQuiescent()` 嚴禁呼叫 `emergencyClose()` 並輸出 Crash Dump；若已靜止則釋放連線，但若 `totalUncommitted > 0` 仍誠實回報 `success: false, dataClean: false` |
-
----
-
-## 9. PRAGMA 最終設定表與設計依據
-
-| PRAGMA 參數 | 設定值 | 實際讀回驗證 | 判定等級 | 設計理由與歷史相容性分析 |
-| :--- | :---: | :---: | :---: | :--- |
-| **`journal_mode`** | `WAL` | `'wal'` | **硬性 (HARD)** | 支援高並發讀寫分離，避免讀取操作阻塞批次寫入隊列。 |
-| **`synchronous`** | `NORMAL` | `1` | **硬性 (HARD)** | 在 WAL 模式下具備崩潰一致性，兼顧高頻封包入列之磁碟 I/O 效能。 |
-| **`busy_timeout`** | `10000` | `10000` | **硬性 (HARD)** | 設定為 10 秒（10000ms），吸收短暫鎖爭用並避免 HTTP 請求無限懸掛。 |
-| **`foreign_keys`** | `OFF` | `0` | **硬性 (HARD)** | 歷史 Schema 無 FOREIGN KEY 約束，且遙測封包可能早於節點資訊到達，維持 `OFF` 確保相容。 |
-| **`wal_autocheckpoint`**| `1000` | `1000` | **硬性 (HARD)** | 當 WAL 達到 1000 頁（約 4MB）時自動觸發 Passive Checkpoint。 |
-| **`cache_size`** | `-64000` | `-64000` | **軟性 (SOFT)** | 配置約 64MB Page Cache 加速熱點查詢。 |
-| **`temp_store`** | `MEMORY` | `2` | **軟性 (SOFT)** | 暫存表與索引置於記憶體，減少磁碟暫存 I/O。 |
-| **`mmap_size`** | `268435456` | $\ge 0$ | **軟性 (SOFT)** | 256MB Memory-Mapped I/O，若受作業系統截斷則記錄軟性警告。 |
+| 檔案路徑 | 修改位置 (行號範圍) | 修正項目與職責說明 |
+| :--- | :--- | :--- |
+| [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L47-L78) | `#L47-L78`, `#L128-L154` | 新增 `#checkpointInProgress`、`lastCleanupError` 與 `#databaseFactory`，將 `checkpointInProgress` 納入 `isQuiescent()` 與 `getActiveStatus()` |
+| [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L156-L259) | `#L156-L259` | **v2.7.5 P1**：新增 `_createDatabase()` 與 `_cleanupFailedInitConnection()`，`initialize()` 在 PRAGMA 失敗時等待原生 `db.close(cb)` 完成後才 reject 原始錯誤，並隔離 Cleanup Error |
+| [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L516-L625) | `#L516-L625` | **v2.7.5 P0**：`checkpoint()` 支援 `{ timeoutMs, deadlineAt }` 共用 Deadline 檢查與有界等待，並在執行期間維護 `#checkpointInProgress` |
+| [`src/database/sqlite.adapter.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.adapter.js#L636-L698) | `#L636-L698` | **v2.7.5 P0/P1**：`close(timeoutMs)` 對 `waitBudget <= 0` 不再落入無界等待；`emergencyClose(queueSafetyState)` 驗證 Queue In-Flight 與 Flush Worker；`_rawClose()` 拒絕 `#checkpointInProgress` 或 `maintenanceInProgress` |
+| [`src/database/write-queue.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js#L68-L135) | `#L68-L135`, `#L622-L709` | **v2.7.5 P1**：新增 `this.isDraining` 與 `isFlushWorkerActive()` 唯讀狀態查詢，並輸出至 `getMetrics().flushWorkerActive` |
+| [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js#L22-L44) | `#L22-L44` | **v2.7.5 P1**：新增 `_canSafelyEmergencyClose()` 檢查 7 項安全准入條件 |
+| [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js#L49-L263) | `#L49-L263` | **v2.7.5 P0**：`handle()` 實作單一絕對 `shutdownDeadlineAt`，統籌 Drain、Checkpoint、Close 三階段剩餘預算，移除 100ms 保底並擴充 `checkpointTimedOut` 與 `diagnostics.checkpoint` |
+| [`src/database/shutdown-handler.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/shutdown-handler.js#L265-L361) | `#L265-L361` | **v2.7.5 P1**：`handleEmergencyCrash()` 整合 `_canSafelyEmergencyClose()`，回傳完整 `flushWorkerActive`、`schedulerPending`、`schedulerActive`、`queueMetrics` 與 `diagnostics` |
+| [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js#L1360-L1603) | `#L46`, `#L1360-L1603` | 新增 Group H（Test 42、Test 43、Test 44），完整保留原有 41 項測試，總計 **44 項測試** |
 
 ---
 
-## 10. Callback Exactly-Once 適用範圍與契約
+## 6. Data Conservation 與可靠性誠實契約
 
-| 介面 | 正常執行 Callback 調用次數 | 異常/失敗調用次數 | Callback 內部拋出例外時的行為 |
-| :--- | :---: | :---: | :--- |
-| **`db.run(sql, [params], cb)`** | 恰好 1 次 (`cb.call(res, null)`) | 恰好 1 次 (`cb(err)`) | 透過 `.then(onFulfilled, onRejected)` 分離，**絕不重複調用**；例外向上冒泡導致 Promise 拒絕。 |
-| **`db.get(sql, [params], cb)`** | 恰好 1 次 (`cb(null, row)`) | 恰好 1 次 (`cb(err)`) | 絕不重複調用；保證 Exactly-Once。 |
-| **`db.all(sql, [params], cb)`** | 恰好 1 次 (`cb(null, rows)`) | 恰好 1 次 (`cb(err)`) | 絕不重複調用；保證 Exactly-Once。 |
-| **`db.close(cb)`** | 恰好 1 次 (`cb(null)`) | 恰好 1 次 (`cb(err)`) | 絕不重複調用；關閉流程正常完成。 |
-| **`writeQueue.enqueue(op, cb)`** | 成功提交時 1 次 | 遭拒絕、隔離或放棄時 1 次 | 入列拒絕由 `_safeRejectCallback` try/catch 隔離保護；隊列處理中由 `_invokeCallback` (`callbackInvoked` 旗標) 保證單次執行。 |
-
----
-
-## 11. 41 項測試場景真實執行驗收報告
-
-測試指令：`node --test tests/database/sqlite_reliability.test.js`  
-測試環境：Node.js (Windows NT)  
-執行結果：**41 passed, 0 failed, 0 skipped, 總耗時 2852.38ms**。
-
-### Group A: Scheduler / Shutdown / Quiescence (7 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 1 | Scheduler Pending/Active 時觸發 Emergency Shutdown (v2.7.4) | 真實 Deferred 任務執行中拒絕 rawClose 並產生結構化診斷轉儲 | **PASS** |
-| 2 | Scheduler Active 時觸發 Emergency Shutdown | 檢驗 `isQuiescent` 並安全拒絕連線強制釋放 | **PASS** |
-| 3 | Transaction 執行中觸發 Shutdown | 禁止關閉並保護在途資料 | **PASS** |
-| 4 | Shutdown Gate 關閉後嘗試新增工作 | 即刻拒絕並累計 `totalRejected`，不影響守恆計數 | **PASS** |
-| 5 | Deadline 到達後 Scheduler 不得啟動新交易 (v2.7.4) | 真實底層交易阻塞下，獨立 Observer 於 100ms 準時返回快照 | **PASS** |
-| 6 | 重複 Shutdown 冪等性 | 同時多次呼叫回傳同一個 Promise 且僅關閉連線一次 | **PASS** |
-| 7 | Maintenance 與 Drain 競爭 | 維護任務執行中禁止執行 TRUNCATE Checkpoint | **PASS** |
-
-### Group B: FIFO & Binary Isolation (6 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 8 | 正常 Binary Isolation | 自動拆分壞資料，好資料成功提交 | **PASS** |
-| 9 | 左側 SQLITE_FULL 保持 FIFO (P0-1 核心驗證) | 剩餘批次按原始序排回隊列前端，無倒置 | **PASS** |
-| 10 | 右側 SQLITE_FULL 保持 FIFO | Left 提交成功，Right 按原始順序退回隊列前端 | **PASS** |
-| 11 | UNKNOWN 中止 Binary Isolation (P1-01) | 立即熔斷且所有未提交資料完整保留於錯誤容器 | **PASS** |
-| 12 | Retry Queue 與一般 Queue 容器互斥無重複 (P0-2) | 單一歸屬保證，定時器重複觸發不重入 | **PASS** |
-| 13 | 多批次連續失敗仍維持 FIFO | 排序以原始 `seq` 為準，多批次提交順序完全一致 | **PASS** |
-
-### Group C: Data Conservation & Lifecycles (9 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 14 | 正常 COMMIT 與守恆 | `totalAccepted == totalCommitted` 且公式成立 | **PASS** |
-| 15 | BUSY Retry 守恆 | 重試過程中資料守恆公式恆成立 | **PASS** |
-| 16 | SQLITE_FULL 守恆 | 磁碟滿額暫停時所有未提交資料皆計入 queued | **PASS** |
-| 17 | CONSTRAINT Quarantine 守恆 | 隔離項目轉入 quarantined 容器並精準計帳 | **PASS** |
-| 18 | UNKNOWN 熔斷保留與守恆 | 轉移至 `uncommittedErrors` 實體保留 SQL 與參數 | **PASS** |
-| 19 | Adapter ERROR 拒絕與計數分離 | 故障時拒絕新入列，`totalAccepted` 不虛增 | **PASS** |
-| 20 | Shutdown Deadline 守恆 | 逾時未提交資料依舊受嚴格守恆追蹤 | **PASS** |
-| 21 | 非法 Item 狀態轉換防護 | 違規轉移被攔截且不破壞原有狀態 | **PASS** |
-| 22 | Callback Exactly-Once 集中防重 (P1-02) | 使用者回呼保證僅被執行一次 | **PASS** |
-
-### Group D: Backup Integrity & Error Handling (4 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 23 | Backup Integrity VALID | 正常資料庫完整性驗證通過 | **PASS** |
-| 24 | Backup Integrity CORRUPTED | 毀損檔案標記 CORRUPTED 並安全移除壞檔 | **PASS** |
-| 25 | Backup Integrity VERIFY_ERROR | 檔案不存在或權限異常時回傳 VERIFY_ERROR | **PASS** |
-| 26 | Backup close 失敗處置 (P1-03) | close 異常歸類為 VERIFY_ERROR 且保留候選檔 | **PASS** |
-
-### Group E: Checkpoint Modes & Preconditions (4 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 27 | Checkpoint PASSIVE | 輕負載下執行並回傳 busy/log 狀態 | **PASS** |
-| 28 | Checkpoint FULL | 嚴格檢查在途交易與 Scheduler Pending | **PASS** |
-| 29 | Checkpoint BUSY 拒絕 | TRUNCATE/FULL 遇 `busy === 1` 拋出 `CHECKPOINT_BUSY_BLOCKED` | **PASS** |
-| 30 | TRUNCATE 安全條件嚴格檢查 (P1-2) | 缺少 `queueMetricsProvider` 或未排空時拒絕 | **PASS** |
-
-### Group F: v2.7.3 缺陷修正與獨立驗證 (7 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 31 | Drain 不將 UNCOMMITTED_ERROR 誤判為成功 (v2.7.3 P0-1) | 驗證 `uncommittedErrorCount > 0` 時 Drain 回報 `isClean = false`，Shutdown 不標記成功 | **PASS** |
-| 32 | Binary Isolation 部分失敗與剩餘批次原子回退 (v2.7.4 P0-2 / P0-1) | 驗證整批觸發拆分且 Left 提交後若 Deadline 到期，Right 交易絕不啟動，剩餘項目原子排回佇列前端並保持守恆 | **PASS** |
-| 33 | 故障注入測試: 模擬 SQLITE_FULL 時 Drain 立即中止 (v2.7.3 P0-3) | 驗證首次遭遇滿額後 Worker 立即 break 退出，耗時遠低於超時時限 | **PASS** |
-| 34 | PAUSED_DISK_FULL 狀態下拒絕新寫入 (v2.7.3 P1-1) | 驗證磁碟滿額暫停期間 `enqueue` 即刻拒絕，`totalRejected` 增加，`totalAccepted` 不虛增 | **PASS** |
-| 35 | PRAGMA 動態比對與硬性驗證 (v2.7.3 P1-2) | 驗證 PRAGMA 實際讀回值符合配置；設定衝突時拋出 `HARD_FAIL` 阻止啟動 | **PASS** |
-| 36 | Callback Exactly-Once 相容層與入列拒絕防重調用 (v2.7.3 P1-3 / v2.7.4 P1-1) | 驗證 run/get/all/error 與 4 種入列拒絕回呼內部拋出例外時被安全保護且絕不二次調用 | **PASS** |
-| 37 | Database Factory 初始化與啟動前置保護 (v2.7.3 P1-4 / v2.7.4) | 驗證初始化失敗時拒絕回傳 READY Adapter，並攔截 HTTP Server 與 MQTT 啟動 | **PASS** |
-
-### Group G: v2.7.4 深度強固驗證 (4 Scenarios)
-| 編號 | 測試案例名稱 | 驗證項目 | 實際執行結果 |
-| :---: | :--- | :--- | :---: |
-| 38 | Drain 階段嚴格遵守 BUSY Retry Backoff 與守恆 (v2.7.4 P0-1) | 驗證 Drain 遭遇 `SQLITE_BUSY` 時嚴格等待至少 80ms 退避延遲後才執行第 2 次交易並滿足資料守恆 | **PASS** |
-| 39 | Graceful Shutdown 有界等待與未靜止時拒絕 rawClose (v2.7.4 P0-2) | 驗證排程器有未完成任務時 `adapter.close(timeout)` 與 `shutdownHandler.handle()` 有界超時返回 `adapterClosed: false`，絕不摧毀活動連線 | **PASS** |
-| 40 | Emergency Shutdown 檢查未提交資料與誠實成功語意 (v2.7.4 P0-3) | 驗證佇列有 20 筆未提交資料時，即使 `emergencyClose()` 釋放連線成功，仍誠實回報 `success: false, dataClean: false` | **PASS** |
-| 41 | 初始化失敗時安全清理 SQLite 連線防洩漏 (v2.7.4 P1-2) | 驗證 PRAGMA `HARD_FAIL` 後底層 `badAdapter.db` 被安全關閉並清空為 `null` | **PASS** |
+1. **兩層資料守恆公式**：
+   $$\text{totalSubmitted} = \text{totalAccepted} + \text{totalRejected}$$
+   $$\text{totalAccepted} = \text{totalCommitted} + \text{totalQuarantined} + \text{queuedCount} + \text{retryPendingCount} + \text{inFlightCount} + \text{uncommittedErrorCount}$$
+2. **三種關機狀態嚴格區分**：
+   - `adapterClosed`：底層 SQLite 連線是否已在無在途操作的靜止狀態下安全執行 `db.close()`。
+   - `hasUncommittedData`：`writeQueue.getMetrics().totalUncommitted > 0`（包含 `queued`、`retryPending`、`inFlight`、`uncommittedErrors`）。
+   - `dataClean` / `success`：唯有所有已接受資料全數提交（`totalUncommitted === 0`）、Checkpoint（於 Graceful Shutdown 時）完成且 `adapterClosed === true` 時，`success` 才為 `true`。
 
 ---
 
-## 12. 已知限制與未驗證項目
+## 7. 44 項測試場景真實執行驗收報告
 
-依據誠實宣告原則，本版本仍具有以下物理邊界與未驗證項目：
-1. **未提交記憶體資料物理限制**：本實作未引入外部持久化預寫日誌（如 Outbox Pattern 或持久化 Ingestion Log）。若主機遭遇硬體突發斷電或作業系統層級 `kill -9`，記憶體隊列中尚未 COMMIT 的資料將無法恢復。
-2. **自動磁碟空間探測 Worker**：目前系統在遭遇 `SQLITE_FULL` 後保持 `PAUSED_DISK_FULL` 並安全拒絕寫入，需透過 `resumeDiskFull()` 恢復；本版本未包含背景自動磁碟空間定時輪詢探測器。
-3. **4.5GB 生產歷史資料庫實體基準測試**：因嚴格遵守「禁止碰觸正式 4.5GB 資料庫」之安全禁令，所有測試皆於獨立臨時資料庫執行；正式庫首次 `VACUUM INTO` 之實際 I/O 耗時留待受控維護視窗驗證。
+- **語法靜態檢查**：`node --check` 於所有修改檔案全數通過（Exit Code 0）。
+- **自動化測試指令**：`npm run test:database` (`node --test tests/database/*.test.js`)
+- **測試結果摘要**：**44 tests, 44 passed, 0 failed, 0 cancelled, 0 skipped, 總耗時 2945.78ms**。
+
+### Group A ~ Group G (Tests 1 ~ 41 回歸驗證結果)
+- **Test 1 ~ Test 41**：**41 / 41 全數 PASS**（包含 Test 1 Scheduler Pending/Active、Test 5 Drain Deadline、Test 38 Drain BUSY Backoff、Test 39 Graceful Shutdown bounded close、Test 40 Emergency Shutdown 未提交資料審計、Test 41 Initialization Failure Cleanup）。
+
+### Group H: v2.7.5 Final Hardening & Verification (Tests 42 ~ 44)
+| 編號 | 測試案例名稱 | 驗證重點 | 耗時 | 結果 |
+| :---: | :--- | :--- | :---: | :---: |
+| **42** | **Checkpoint Timeout 與 Shutdown 共用 Deadline (v2.7.5 P0)** | 1. Drain 正常提交 2 筆資料完成<br>2. `wal_checkpoint(TRUNCATE)` 被 Deferred 阻塞<br>3. Shutdown 於共用預算（220ms，實測約 224ms）準時返回，無 100ms 額外溢出<br>4. `checkpointTimedOut: true`, `checkpointCompleted: false`, `success: false`<br>5. 未呼叫 `_rawClose()`（`adapterClosed: false`, `db !== null`）<br>6. `diagnostics.checkpoint` 與 `adapterStatus` 完整記錄在途狀態 | 248.91ms | **PASS** |
+| **43** | **Emergency Shutdown Queue In-Flight Race 防護驗證 (v2.7.5 P1)** | 1. 透過真實 `enqueue` $\to$ `flush()` 進入 `inFlightCount === 1`、`flushWorkerActive === true` 但 Adapter 尚未註冊排程（`adapter.isQuiescent() === true`）之競態窗口<br>2. 觸發 `handleEmergencyCrash`，驗證即使 Adapter 暫時 Quiescent 仍拒絕呼叫 `emergencyClose`<br>3. `adapterClosed: false`, `forcedExit: true`, `flushWorkerActive: true`<br>4. 驗證 Queue 項目零遺失，`conservationCheck === true` | 78.36ms | **PASS** |
+| **44** | **Initialization Failure Native Close Completion 與錯誤隔離驗證 (v2.7.5 P1)** | 1. 真實 `sqlite3.Database` 開啟後觸發 PRAGMA `HARD_FAIL`<br>2. 以 Deferred 控制原生 `db.close(cb)` 完成時點，驗證 `close(cb)` 完成前 `initialize()` Promise 絕不提前 reject，且 `this.db` 已立即清空為 `null`<br>3. 釋放 Deferred 並模擬 Cleanup Error 後，`initialize()` 才 reject 原始 `HARD_FAIL` 錯誤<br>4. `state === ERROR`、`lastError` 維持原始錯誤、`lastCleanupError` 獨立記錄清理錯誤 | 43.62ms | **PASS** |
 
 ---
 
-## 13. 最終自我審查結論與交付狀態
+## 8. 尚未解決的問題與物理限制
 
-| 審查項目 | 檢查標準 | 審查結論 |
-| :--- | :--- | :---: |
-| **v2.7.4 P0-1 Drain BUSY Backoff** | Drain 嚴格遵守 `retryAt` 退避延遲與剩餘預算，結束時清理 `#retryTimers` | **PASS** |
-| **v2.7.4 P0-2 Shutdown 有界等待** | `close(timeoutMs)` 有界等待，未達 `isQuiescent()` 嚴禁呼叫 `_rawClose()` | **PASS** |
-| **v2.7.4 P0-3 誠實成功語意** | Emergency / Graceful Shutdown 只要 `totalUncommitted > 0` 必回報 `success: false` | **PASS** |
-| **v2.7.4 P1-1 拒絕回呼異常隔離** | `_safeRejectCallback` 確保入列拒絕回呼拋錯不炸穿呼叫端 | **PASS** |
-| **v2.7.4 P1-2 初始化失敗連線清理** | PRAGMA 驗證失敗時自動 `close()` 並清空 `this.db` 防止 Handle 洩漏 | **PASS** |
-| **v2.7.3 P0/P1 全項回歸** | UNCOMMITTED_ERROR 審核、Deadline 二分阻絕、Disk Full 中止、PRAGMA 動態驗證全數維持 | **PASS** |
-| **Data Conservation** | 守恆公式在全部 41 項正常與故障注入路徑均 100% 成立 | **PASS** |
-| **測試真實性** | 41 項測試全部在獨立臨時庫實際執行通過 (41 pass, 0 fail) | **PASS** |
-| **Production 隔離** | 生產目錄、PM2、正式 4.5GB 資料庫維持絕對零碰觸 | **PASS** |
+依據工程誠實原則，如實宣告以下物理限制與未涵蓋邊界：
+1. **Node.js `sqlite3` 原生 C++ 操作不可中途強制取消**：當 `checkpoint()`、`drain()` 或 `close()` 因共用 Deadline 到期而透過 `Promise.race` 返回 Timeout 時，僅代表 JS 控制流不再等待並保護性地拒絕呼叫 `_rawClose()`；底層 libuv 執行緒池中正在運行的 SQLite C API 操作並未被取消，仍會繼續執行至底層完成或由作業系統在行程終止時回收，由 SQLite WAL 恢復機制確保檔案一致性。
+2. **記憶體佇列無法抵禦斷電與 `SIGKILL`**：`WriteQueue` 為純記憶體佇列，未實作外部持久化預寫日誌（Durable Outbox / WAL Ingestion Log）。若發生硬體斷電、OS 崩潰或 `kill -9`，所有尚未完成 SQLite `COMMIT` 的在途與排隊資料將會遺失。
+3. **磁碟滿額需外部介入恢復**：遭遇 `SQLITE_FULL` 時系統自動進入 `PAUSED_DISK_FULL` 並拒絕新寫入以保護現有佇列，需待磁碟空間清理後呼叫 `resumeDiskFull()` 恢復，未內建背景自動磁碟空間輪詢。
+4. **正式環境 4.5GB 資料庫未實測**：受嚴格安全隔離限制，正式生產環境約 4.5GB 資料庫尚未執行實際 `VACUUM INTO` 與 `TRUNCATE` Checkpoint 耗時基準量測。
 
-### 最終驗收結論
-**狀態：`READY FOR REVIEW`**
+---
 
-所有修改均已通過本地獨立測試，並產出交付封裝包：`Meshtastic-DashBoard_SQLite_Reliability_v2.7.4.zip`。
+## 9. 最終驗收條件檢核表
+
+| 驗收條件 | 檢核結果 |
+| :--- | :---: |
+| Checkpoint 受到共用 Shutdown Deadline 保護 | **PASS** |
+| Drain、Checkpoint、Close 不會各自取得完整 Timeout，且移除 100ms 保底 | **PASS** |
+| Emergency Shutdown 正確檢查 Queue In-Flight 與 Flush Worker | **PASS** |
+| Initialization Failure 等待原生 `close(callback)` 完成且不覆蓋原始錯誤 | **PASS** |
+| Test 42、Test 43、Test 44 全部真實執行通過 | **PASS** |
+| v2.7.4 原有 41 項測試全部回歸通過（共 44 / 44 PASS） | **PASS** |
+| 沒有修改 Schema 或既有外部 API | **PASS** |
+| 沒有碰觸正式環境與正式 4.5GB 資料庫 | **PASS** |
+| 完整測試紀錄及 Git diff 已交付 | **PASS** |
+
+**最終簽核狀態：`v2.7.5 — READY FOR REVIEW`**  
+*(註：`READY FOR REVIEW` 僅代表開發環境程式碼與隔離驗證完成，不等於 `READY FOR PRODUCTION`。)*

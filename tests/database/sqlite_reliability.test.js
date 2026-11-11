@@ -43,7 +43,7 @@ function assertDataConservation(m) {
     );
 }
 
-describe('SQLite Reliability v2.7.4 Comprehensive Test Suite (41 Scenarios)', () => {
+describe('SQLite Reliability v2.7.5 Comprehensive Test Suite (44 Scenarios)', () => {
 
     // ==========================================
     // Group A: Scheduler / Shutdown (7 Scenarios)
@@ -1353,6 +1353,258 @@ describe('SQLite Reliability v2.7.4 Comprehensive Test Suite (41 Scenarios)', ()
         assert.equal(badAdapter.state, ADAPTER_STATES.ERROR);
         // 🌟 P1-2 核心驗證：已開啟之 SQLite 原生 handle 已被妥善關閉並清空，絕不遺留洩漏
         assert.equal(badAdapter.db, null, '初始化失敗後連線 handle 必須被安全關閉並清空');
+
+        cleanupTempDb(dbPath);
+    });
+
+    // ==========================================
+    // Group H: SQLite Reliability v2.7.5 Final Hardening & Verification (3 Scenarios)
+    // ==========================================
+
+    it('42. Checkpoint Timeout 與 Shutdown 共用 Deadline (v2.7.5 P0)', async () => {
+        const dbPath = getTempDbPath('checkpoint_shared_deadline');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            config: {
+                shutdown: {
+                    pm2KillTimeoutMs: 220,
+                    drainTimeoutMs: 120,
+                    drainWaitBufferMs: 80
+                }
+            }
+        });
+        await db.run('CREATE TABLE cp_deadline_test (id INT PRIMARY KEY)');
+
+        // 1. 排入 2 筆待排空資料，確保 Drain 正常完成
+        db.queueDbOp('INSERT INTO cp_deadline_test VALUES (1)');
+        db.queueDbOp('INSERT INTO cp_deadline_test VALUES (2)');
+
+        // 2. 攔截底層 PRAGMA wal_checkpoint(TRUNCATE)，以 Deferred 模擬 Checkpoint 長時間阻塞超過共用 Deadline
+        let releaseCheckpoint;
+        const checkpointDeferred = new Promise((resolve) => { releaseCheckpoint = resolve; });
+        let checkpointStarted = false;
+        let rawCloseCalled = false;
+
+        const origRawQueryOne = db.adapter._rawQueryOne.bind(db.adapter);
+        db.adapter._rawQueryOne = async function(sql, params) {
+            if (String(sql).includes('wal_checkpoint(TRUNCATE)')) {
+                checkpointStarted = true;
+                await checkpointDeferred;
+            }
+            return origRawQueryOne(sql, params);
+        };
+
+        const origRawClose = db.adapter._rawClose.bind(db.adapter);
+        db.adapter._rawClose = async function() {
+            rawCloseCalled = true;
+            return origRawClose();
+        };
+
+        // 3. 觸發 Graceful Shutdown，驗證共用單一 Deadline
+        const startT = Date.now();
+        const shutResult = await db.shutdownHandler.handle('SIGTERM', { exitProcess: false });
+        const elapsed = Date.now() - startT;
+
+        // 4. 驗證 Shutdown 在總時間預算 (約 220ms) 內返回，未在 Close 階段額外保底等待 100ms
+        assert.equal(checkpointStarted, true, 'Drain 正常完成後應進入 TRUNCATE Checkpoint');
+        assert.ok(elapsed >= 170 && elapsed < 320, `Shutdown 必須受單一共用 Deadline (220ms) 約束準時返回，實際耗時: ${elapsed}ms`);
+
+        // 5. 驗證結果明確標記 Checkpoint Timeout，且不得誤判為成功
+        assert.equal(shutResult.success, false, 'Checkpoint 超時時 Shutdown 絕對不得回報成功');
+        assert.equal(shutResult.checkpointTimedOut, true, '必須明確標記 checkpointTimedOut: true');
+        assert.equal(shutResult.checkpointCompleted, false, '不得誤判為 Checkpoint 完成');
+        assert.equal(shutResult.deadlineExpired, true, '必須標記共用 Deadline 已到期');
+        assert.equal(shutResult.dataClean, true, 'Drain 階段本身已完成 2 筆資料提交');
+
+        // 6. 驗證不得對仍在執行 Checkpoint 的底層連線呼叫 rawClose
+        assert.equal(shutResult.adapterClosed, false, 'Checkpoint 仍在底層執行時 Adapter 不得關閉');
+        assert.equal(rawCloseCalled, false, '仍在執行底層操作時嚴禁呼叫 _rawClose()');
+        assert.ok(db.adapter.db !== null, '底層連線實例必須保留，避免 native crash');
+
+        // 7. 驗證 Diagnostics 完整保留 Checkpoint 與 Adapter 執行狀態
+        assert.ok(shutResult.diagnostics);
+        assert.ok(shutResult.diagnostics.checkpoint);
+        assert.equal(shutResult.diagnostics.checkpoint.attempted, true);
+        assert.equal(shutResult.diagnostics.checkpoint.completed, false);
+        assert.equal(shutResult.diagnostics.checkpoint.timedOut, true);
+        assert.match(shutResult.diagnostics.checkpoint.error, /CHECKPOINT_TIMEOUT/);
+        assert.equal(shutResult.diagnostics.adapterStatus.checkpointInProgress, true);
+        assert.equal(shutResult.diagnostics.adapterStatus.underlyingExecuting, true);
+        assert.equal(shutResult.diagnostics.adapterStatus.schedulerActive, 1);
+        assert.equal(shutResult.diagnostics.adapterStatus.isQuiescent, false);
+
+        // 8. 釋放 Deferred Checkpoint 任務並安全清理資源
+        releaseCheckpoint();
+        while (!db.adapter.isQuiescent()) {
+            await new Promise(r => setTimeout(r, 5));
+        }
+        db.adapter._rawQueryOne = origRawQueryOne;
+        db.adapter._rawClose = origRawClose;
+        await db.adapter.emergencyClose();
+        cleanupTempDb(dbPath);
+    });
+
+    it('43. Emergency Shutdown Queue In-Flight Race 防護驗證 (v2.7.5 P1)', async () => {
+        const dbPath = getTempDbPath('emergency_inflight_race');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            config: {
+                shutdown: {
+                    emergencyWaitMs: 60
+                }
+            }
+        });
+        await db.run('CREATE TABLE race_test (id INT PRIMARY KEY)');
+
+        // 1. 攔截 adapter.transaction，在 Flush Worker 已將項目移入 IN_FLIGHT 但 Adapter 尚未註冊 Scheduler 前建立真實競態窗口
+        let releasePreScheduleBarrier;
+        const preScheduleBarrier = new Promise((resolve) => { releasePreScheduleBarrier = resolve; });
+        let NotifyEnteredInFlightWindow;
+        const enteredInFlightWindow = new Promise((resolve) => { NotifyEnteredInFlightWindow = resolve; });
+
+        const origTransaction = db.adapter.transaction.bind(db.adapter);
+        db.adapter.transaction = async function(workFn) {
+            // 此時 WriteQueue.flush() 已將項目轉為 IN_FLIGHT 且 isFlushing = true，但尚未進入 adapter._schedule()
+            NotifyEnteredInFlightWindow();
+            await preScheduleBarrier;
+            return origTransaction(workFn);
+        };
+
+        let emergencyCloseCalled = false;
+        const origEmergencyClose = db.adapter.emergencyClose.bind(db.adapter);
+        db.adapter.emergencyClose = async function(...args) {
+            emergencyCloseCalled = true;
+            return origEmergencyClose(...args);
+        };
+
+        // 2. 入列 1 筆資料並啟動真實 Flush Worker 控制流程
+        const accepted = db.queueDbOp('INSERT INTO race_test VALUES (1)');
+        assert.equal(accepted, true);
+        const flushPromise = db.writeQueue.flush();
+
+        // 3. 等待進入「Item 已 IN_FLIGHT、Flush Worker 執行中，但 Adapter 尚未註冊 Scheduler」之真實競態點
+        await enteredInFlightWindow;
+
+        assert.equal(db.writeQueue.inFlightCount, 1, '項目必須已進入 IN_FLIGHT 狀態');
+        assert.equal(db.writeQueue.isFlushWorkerActive(), true, 'Flush Worker 必須處於活動狀態');
+        assert.equal(db.adapter.isQuiescent(), true, '此時 Adapter 尚未註冊排程，暫時回報 Quiescent');
+
+        // 4. 在此競態窗口觸發 Emergency Shutdown
+        const crashResult = await db.shutdownHandler.handleEmergencyCrash(
+            new Error('Race Condition Crash'),
+            'uncaughtException',
+            { exitProcess: false }
+        );
+
+        // 5. 驗證即使 Adapter 暫時 Quiescent，Emergency Shutdown 仍因 In-Flight 與 Flush Worker 活動而拒絕呼叫 emergencyClose
+        assert.equal(emergencyCloseCalled, false, 'Queue 有 In-Flight 或 Flush Worker 活動時嚴禁呼叫 emergencyClose');
+        assert.equal(crashResult.success, false);
+        assert.equal(crashResult.adapterClosed, false);
+        assert.equal(crashResult.dataClean, false);
+        assert.equal(crashResult.hasUncommittedData, true);
+        assert.equal(crashResult.forcedExit, true);
+        assert.ok(db.adapter.db !== null, '底層資料庫連線不得被關閉');
+
+        // 6. 驗證 Diagnostics 正確反映 Flush Worker 與 In-Flight 狀態，且資料無遺失
+        assert.equal(crashResult.flushWorkerActive, true);
+        assert.equal(crashResult.queueMetrics.inFlightCount, 1);
+        assert.equal(crashResult.queueMetrics.totalUncommitted, 1);
+        assert.ok(crashResult.diagnostics);
+        assert.equal(crashResult.diagnostics.flushWorkerActive, true);
+        assert.equal(crashResult.diagnostics.queueMetrics.inFlightCount, 1);
+        assert.equal(crashResult.diagnostics.adapterStatus.isQuiescent, true);
+        assertDataConservation(db.writeQueue.getMetrics());
+
+        // 7. 釋放競態屏障，等待 Flush Worker 收斂並驗證項目未遺失 (轉入 uncommittedErrors 保全)
+        releasePreScheduleBarrier();
+        await flushPromise;
+
+        const finalMetrics = db.writeQueue.getMetrics();
+        assertDataConservation(finalMetrics);
+        assert.equal(finalMetrics.totalAccepted, 1);
+        assert.equal(finalMetrics.totalUncommitted, 1);
+        assert.equal(finalMetrics.uncommittedErrorCount, 1);
+
+        // 8. 恢復方法並完成最終清理
+        db.adapter.transaction = origTransaction;
+        db.adapter.emergencyClose = origEmergencyClose;
+        await db.adapter.emergencyClose();
+        cleanupTempDb(dbPath);
+    });
+
+    it('44. Initialization Failure Native Close Completion 與錯誤隔離驗證 (v2.7.5 P1)', async () => {
+        const dbPath = getTempDbPath('init_native_close_await');
+
+        let releaseCloseCallback;
+        const closeDeferred = new Promise((resolve) => { releaseCloseCallback = resolve; });
+        let notifyCloseInvoked;
+        const closeInvokedPromise = new Promise((resolve) => { notifyCloseInvoked = resolve; });
+        let closeCallbackCompleted = false;
+
+        // 使用包裝後之真實 sqlite3.Database，保留真實非同步 close 並以 Deferred 控制 callback 完成時機
+        const badAdapter = new SQLiteAdapter({
+            pragmas: {
+                busy_timeout: -999 // 觸發 PRAGMA 驗證 HARD_FAIL
+            },
+            databaseFactory: (targetPath, openCb) => {
+                const realDb = new sqlite3.Database(targetPath, openCb);
+                const origClose = realDb.close.bind(realDb);
+                realDb.close = (closeCb) => {
+                    notifyCloseInvoked();
+                    // 先執行真實原生 close 釋放檔案控制代碼，再由 Deferred 控制回呼完成時點與模擬 Cleanup Error
+                    origClose(async () => {
+                        await closeDeferred;
+                        closeCallbackCompleted = true;
+                        if (typeof closeCb === 'function') {
+                            closeCb(new Error('Simulated native close cleanup error'));
+                        }
+                    });
+                };
+                return realDb;
+            }
+        });
+
+        // 1. 啟動初始化，追蹤 Promise 是否已 settle
+        let initSettled = false;
+        let caughtInitErr = null;
+        const initPromise = badAdapter.initialize(dbPath).then(
+            () => { initSettled = true; },
+            (err) => {
+                initSettled = true;
+                caughtInitErr = err;
+                throw err;
+            }
+        );
+
+        // 2. 等待 PRAGMA 驗證失敗並進入 db.close()
+        await closeInvokedPromise;
+
+        // 3. 在 Deferred close callback 尚未釋放前，驗證公開連線 reference 已清空，且 initialize Promise 尚未 reject！
+        assert.equal(badAdapter.db, null, '進入清理時公開 this.db 必須立即設為 null 防止外部誤用');
+        await new Promise(r => setTimeout(r, 30));
+        assert.equal(closeCallbackCompleted, false, 'Deferred 釋放前 close callback 尚未完成');
+        assert.equal(initSettled, false, '在原生 close callback 完成前，initialize Promise 絕對不得提前 reject');
+
+        // 4. 釋放 Deferred close callback，驗證 initialize Promise 此時才 reject 原始錯誤
+        releaseCloseCallback();
+
+        await assert.rejects(
+            async () => {
+                await initPromise;
+            },
+            /HARD_FAIL.*busy_timeout/
+        );
+
+        // 5. 驗證所有最終狀態與錯誤隔離要求
+        assert.equal(initSettled, true);
+        assert.equal(closeCallbackCompleted, true, '原生 close callback 必須確實完成');
+        assert.equal(badAdapter.state, ADAPTER_STATES.ERROR, 'Adapter 最終狀態必須為 ERROR');
+        assert.equal(badAdapter.db, null, 'Adapter 連線 reference 必須保持為 null');
+        assert.ok(caughtInitErr);
+        assert.match(caughtInitErr.message, /HARD_FAIL.*busy_timeout/, '必須 reject 原始 Initialization Error');
+        assert.match(badAdapter.lastError.message, /HARD_FAIL.*busy_timeout/, 'lastError 不得被 Cleanup Error 覆蓋');
+        assert.ok(badAdapter.lastCleanupError, 'Cleanup Error 必須被獨立記錄');
+        assert.match(badAdapter.lastCleanupError.message, /Simulated native close cleanup error/);
 
         cleanupTempDb(dbPath);
     });

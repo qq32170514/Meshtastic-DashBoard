@@ -52,18 +52,24 @@ class SQLiteAdapter {
     #acceptingNewTasks = true;
     #fatalErrorListeners = [];
     #pragmas;
+    #checkpointInProgress = false;
+    #databaseFactory = null;
 
     constructor(config = {}) {
         this.instanceId = crypto.randomUUID();
         this.db = null;
         this.state = ADAPTER_STATES.NEW;
         this.lastError = null;
+        this.lastCleanupError = null;
         this._schedulerQueue = Promise.resolve();
         this._closePromise = null;
         this._initPromise = null;
         this.isExecutingUnderlying = false;
         this.maintenanceInProgress = false;
         this.#pragmas = { ...defaultPragmas, ...(config.pragmas || {}) };
+        if (typeof config.databaseFactory === 'function') {
+            this.#databaseFactory = config.databaseFactory;
+        }
     }
 
     /**
@@ -120,7 +126,7 @@ class SQLiteAdapter {
     }
 
     /**
-     * 判定 Adapter 是否已完全達到 Quiescent 靜止狀態 (P0-4)
+     * 判定 Adapter 是否已完全達到 Quiescent 靜止狀態 (P0-4, v2.7.5 P0)
      */
     isQuiescent() {
         return (
@@ -128,12 +134,13 @@ class SQLiteAdapter {
             this.#schedulerPendingCount === 0 &&
             this.#schedulerActiveCount === 0 &&
             this.#activeTransactions === 0 &&
-            !this.maintenanceInProgress
+            !this.maintenanceInProgress &&
+            !this.#checkpointInProgress
         );
     }
 
     /**
-     * 取得 Adapter 完整執行狀態快照 (P0-3, P0-4)
+     * 取得 Adapter 完整執行狀態快照 (P0-3, P0-4, v2.7.5 P0)
      */
     getActiveStatus() {
         return {
@@ -142,10 +149,54 @@ class SQLiteAdapter {
             underlyingExecuting: this.isExecutingUnderlying,
             activeTransactions: this.#activeTransactions,
             maintenanceInProgress: this.maintenanceInProgress,
+            checkpointInProgress: this.#checkpointInProgress,
             acceptingNewTasks: this.#acceptingNewTasks,
             isQuiescent: this.isQuiescent(),
             state: this.state
         };
+    }
+
+    _createDatabase(dbPath, callback) {
+        if (typeof this.#databaseFactory === 'function') {
+            return this.#databaseFactory(dbPath, callback);
+        }
+        return new sqlite3.Database(dbPath, callback);
+    }
+
+    /**
+     * 🌟 初始化失敗後等待原生 SQLite 連線 close callback 完成 (v2.7.5 P1)
+     * 確保 Cleanup Error 被獨立記錄，絕不覆蓋原始 Initialization Error
+     */
+    _cleanupFailedInitConnection(dbToClose, initErr) {
+        return new Promise((resolve) => {
+            if (!dbToClose || typeof dbToClose.close !== 'function') {
+                return resolve(null);
+            }
+            let settled = false;
+            try {
+                dbToClose.close((closeErr) => {
+                    if (settled) return;
+                    settled = true;
+                    if (closeErr) {
+                        this.lastCleanupError = closeErr;
+                        if (initErr && typeof initErr === 'object') {
+                            initErr.cleanupError = closeErr;
+                        }
+                        console.error('⚠️ [ADAPTER_INIT_CLEANUP_WARN] 初始化失敗清理連線時報錯:', closeErr.message);
+                    }
+                    resolve(closeErr || null);
+                });
+            } catch (syncCloseErr) {
+                if (settled) return;
+                settled = true;
+                this.lastCleanupError = syncCloseErr;
+                if (initErr && typeof initErr === 'object') {
+                    initErr.cleanupError = syncCloseErr;
+                }
+                console.error('⚠️ [ADAPTER_INIT_CLEANUP_WARN] 初始化失敗同步呼叫 close 時報錯:', syncCloseErr.message);
+                resolve(syncCloseErr);
+            }
+        });
     }
 
     initialize(dbPath) {
@@ -156,31 +207,61 @@ class SQLiteAdapter {
         this.state = ADAPTER_STATES.INITIALIZING;
 
         this._initPromise = new Promise((resolve, reject) => {
-            this.db = new sqlite3.Database(dbPath, async (err) => {
-                if (err) {
-                    this.setFatalError(err);
-                    return reject(new Error(`SQLite 連線失敗: ${err.message}`));
-                }
-                try {
-                    await this._applyAndVerifyPragmas();
-                    this.state = ADAPTER_STATES.READY;
-                    resolve();
-                } catch (pErr) {
-                    this.setFatalError(pErr);
-                    // 🌟 P1-2: 連線已開啟但初始化 PRAGMA 驗證失敗，執行連線清理防洩漏
-                    if (this.db) {
-                        const dbToClose = this.db;
+            let dbOpened = false;
+            let rawDb = null;
+
+            try {
+                rawDb = this._createDatabase(dbPath, async (err) => {
+                    if (err) {
+                        // Case 1: Database open 失敗，底層連線尚未成功開啟，清空引用但不重複呼叫 close
                         this.db = null;
-                        dbToClose.close((closeErr) => {
-                            if (closeErr) {
-                                console.error('⚠️ [ADAPTER_INIT_CLEANUP_WARN] 初始化失敗清理連線時報錯:', closeErr.message);
-                            }
-                        });
+                        const openErr = new Error(`SQLite 連線失敗: ${err.message}`);
+                        this.setFatalError(openErr);
+                        this.state = ADAPTER_STATES.ERROR;
+                        return reject(openErr);
                     }
-                    this.state = ADAPTER_STATES.ERROR;
-                    reject(pErr);
+
+                    dbOpened = true;
+                    if (!this.db && rawDb) {
+                        this.db = rawDb;
+                    }
+
+                    try {
+                        await this._applyAndVerifyPragmas();
+                        this.state = ADAPTER_STATES.READY;
+                        resolve();
+                    } catch (pErr) {
+                        // Case 2: 連線已成功開啟但 PRAGMA 執行或驗證失敗 (v2.7.5 P1)
+                        // 1. 保存原始 Initialization Error 並立即將 Adapter 轉為 ERROR
+                        this.setFatalError(pErr);
+                        this.state = ADAPTER_STATES.ERROR;
+
+                        // 2. 立即清空公開連線 reference，防止外部使用未初始化完成之連線
+                        const dbToClose = this.db || rawDb;
+                        this.db = null;
+
+                        // 3. 若連線已開啟，必須等待原生 db.close(callback) 完成後才 reject
+                        if (dbOpened && dbToClose) {
+                            await this._cleanupFailedInitConnection(dbToClose, pErr);
+                        }
+
+                        // 4. 確保最終狀態為 ERROR、reference 為 null，且原始錯誤不被 Cleanup Error 覆蓋
+                        this.db = null;
+                        this.state = ADAPTER_STATES.ERROR;
+                        this.lastError = pErr;
+                        reject(pErr);
+                    }
+                });
+
+                if (this.state === ADAPTER_STATES.INITIALIZING && !this.db) {
+                    this.db = rawDb;
                 }
-            });
+            } catch (syncErr) {
+                this.db = null;
+                this.setFatalError(syncErr);
+                this.state = ADAPTER_STATES.ERROR;
+                reject(syncErr);
+            }
         });
 
         return this._initPromise;
@@ -443,18 +524,46 @@ class SQLiteAdapter {
     }
 
     /**
-     * 🌟 Checkpoint 具備模式白名單與執行當下 9 項前置條件強驗證 (P1-2)
+     * 🌟 Checkpoint 具備模式白名單、執行當下 9 項前置條件強驗證與共用 Deadline 超時保護 (P1-2, v2.7.5 P0)
      */
-    checkpoint(mode = 'PASSIVE', capability = null, queueMetricsProvider = null) {
+    checkpoint(mode = 'PASSIVE', capability = null, queueMetricsProvider = null, options = {}) {
         const upperMode = String(mode).toUpperCase();
         if (!ALLOWED_CHECKPOINT_MODES.includes(upperMode)) {
             return Promise.reject(new Error(`[INVALID_CHECKPOINT_MODE] 不支援之模式: ${mode}`));
         }
 
+        let timeoutMs = null;
+        let deadlineAt = null;
+        if (typeof options === 'number') {
+            timeoutMs = options;
+            deadlineAt = Date.now() + options;
+        } else if (options && typeof options === 'object') {
+            if (typeof options.deadlineAt === 'number') {
+                deadlineAt = options.deadlineAt;
+            }
+            if (typeof options.timeoutMs === 'number') {
+                timeoutMs = options.timeoutMs;
+                if (deadlineAt === null) {
+                    deadlineAt = Date.now() + options.timeoutMs;
+                }
+            }
+        }
+
+        if (deadlineAt !== null) {
+            const remainingBeforeSchedule = deadlineAt - Date.now();
+            if (remainingBeforeSchedule <= 0 || (timeoutMs !== null && timeoutMs <= 0)) {
+                return Promise.reject(new Error(`[CHECKPOINT_TIMEOUT] wal_checkpoint(${upperMode}) 啟動前已超過 Shutdown Deadline (剩餘: ${remainingBeforeSchedule}ms)`));
+            }
+        }
+
         // 預檢驗授權
         const authType = upperMode === 'TRUNCATE' ? AUTH_TYPES.CHECKPOINT : AUTH_TYPES.GENERAL;
 
-        return this._schedule(async () => {
+        const scheduledCheckpoint = this._schedule(async () => {
+            if (deadlineAt !== null && Date.now() >= deadlineAt) {
+                throw new Error(`[CHECKPOINT_TIMEOUT] wal_checkpoint(${upperMode}) 排程等待期間已超過 Shutdown Deadline`);
+            }
+
             if (upperMode === 'TRUNCATE') {
                 const auth = validateDrainCapability(capability, this);
                 if (!auth.valid || !auth.record.drainCompleted) {
@@ -486,16 +595,48 @@ class SQLiteAdapter {
                 }
             }
 
-            const result = await this._rawQueryOne(`PRAGMA wal_checkpoint(${upperMode})`);
-            if (result && Number(result.busy) === 1) {
-                if (upperMode === 'TRUNCATE' || upperMode === 'FULL' || upperMode === 'RESTART') {
-                    throw new Error(`[CHECKPOINT_BUSY_BLOCKED] wal_checkpoint(${upperMode}) 遭遇鎖阻塞未完成 (busy: 1, log: ${result.log})`);
-                } else {
-                    console.warn(`⚠️ [CHECKPOINT_BUSY] wal_checkpoint(${upperMode}) 部分幀被鎖阻塞:`, result);
+            this.#checkpointInProgress = true;
+            try {
+                const result = await this._rawQueryOne(`PRAGMA wal_checkpoint(${upperMode})`);
+                if (result && Number(result.busy) === 1) {
+                    if (upperMode === 'TRUNCATE' || upperMode === 'FULL' || upperMode === 'RESTART') {
+                        throw new Error(`[CHECKPOINT_BUSY_BLOCKED] wal_checkpoint(${upperMode}) 遭遇鎖阻塞未完成 (busy: 1, log: ${result.log})`);
+                    } else {
+                        console.warn(`⚠️ [CHECKPOINT_BUSY] wal_checkpoint(${upperMode}) 部分幀被鎖阻塞:`, result);
+                    }
                 }
+                return result;
+            } finally {
+                this.#checkpointInProgress = false;
             }
-            return result;
         }, authType, capability);
+
+        if (deadlineAt === null) {
+            return scheduledCheckpoint;
+        }
+
+        const waitBudget = deadlineAt - Date.now();
+        if (waitBudget <= 0) {
+            scheduledCheckpoint.catch(() => {});
+            return Promise.reject(new Error(`[CHECKPOINT_TIMEOUT] wal_checkpoint(${upperMode}) 剩餘時間預算耗盡 (${waitBudget}ms)`));
+        }
+
+        return new Promise((resolve, reject) => {
+            const timerId = setTimeout(() => {
+                reject(new Error(`[CHECKPOINT_TIMEOUT] wal_checkpoint(${upperMode}) 未在剩餘時限 (${waitBudget}ms) 內完成 (status: ${JSON.stringify(this.getActiveStatus())})`));
+            }, waitBudget);
+
+            scheduledCheckpoint.then(
+                (res) => {
+                    clearTimeout(timerId);
+                    resolve(res);
+                },
+                (err) => {
+                    clearTimeout(timerId);
+                    reject(err);
+                }
+            );
+        });
     }
 
     setFatalError(err) {
@@ -520,22 +661,26 @@ class SQLiteAdapter {
             this.#acceptingNewTasks = false;
 
             const waitBudget = typeof timeoutMs === 'number' ? timeoutMs : null;
-            if (waitBudget && waitBudget > 0) {
-                let timerId = null;
-                const timeoutPromise = new Promise((_, reject) => {
-                    timerId = setTimeout(() => {
-                        reject(new Error(`[CLOSE_TIMEOUT] Scheduler 隊列未在時限 (${waitBudget}ms) 內清空`));
-                    }, waitBudget);
-                });
-                try {
-                    await Promise.race([
-                        this._schedulerQueue.catch(() => {}),
-                        timeoutPromise
-                    ]);
-                } catch (waitErr) {
-                    console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] ${waitErr.message}`);
-                } finally {
-                    if (timerId) clearTimeout(timerId);
+            if (waitBudget !== null) {
+                if (waitBudget > 0) {
+                    let timerId = null;
+                    const timeoutPromise = new Promise((_, reject) => {
+                        timerId = setTimeout(() => {
+                            reject(new Error(`[CLOSE_TIMEOUT] Scheduler 隊列未在時限 (${waitBudget}ms) 內清空`));
+                        }, waitBudget);
+                    });
+                    try {
+                        await Promise.race([
+                            this._schedulerQueue.catch(() => {}),
+                            timeoutPromise
+                        ]);
+                    } catch (waitErr) {
+                        console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] ${waitErr.message}`);
+                    } finally {
+                        if (timerId) clearTimeout(timerId);
+                    }
+                } else {
+                    console.warn(`⚠️ [ADAPTER_CLOSE_TIMEOUT] [CLOSE_TIMEOUT] 剩餘關閉時間預算不足 (${waitBudget}ms)，不啟動額外等待`);
                 }
             } else {
                 try {
@@ -553,7 +698,12 @@ class SQLiteAdapter {
         return this._closePromise;
     }
 
-    emergencyClose() {
+    emergencyClose(queueSafetyState = null) {
+        if (queueSafetyState && typeof queueSafetyState === 'object') {
+            if (queueSafetyState.inFlightCount > 0 || queueSafetyState.flushWorkerActive) {
+                throw new Error(`[EMERGENCY_CLOSE_REJECTED] WriteQueue 尚有 In-Flight 項目或 Flush Worker 運行中 (inFlight: ${queueSafetyState.inFlightCount}, flushWorkerActive: ${Boolean(queueSafetyState.flushWorkerActive)})`);
+            }
+        }
         if (!this.isQuiescent()) {
             throw new Error(`[EMERGENCY_CLOSE_REJECTED] Adapter 尚未達到靜止狀態 (isQuiescent: false, status: ${JSON.stringify(this.getActiveStatus())})`);
         }
@@ -562,7 +712,7 @@ class SQLiteAdapter {
 
     _rawClose() {
         return new Promise((resolve, reject) => {
-            if (this.isExecutingUnderlying || this.#activeTransactions > 0) {
+            if (this.isExecutingUnderlying || this.#activeTransactions > 0 || this.#checkpointInProgress || this.maintenanceInProgress) {
                 return reject(new Error('[RAW_CLOSE_REJECTED] 底層操作運行中禁止調用 _rawClose()'));
             }
             if (!this.db) {

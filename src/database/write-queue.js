@@ -67,6 +67,7 @@ class WriteQueue {
 
         this.flushTimer = null;
         this.isFlushing = false;
+        this.isDraining = false;
         this.lastError = null;
         this._shutdownGateClosed = false;
 
@@ -91,6 +92,13 @@ class WriteQueue {
         return this.retryPendingItems.size;
     }
 
+    /**
+     * 🌟 唯讀查詢 Flush / Drain Worker 是否正在活動執行中 (v2.7.5 P1)
+     */
+    isFlushWorkerActive() {
+        return Boolean(this.isFlushing || this.isDraining || this.#currentFlushPromise !== null);
+    }
+
     getMetrics() {
         const queuedCount = this.queue.length;
         const inFlightCount = this.#inFlightItems.size;
@@ -98,6 +106,7 @@ class WriteQueue {
         const uncommittedErrorCount = this.uncommittedErrors.length;
         const totalPending = queuedCount + retryPendingCount + inFlightCount;
         const totalUncommitted = totalPending + uncommittedErrorCount;
+        const flushWorkerActive = this.isFlushWorkerActive();
 
         const totalTrackedAccepted = (
             this.totalCommitted +
@@ -114,6 +123,7 @@ class WriteQueue {
             uncommittedErrorCount,
             totalPending,
             totalUncommitted,
+            flushWorkerActive,
             totalAccepted: this.totalAccepted,
             totalCommitted: this.totalCommitted,
             totalRejected: this.totalRejected,
@@ -611,88 +621,93 @@ class WriteQueue {
 
         // 實際排空工作 Worker Promise
         const drainWorkerPromise = (async () => {
-            while (this.queue.length > 0 || this.retryPendingItems.size > 0 || this.#inFlightItems.size > 0) {
-                if (Date.now() >= deadlineAt) {
-                    break;
-                }
-                // P0-3: 磁碟滿額或嚴重錯誤時立即中止 Drain，避免無限重試
-                if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
-                    break;
-                }
+            this.isDraining = true;
+            try {
+                while (this.queue.length > 0 || this.retryPendingItems.size > 0 || this.#inFlightItems.size > 0) {
+                    if (Date.now() >= deadlineAt) {
+                        break;
+                    }
+                    // P0-3: 磁碟滿額或嚴重錯誤時立即中止 Drain，避免無限重試
+                    if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                        break;
+                    }
 
-                // 🌟 P0-1: 嚴格遵守 Retry Backoff，僅提升已經到達重試時間的項目
-                if (this.retryPendingItems.size > 0) {
-                    const now = Date.now();
-                    const readyToRequeue = [];
-                    const expiredBudgetItems = [];
+                    // 🌟 P0-1: 嚴格遵守 Retry Backoff，僅提升已經到達重試時間的項目
+                    if (this.retryPendingItems.size > 0) {
+                        const now = Date.now();
+                        const readyToRequeue = [];
+                        const expiredBudgetItems = [];
 
-                    for (const item of this.retryPendingItems) {
-                        const rAt = item.retryAt || 0;
-                        if (rAt <= now) {
-                            readyToRequeue.push(item);
-                        } else if (rAt > deadlineAt) {
-                            expiredBudgetItems.push(item);
+                        for (const item of this.retryPendingItems) {
+                            const rAt = item.retryAt || 0;
+                            if (rAt <= now) {
+                                readyToRequeue.push(item);
+                            } else if (rAt > deadlineAt) {
+                                expiredBudgetItems.push(item);
+                            }
+                        }
+
+                        if (expiredBudgetItems.length > 0) {
+                            for (const item of expiredBudgetItems) {
+                                this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                                this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                            }
+                        }
+
+                        if (readyToRequeue.length > 0) {
+                            this._requeueRemainingBatchAtHead(readyToRequeue);
                         }
                     }
 
-                    if (expiredBudgetItems.length > 0) {
-                        for (const item of expiredBudgetItems) {
-                            this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
-                            this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                    if (this.queue.length > 0) {
+                        const batch = this.queue.splice(0, this.#config.batchSize);
+                        for (const item of batch) {
+                            this._transitionItem(item, ITEM_STATUS.IN_FLIGHT);
                         }
-                    }
-
-                    if (readyToRequeue.length > 0) {
-                        this._requeueRemainingBatchAtHead(readyToRequeue);
+                        try {
+                            await this._executeTopLevelBatch(batch, capability, deadlineAt);
+                        } catch (batchErr) {
+                            // 若遇到磁碟滿額或嚴重錯誤，立即中斷排空迴圈 (P0-3)
+                            if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                                break;
+                            }
+                        }
+                    } else if (this.retryPendingItems.size > 0) {
+                        // 佇列目前為空，但有尚未到達重試時間的 retryPendingItems
+                        // 有界等待至下一次重試到達或 deadline，嚴格禁止 busy-spin 或提前重試
+                        const now = Date.now();
+                        let nextRetryAt = deadlineAt;
+                        for (const item of this.retryPendingItems) {
+                            if (item.retryAt && item.retryAt < nextRetryAt) {
+                                nextRetryAt = item.retryAt;
+                            }
+                        }
+                        const waitMs = Math.min(Math.max(1, nextRetryAt - now), Math.max(0, deadlineAt - now));
+                        if (waitMs > 0) {
+                            await new Promise(r => setTimeout(r, Math.min(waitMs, 50)));
+                        }
+                    } else if (this.#inFlightItems.size > 0) {
+                        await new Promise(r => setTimeout(r, 20));
                     }
                 }
 
-                if (this.queue.length > 0) {
-                    const batch = this.queue.splice(0, this.#config.batchSize);
-                    for (const item of batch) {
-                        this._transitionItem(item, ITEM_STATUS.IN_FLIGHT);
-                    }
-                    try {
-                        await this._executeTopLevelBatch(batch, capability, deadlineAt);
-                    } catch (batchErr) {
-                        // 若遇到磁碟滿額或嚴重錯誤，立即中斷排空迴圈 (P0-3)
-                        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
-                            break;
-                        }
-                    }
-                } else if (this.retryPendingItems.size > 0) {
-                    // 佇列目前為空，但有尚未到達重試時間的 retryPendingItems
-                    // 有界等待至下一次重試到達或 deadline，嚴格禁止 busy-spin 或提前重試
-                    const now = Date.now();
-                    let nextRetryAt = deadlineAt;
-                    for (const item of this.retryPendingItems) {
-                        if (item.retryAt && item.retryAt < nextRetryAt) {
-                            nextRetryAt = item.retryAt;
-                        }
-                    }
-                    const waitMs = Math.min(Math.max(1, nextRetryAt - now), Math.max(0, deadlineAt - now));
-                    if (waitMs > 0) {
-                        await new Promise(r => setTimeout(r, Math.min(waitMs, 50)));
-                    }
-                } else if (this.#inFlightItems.size > 0) {
-                    await new Promise(r => setTimeout(r, 20));
-                }
+                const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
+                const hasErrors = this.uncommittedErrors.length > 0;
+                const isDiskFull = this.state === QUEUE_STATES.PAUSED_DISK_FULL;
+                const clean = (totalUncommitted === 0 && !isDiskFull);
+
+                return {
+                    isClean: clean,
+                    isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
+                    hasUncommittedErrors: hasErrors,
+                    isDiskFull,
+                    deadlineExpired: (Date.now() >= deadlineAt),
+                    uncommitted: totalUncommitted,
+                    adapterStatus: this.#adapter.getActiveStatus()
+                };
+            } finally {
+                this.isDraining = false;
             }
-
-            const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
-            const hasErrors = this.uncommittedErrors.length > 0;
-            const isDiskFull = this.state === QUEUE_STATES.PAUSED_DISK_FULL;
-            const clean = (totalUncommitted === 0 && !isDiskFull);
-
-            return {
-                isClean: clean,
-                isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
-                hasUncommittedErrors: hasErrors,
-                isDiskFull,
-                deadlineExpired: (Date.now() >= deadlineAt),
-                uncommitted: totalUncommitted,
-                adapterStatus: this.#adapter.getActiveStatus()
-            };
         })();
 
         try {
