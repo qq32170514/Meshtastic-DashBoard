@@ -103,6 +103,27 @@
 
 ---
 
+### 7. Meshtastic-DashBoard 4.0.1 — Database Bootstrap & Backup Integrity (Data Integrity Round 1)
+- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成啟動階段 Schema Initialization Barrier（P0）與 WAL 模式線上備份完整性整合（P1）。
+- **新增與修改模組**：
+  - [schema-bootstrap.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js)（新增）：
+    - 嚴格定義並依序執行：**Step 1 核心資料表建立（8 張表）** $\rightarrow$ **Step 2 欄位擴充 Migration（26 個欄位，`PRAGMA table_info` 預檢 + 型別相容性檢查 + 錯誤分類，禁止以空回呼吞錯）** $\rightarrow$ **Step 3 清理廢棄索引（5 個）** $\rightarrow$ **Step 4 建立必要索引（11 個，位於 Migration 後確保 `gateway_id` 與 `hops_away` 已存在）** $\rightarrow$ **Step 5 最終 Schema Verification（`verifyDatabaseSchema`）**。
+  - [backup-manager.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)：
+    - 強化 `verifyIntegrity()`（檢查檔案存在、`stats.size > 0`、`OPEN_READONLY` 與 `PRAGMA integrity_check === 'ok'`）。
+    - 強化 `performBackup()`（`#backupInProgress` 防重疊鎖、同名目標檔 `.staging` 保護、`VACUUM INTO` 半成品自動清理、`lastBackupError` / `lastBackupResult` 狀態追蹤）。
+    - 強化 `_rotateOldBackups()`（僅計入與清理已驗證成功的備份、保護進行中備份、由舊到新依序清理、**絕不刪除唯一可用備份**）。
+    - 新增 `restoreFromBackup(backupFilePath, targetRestoreDbPath)` 獨立還原與完整性驗證流程。
+    - 新增 `triggerScheduledBackup()`、`startSchedule()`、`stopSchedule()` 防重疊排程管理。
+  - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
+    - 新增 `isSchemaReady`、`bootstrapError`、`schemaReport`、`isBootstrapReady()` 與 `executeWithStartupBarrier()`。
+    - 移除 `index.js` 頂層未等待的 `db.serialize()` DDL 與 `(err) => {}` 空回呼，以及頂層過早執行的 `cleanupOldData()`；統一由 `startServer()` 等待 `db.readyPromise` 與 `db.isBootstrapReady()` 後才啟動 HTTP/API、Socket.IO、MQTT 與背景清理工作者。
+    - 移除 `index.js` 中 WAL 模式下不安全的 `fs.copyFileSync(sourceDbPath, targetBackupPath)`，正式串接 `db.backupManager.startSchedule('0 0 * * 0', ...)`，並於 `handleShutdown()` 停止備份排程。
+- **測試與文件**：
+  - 新增 [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Test A 至 Test M 共 13 項測試），連同既有 46 項測試共 **59 項測試全數通過（59 passed, 0 failed）**。
+  - 新增技術文件 [DATA_INTEGRITY_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/DATA_INTEGRITY_GUIDE.md)。
+
+---
+
 ## 📋 待辦事項與後續擴充方向 (Backlog)
 
 1. **單站與全台覆蓋圖層連動**：

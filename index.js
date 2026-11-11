@@ -680,207 +680,151 @@ if (process.env.TURSO_URL) {
         serialize: (fn) => fn()
     };
     console.log(`☁️ 已連線至 Turso 雲端資料庫`);
+    db.serialize(() => {
+        db.run(`
+            CREATE TABLE IF NOT EXISTS telemetry_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                battery_level REAL,
+                voltage REAL,
+                temperature REAL,
+                humidity REAL,
+                channel_utilization REAL,
+                air_util_tx REAL,
+                snr REAL,
+                rssi REAL,
+                current REAL,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                adc_voltage REAL
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                long_name TEXT,
+                short_name TEXT,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                latitude REAL,
+                longitude REAL,
+                is_favorite INTEGER DEFAULT 0,
+                last_topic TEXT,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                role TEXT,
+                channel TEXT,
+                hw_model TEXT,
+                battery_level REAL,
+                voltage REAL,
+                current REAL,
+                temperature REAL,
+                humidity REAL,
+                firmware_version TEXT,
+                firmware_build_num TEXT,
+                last_gateway TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS packet_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                portnum TEXT,
+                topic TEXT,
+                gateway_id TEXT,
+                snr REAL,
+                rssi REAL,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                payload_json TEXT,
+                raw_hex TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS neighbors (
+                node_id TEXT,
+                neighbor_id TEXT,
+                snr REAL,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(node_id, neighbor_id)
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message TEXT,
+                channel_name TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS packets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                lat REAL,
+                lon REAL,
+                snr REAL,
+                source TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS daily_analytics_summary (
+                date TEXT PRIMARY KEY,
+                active_count INTEGER DEFAULT 0,
+                ghost_count INTEGER DEFAULT 0,
+                snr_sum REAL DEFAULT 0,
+                snr_count INTEGER DEFAULT 0,
+                rssi_sum REAL DEFAULT 0,
+                rssi_count INTEGER DEFAULT 0,
+                temp_sum REAL DEFAULT 0,
+                temp_count INTEGER DEFAULT 0,
+                hum_sum REAL DEFAULT 0,
+                hum_count INTEGER DEFAULT 0,
+                position_count INTEGER DEFAULT 0,
+                telemetry_count INTEGER DEFAULT 0,
+                text_count INTEGER DEFAULT 0,
+                routing_count INTEGER DEFAULT 0,
+                other_count INTEGER DEFAULT 0,
+                hop0_count INTEGER DEFAULT 0,
+                hop1_count INTEGER DEFAULT 0,
+                hop2_count INTEGER DEFAULT 0,
+                hop3_count INTEGER DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS cwa_weather_stations (
+                station_id TEXT PRIMARY KEY,
+                station_name TEXT,
+                county TEXT,
+                town TEXT,
+                latitude REAL,
+                longitude REAL,
+                temperature REAL,
+                humidity REAL,
+                weather TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)`);
+    });
 } else {
     const { initDatabaseSubsystemSync } = require('./src/database');
     const dbPath = path.join(__dirname, 'meshtastic.db');
-    db = initDatabaseSubsystemSync({ dbPath });
-    console.log(`🗄️ 本地資料庫連線初始化成功 (SQLite Reliability v2.7.1): ${dbPath}`);
-}
-
-db.serialize(() => {
-    // 🚀 PRAGMA 設定由 src/database/sqlite.config.js 統一管理並在 Adapter 初始化時驗證讀回 (P1-2, P1-05)
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS telemetry_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            battery_level REAL,
-            voltage REAL,
-            temperature REAL,
-            humidity REAL,
-            channel_utilization REAL,
-            air_util_tx REAL,
-            snr REAL,
-            rssi REAL,
-            current REAL,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            adc_voltage REAL
-        )
-    `);
-    // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
-    db.run(`
-        CREATE TABLE IF NOT EXISTS nodes (
-            node_id TEXT PRIMARY KEY,
-            long_name TEXT,
-            short_name TEXT,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            latitude REAL,
-            longitude REAL,
-            is_favorite INTEGER DEFAULT 0,
-            last_topic TEXT,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            role TEXT,
-            channel TEXT,
-            hw_model TEXT,
-            battery_level REAL,
-            voltage REAL,
-            current REAL,
-            temperature REAL,
-            humidity REAL,
-            firmware_version TEXT,
-            firmware_build_num TEXT,
-            last_gateway TEXT
-        )
-    `);
-    // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
-    db.run(`
-        CREATE TABLE IF NOT EXISTS packet_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            portnum TEXT,
-            topic TEXT,
-            gateway_id TEXT,
-            snr REAL,
-            rssi REAL,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            payload_json TEXT,
-            raw_hex TEXT
-        )
-    `);
-    // 新增 neighbors 資料表，紀錄節點間的鄰居關係 (拓撲核心)
-    db.run(`
-        CREATE TABLE IF NOT EXISTS neighbors (
-            node_id TEXT,
-            neighbor_id TEXT,
-            snr REAL,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(node_id, neighbor_id)
-        )
-    `);
-    // 新增 chat_messages 資料表，專門儲存解密後的文字訊息
-    db.run(`
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            message TEXT,
-            channel_name TEXT
-        )
-    `);
-    // 🚀 核心升級：實體 RF 攔截專用表 (支援多來源標記)
-    db.run(`
-        CREATE TABLE IF NOT EXISTS packets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            lat REAL,
-            lon REAL,
-            snr REAL,
-            source TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS daily_analytics_summary (
-            date TEXT PRIMARY KEY,
-            active_count INTEGER DEFAULT 0,
-            ghost_count INTEGER DEFAULT 0,
-            snr_sum REAL DEFAULT 0,
-            snr_count INTEGER DEFAULT 0,
-            rssi_sum REAL DEFAULT 0,
-            rssi_count INTEGER DEFAULT 0,
-            temp_sum REAL DEFAULT 0,
-            temp_count INTEGER DEFAULT 0,
-            hum_sum REAL DEFAULT 0,
-            hum_count INTEGER DEFAULT 0,
-            position_count INTEGER DEFAULT 0,
-            telemetry_count INTEGER DEFAULT 0,
-            text_count INTEGER DEFAULT 0,
-            routing_count INTEGER DEFAULT 0,
-            other_count INTEGER DEFAULT 0,
-            hop0_count INTEGER DEFAULT 0,
-            hop1_count INTEGER DEFAULT 0,
-            hop2_count INTEGER DEFAULT 0,
-            hop3_count INTEGER DEFAULT 0,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS cwa_weather_stations (
-            station_id TEXT PRIMARY KEY,
-            station_name TEXT,
-            county TEXT,
-            town TEXT,
-            latitude REAL,
-            longitude REAL,
-            temperature REAL,
-            humidity REAL,
-            weather TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)`);
-
-    const cols = [
-        { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
-        { t: 'nodes', c: 'last_topic', d: 'TEXT' },
-        { t: 'packet_logs', c: 'gateway_id', d: 'TEXT' },
-        { t: 'telemetry_data', c: 'current', d: 'REAL' },
-        { t: 'packet_logs', c: 'hop_limit', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'hop_start', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'payload_json', d: 'TEXT' },
-        { t: 'packet_logs', c: 'raw_hex', d: 'TEXT' },
-        { t: 'nodes', c: 'hop_limit', d: 'INTEGER' },
-        { t: 'nodes', c: 'hop_start', d: 'INTEGER' },
-        { t: 'nodes', c: 'role', d: 'TEXT' },
-        { t: 'nodes', c: 'channel', d: 'TEXT' },
-        { t: 'nodes', c: 'hw_model', d: 'TEXT' },
-        { t: 'nodes', c: 'battery_level', d: 'REAL' },
-        { t: 'nodes', c: 'voltage', d: 'REAL' },
-        { t: 'nodes', c: 'current', d: 'REAL' },
-        { t: 'nodes', c: 'temperature', d: 'REAL' },
-        { t: 'nodes', c: 'humidity', d: 'REAL' },
-        { t: 'nodes', c: 'firmware_version', d: 'TEXT' },
-        { t: 'nodes', c: 'firmware_build_num', d: 'TEXT' },
-        { t: 'nodes', c: 'last_gateway', d: 'TEXT' },
-        { t: 'packet_logs', c: 'latitude', d: 'REAL' },
-        { t: 'packet_logs', c: 'longitude', d: 'REAL' },
-        { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'source', d: 'TEXT' }, // 🚀 新增：標記封包來源 (MQTT 或 RF 隧道)
-        { t: 'telemetry_data', c: 'adc_voltage', d: 'REAL' } // 🚀 新增：保留 ADC 電壓
-    ];
-    cols.forEach(col => {
-        db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => { });
+    const configuredBackupDir = process.env.BACKUP_PATH || path.join(__dirname, 'backups');
+    // 🛡️ 4.0.1 P0: 啟用 bootstrapSchema: true，將 Table DDL、Column Migration、Index 建立與 Schema Verification 全數納入 db.readyPromise 屏障
+    db = initDatabaseSubsystemSync({
+        dbPath,
+        backupDir: configuredBackupDir,
+        bootstrapSchema: true
     });
-    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)`);
-
-    // 🛡️ 效能優化 (Phase 1)：安全卸載無用、重複或引發 TEMP B-TREE 排序的大型索引
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_rawhex_ts`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_port_ts`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_node_id`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_gateway`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_source_timestamp`);
-
-    // 🚀 保留核心索引 (覆蓋最左前綴原則，無重複冗餘)
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)`);
-
-    // 聊天紀錄效能優化
-    db.run(`CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)`);
-});
+    console.log(`🗄️ 本地資料庫子系統已掛載，正在執行初始化與 Schema Initialization Barrier (4.0.1): ${dbPath}`);
+}
 
 // 🛸 輔助映射：將前端名稱對應回 Protobuf ID，確保 API 查詢正確
 const PORT_NAME_TO_ID = {
@@ -904,33 +848,44 @@ const PORT_NAME_TO_ID = {
 const DATA_RETENTION_DAYS = 90; // 🚀 保留 90 天 (3 個月)
 
 function cleanupOldData() {
+    if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+        return;
+    }
     const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     // 聊天紀錄保留 90 天
     const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
 
     db.run(sql, function (err) {
-        if (err) console.error('❌ 清理舊資料失敗:', err.message);
+        if (err) console.error('❌ 清理舊資料失敗 (telemetry_data):', err.message);
         else if (this.changes > 0) {
             console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 90 天的舊資料`);
         }
     });
-    db.run(sqlPackets);
-    db.run(sqlChat);
+    db.run(sqlPackets, function (err) {
+        if (err) console.error('❌ 清理舊資料失敗 (packet_logs):', err.message);
+    });
+    db.run(sqlChat, function (err) {
+        if (err) console.error('❌ 清理舊資料失敗 (chat_messages):', err.message);
+    });
 }
 
-// 每小時執行一次清理
-setInterval(cleanupOldData, 60 * 60 * 1000);
-cleanupOldData(); // 啟動時先執行一次
+function startDatabaseMaintenanceWorkers() {
+    cleanupOldData();
+    setInterval(cleanupOldData, 60 * 60 * 1000);
 
-// 🚀 效能維護：每 15 分鐘執行一次被動 WAL Checkpoint，防止 WAL 檔案無限制膨脹至數百 MB
-setInterval(() => {
-    if (db && typeof db.run === 'function') {
-        db.run('PRAGMA wal_checkpoint(PASSIVE)', (err) => {
-            if (err) console.error('⚠️ [WAL] Passive checkpoint warning:', err.message);
-        });
-    }
-}, 15 * 60 * 1000);
+    // 🚀 效能維護：每 15 分鐘執行一次被動 WAL Checkpoint，防止 WAL 檔案無限制膨脹至數百 MB
+    setInterval(() => {
+        if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+            return;
+        }
+        if (db && typeof db.run === 'function') {
+            db.run('PRAGMA wal_checkpoint(PASSIVE)', (err) => {
+                if (err) console.error('⚠️ [WAL] Passive checkpoint warning:', err.message);
+            });
+        }
+    }, 15 * 60 * 1000);
+}
 
 // ==========================================
 // 1.5 API 路由設定 (提供給前端)
@@ -2853,6 +2808,7 @@ function fetchCwaSolarData() {
 
 // 每 15 分鐘自動刷新中央氣象署氣象與日射資料
 cron.schedule('*/15 * * * *', () => {
+    if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) return;
     fetchAndSaveCWAData();
     fetchCwaSolarData();
 });
@@ -3940,17 +3896,21 @@ app.get('/api/analytics/bundle', async (req, res) => {
     }
 });
 
-// 啟動 Express 伺服器 (P1-4: 確保資料庫初始化完成才開啟通訊埠)
+// 啟動 Express 伺服器 (P1-4 & 4.0.1 P0: 確保資料庫初始化、PRAGMA 驗證與 Schema Initialization Barrier 全數完成才開啟通訊埠與背景工作者)
 async function startServer() {
     try {
         if (db && db.readyPromise) {
             await db.readyPromise;
-            console.log('✅ [BOOTSTRAP] 資料庫子系統初始化與 PRAGMA 驗證完成，準備開啟服務埠');
+            if (typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+                throw db.bootstrapError || new Error('[BOOTSTRAP_BARRIER_FAILED] Schema Initialization Barrier 未通過');
+            }
+            console.log('✅ [BOOTSTRAP] 資料庫子系統初始化、PRAGMA 驗證與 Schema Initialization Barrier 全數完成，準備開啟服務埠');
         }
 
         server.listen(PORT, () => {
             console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
             console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
+            startDatabaseMaintenanceWorkers();
             bootstrapAnalyticsSummary();
             fetchAndSaveCWAData();
             fetchCwaSolarData();
@@ -3968,7 +3928,7 @@ async function startServer() {
             setInterval(warmCache, 3 * 60 * 1000);
         });
     } catch (bootErr) {
-        console.error('❌ [FATAL_BOOTSTRAP_ERROR] 資料庫初始化失敗，拒絕啟動伺服器與相關模組:', bootErr.message);
+        console.error('❌ [FATAL_BOOTSTRAP_ERROR] 資料庫或 Schema 初始化失敗，拒絕啟動伺服器與相關模組:', bootErr.message);
         process.exit(1);
     }
 }
@@ -4129,10 +4089,13 @@ root.load([
     (async () => {
         try {
             if (db && db.readyPromise) await db.readyPromise;
+            if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+                throw db.bootstrapError || new Error('[BOOTSTRAP_BARRIER_FAILED] Schema Initialization Barrier 未通過');
+            }
             console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
             startMqttClient();
         } catch (dbErr) {
-            console.error('❌ [MQTT_BOOT_ABORT] 資料庫尚未就緒，取消 MQTT 啟動:', dbErr.message);
+            console.error('❌ [MQTT_BOOT_ABORT] 資料庫或 Schema 尚未就緒，取消 MQTT 啟動:', dbErr.message);
         }
     })();
 });
@@ -4548,61 +4511,26 @@ function startMqttClient() {
 }
 
 // ==========================================
-// 💾 4. 每 12 小時自動備份資料庫至雲端
+// 💾 4. 自動備份資料庫至雲端 (4.0.1 P1: 正式整合 BackupManager WAL 一致性備份)
+//    註：保留既有實際 Cron 表達式 '0 0 * * 0' (每週日 00:00)；舊版註解「每 12 小時」與 sqlite.config.js 之 '0 4 * * *' 差異列為待確認事項
 // ==========================================
-cron.schedule('0 0 * * 0', () => {
-    // 原始資料庫路徑
-    const sourceDbPath = path.join(__dirname, 'meshtastic.db');
-
-    // 雲端環境適應：從環境變數讀取備份路徑，若無則不執行備份
-    const googleDrivePath = process.env.BACKUP_PATH;
-
-    if (!googleDrivePath) return;
-
-    // 如果資料夾不存在，就自動建立
-    if (!fs.existsSync(googleDrivePath)) {
-        fs.mkdirSync(googleDrivePath, { recursive: true });
-    }
-
-    // 取得今天的日期作為檔名後綴
-    const dateStr = new Date().toISOString().slice(0, 10);
-    const backupFileName = `meshtastic_backup_${dateStr}.db`;
-    const targetBackupPath = path.join(googleDrivePath, backupFileName);
-
-    try {
-        // 執行檔案複製 (靜態副本)
-        fs.copyFileSync(sourceDbPath, targetBackupPath);
-        console.log(`\n📦 [雲端備份成功] ${new Date().toLocaleString()} - 資料庫已安全複製至: ${backupFileName}`);
-
-        // 🧹 清理 30 天以前的舊備份
-        try {
-            const files = fs.readdirSync(googleDrivePath);
-            const now = new Date();
-            const maxAgeMs = 30 * 24 * 60 * 60 * 1000; // 30 天的毫秒數
-
-            files.forEach(file => {
-                const match = file.match(/^meshtastic_backup_(\d{4}-\d{2}-\d{2})\.db$/);
-                if (match) {
-                    const fileDateStr = match[1];
-                    const fileDate = new Date(fileDateStr);
-                    if (!isNaN(fileDate.getTime())) {
-                        const ageMs = now - fileDate;
-                        if (ageMs > maxAgeMs) {
-                            const oldFilePath = path.join(googleDrivePath, file);
-                            fs.unlinkSync(oldFilePath);
-                            console.log(`🧹 [備份清理] 已刪除 30 天前舊備份: ${file}`);
-                        }
-                    }
-                }
-            });
-        } catch (cleanErr) {
-            console.error('❌ [備份清理失敗] 發生錯誤:', cleanErr);
-        }
-
-    } catch (err) {
-        console.error('\n❌ [雲端備份失敗] 發生錯誤:', err);
-    }
-});
+if (db && db.backupManager) {
+    db.backupManager.startSchedule('0 0 * * 0', cron, {
+        shouldRun: () => {
+            const googleDrivePath = process.env.BACKUP_PATH;
+            if (!googleDrivePath) return false;
+            if (typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) return false;
+            return true;
+        },
+        fileNameProvider: () => {
+            const dateStr = new Date().toISOString().slice(0, 10);
+            return `meshtastic_backup_${dateStr}.db`;
+        },
+        optionsProvider: () => ({
+            backupDir: process.env.BACKUP_PATH
+        })
+    });
+}
 
 // ==========================================
 // 🔌 系統關閉訊號監聽
@@ -4619,6 +4547,9 @@ function handleShutdown(signal) {
         });
     } catch (err) {
         console.error('Failed to log shutdown event:', err);
+    }
+    if (db && db.backupManager) {
+        db.backupManager.stopSchedule();
     }
     if (db && db.shutdownHandler) {
         db.shutdownHandler.handle(signal, { exitProcess: true });

@@ -3,15 +3,52 @@ const { SQLiteAdapter, ADAPTER_STATES, AUTH_TYPES } = require('./sqlite.adapter'
 const { WriteQueue, QUEUE_STATES, ITEM_STATUS } = require('./write-queue');
 const { ShutdownHandler } = require('./shutdown-handler');
 const { BackupManager, BACKUP_VERIFY_STATUS } = require('./backup-manager');
+const {
+    REQUIRED_TABLES,
+    COLUMN_MIGRATIONS,
+    OBSOLETE_INDEXES,
+    REQUIRED_INDEXES,
+    getTableColumns,
+    verifyDatabaseSchema,
+    bootstrapDatabaseSchema
+} = require('./schema-bootstrap');
 const defaultConfig = require('./sqlite.config');
 
 function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
-    return {
+    const compat = {
         // 子系統核心組件
         adapter,
         writeQueue,
         shutdownHandler,
         backupManager,
+
+        // 4.0.1 P0: Schema Initialization Barrier 狀態追蹤
+        isSchemaReady: false,
+        bootstrapError: null,
+        schemaReport: null,
+
+        isBootstrapReady() {
+            return Boolean(
+                adapter.state === ADAPTER_STATES.READY &&
+                this.isSchemaReady === true &&
+                this.bootstrapError === null
+            );
+        },
+
+        async bootstrapSchema(schemaOptions = {}) {
+            try {
+                const report = await bootstrapDatabaseSchema(adapter, schemaOptions);
+                this.schemaReport = report;
+                this.isSchemaReady = true;
+                this.bootstrapError = null;
+                return report;
+            } catch (err) {
+                this.isSchemaReady = false;
+                this.bootstrapError = err;
+                adapter.setFatalError(err);
+                throw err;
+            }
+        },
 
         // 傳統 sqlite3.Database 相容方法 (P1-3: Callback Exactly-Once 防重調用)
         run(sql, paramsOrCb, maybeCb) {
@@ -111,6 +148,7 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
         },
 
         close(callback) {
+            backupManager.stopSchedule();
             let callbackCalled = false;
             return shutdownHandler.handle('MANUAL_CLOSE', { exitProcess: false }).then(
                 () => {
@@ -146,17 +184,74 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
             };
         }
     };
+
+    return compat;
 }
 
 /**
- * 建立資料庫子系統 (Database Subsystem Factory - P0-1)
- * 進行安全一次性握手，嚴格封裝 Shutdown Authority
+ * 4.0.1 P0: 啟動屏障協調器 (Initialization Barrier Coordinator)
+ * 確保唯有在 SQLite Adapter 初始化、PRAGMA 驗證、Schema DDL、Column Migration 與 Schema Verification
+ * 全部成功通過屏障後，才允許啟動 HTTP / REST API / Socket.IO / MQTT 與背景工作者。
+ */
+async function executeWithStartupBarrier(dbSubsystem, services = {}) {
+    if (!dbSubsystem) {
+        throw new Error('[STARTUP_BARRIER_ERROR] dbSubsystem 為必填');
+    }
+
+    if (dbSubsystem.readyPromise) {
+        await dbSubsystem.readyPromise;
+    }
+
+    if (dbSubsystem.adapter && dbSubsystem.adapter.state !== ADAPTER_STATES.READY) {
+        throw new Error(
+            `[STARTUP_BARRIER_REJECTED] SQLite Adapter 狀態非 READY (${dbSubsystem.adapter.state})`
+        );
+    }
+
+    if (dbSubsystem.bootstrapError) {
+        throw dbSubsystem.bootstrapError;
+    }
+
+    if (dbSubsystem.isSchemaReady !== true) {
+        throw new Error('[STARTUP_BARRIER_REJECTED] Schema Initialization Barrier 尚未完成');
+    }
+
+    const startedServices = [];
+
+    if (typeof services.startHttp === 'function') {
+        await services.startHttp();
+        startedServices.push('HTTP_API');
+    }
+    if (typeof services.startSocketIo === 'function') {
+        await services.startSocketIo();
+        startedServices.push('SOCKET_IO');
+    }
+    if (typeof services.startMqtt === 'function') {
+        await services.startMqtt();
+        startedServices.push('MQTT');
+    }
+    if (typeof services.startBackgroundWorkers === 'function') {
+        await services.startBackgroundWorkers();
+        startedServices.push('BACKGROUND_WORKERS');
+    }
+
+    return {
+        barrierPassed: true,
+        startedServices
+    };
+}
+
+/**
+ * 建立資料庫子系統 (Database Subsystem Factory - P0-1 & 4.0.1 P0)
+ * 進行安全一次性握手，嚴格封裝 Shutdown Authority 與選配之 Schema Initialization Barrier
  */
 async function createDatabaseSubsystem(options = {}) {
     const {
         dbPath,
         backupDir,
-        config = {}
+        config = {},
+        bootstrapSchema = false,
+        schemaOptions = {}
     } = options;
 
     if (!dbPath) {
@@ -180,22 +275,29 @@ async function createDatabaseSubsystem(options = {}) {
         config: mergedConfig.shutdown
     });
     const backupManager = new BackupManager(adapter, backupDir, mergedConfig.backup);
+    const dbCompat = _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager);
 
     await adapter.initialize(dbPath);
 
-    return _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager);
+    if (bootstrapSchema) {
+        await dbCompat.bootstrapSchema(schemaOptions);
+    }
+
+    dbCompat.readyPromise = Promise.resolve(dbCompat);
+    return dbCompat;
 }
 
 /**
- * @deprecated 由於 SQLite 初始化與 PRAGMA 驗證本質為非同步，同步工廠無法保證回傳時資料庫已就緒。
- * 主應用或模組強烈建議改用 async createDatabaseSubsystem(options)。
- * 若使用本方法，可透過回傳物件的 readyPromise 確保初始化完成；若失敗將自動觸發 setFatalError。
+ * 同步取得相容層包裝，並將 Adapter 初始化、PRAGMA 驗證與 Schema Initialization Barrier
+ * 統一納入回傳物件的 readyPromise 屏障中 (4.0.1 P0)
  */
 function initDatabaseSubsystemSync(options = {}) {
     const {
         dbPath,
         backupDir,
-        config = {}
+        config = {},
+        bootstrapSchema = false,
+        schemaOptions = {}
     } = options;
 
     if (!dbPath) {
@@ -219,14 +321,22 @@ function initDatabaseSubsystemSync(options = {}) {
         config: mergedConfig.shutdown
     });
     const backupManager = new BackupManager(adapter, backupDir, mergedConfig.backup);
-
-    const readyPromise = adapter.initialize(dbPath).catch((err) => {
-        console.error('❌ [DATABASE_SUBSYSTEM] 初始化失敗:', err.message);
-        adapter.setFatalError(err);
-        throw err;
-    });
-
     const dbCompat = _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager);
+
+    const readyPromise = (async () => {
+        try {
+            await adapter.initialize(dbPath);
+            if (bootstrapSchema) {
+                await dbCompat.bootstrapSchema(schemaOptions);
+            }
+            return dbCompat;
+        } catch (err) {
+            console.error('❌ [DATABASE_SUBSYSTEM] 初始化或 Schema 屏障失敗:', err.message);
+            adapter.setFatalError(err);
+            throw err;
+        }
+    })();
+
     dbCompat.readyPromise = readyPromise;
     return dbCompat;
 }
@@ -234,6 +344,14 @@ function initDatabaseSubsystemSync(options = {}) {
 module.exports = {
     createDatabaseSubsystem,
     initDatabaseSubsystemSync,
+    executeWithStartupBarrier,
+    bootstrapDatabaseSchema,
+    verifyDatabaseSchema,
+    getTableColumns,
+    REQUIRED_TABLES,
+    COLUMN_MIGRATIONS,
+    OBSOLETE_INDEXES,
+    REQUIRED_INDEXES,
     SQLiteAdapter,
     ADAPTER_STATES,
     AUTH_TYPES,
