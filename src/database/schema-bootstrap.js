@@ -224,17 +224,126 @@ const OBSOLETE_INDEXES = [
 ];
 
 const REQUIRED_INDEXES = [
-    { name: 'idx_packets_timestamp', table: 'packets', ddl: 'CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)' },
-    { name: 'idx_nodes_last_seen', table: 'nodes', ddl: 'CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)' },
-    { name: 'idx_cwa_lat_lng', table: 'cwa_weather_stations', ddl: 'CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)' },
-    { name: 'idx_telemetry_timestamp', table: 'telemetry_data', ddl: 'CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)' },
-    { name: 'idx_telemetry_node_timestamp', table: 'telemetry_data', ddl: 'CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)' },
-    { name: 'idx_packet_logs_timestamp', table: 'packet_logs', ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)' },
-    { name: 'idx_packet_logs_node_timestamp', table: 'packet_logs', ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)' },
-    { name: 'idx_packet_logs_portnum_timestamp', table: 'packet_logs', ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)' },
-    { name: 'idx_packet_logs_gw_ts', table: 'packet_logs', ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)' },
-    { name: 'idx_packet_logs_ts_hops', table: 'packet_logs', ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)' },
-    { name: 'idx_chat_channel_timestamp', table: 'chat_messages', ddl: 'CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)' }
+    {
+        name: 'idx_packets_timestamp',
+        table: 'packets',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [{ name: 'timestamp', order: 'DESC' }],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)'
+    },
+    {
+        name: 'idx_nodes_last_seen',
+        table: 'nodes',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [{ name: 'last_seen', order: 'DESC' }],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)'
+    },
+    {
+        name: 'idx_cwa_lat_lng',
+        table: 'cwa_weather_stations',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'latitude', order: 'ASC' },
+            { name: 'longitude', order: 'ASC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)'
+    },
+    {
+        name: 'idx_telemetry_timestamp',
+        table: 'telemetry_data',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [{ name: 'timestamp', order: 'DESC' }],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)'
+    },
+    {
+        name: 'idx_telemetry_node_timestamp',
+        table: 'telemetry_data',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'node_id', order: 'ASC' },
+            { name: 'timestamp', order: 'DESC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)'
+    },
+    {
+        name: 'idx_packet_logs_timestamp',
+        table: 'packet_logs',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [{ name: 'timestamp', order: 'DESC' }],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)'
+    },
+    {
+        name: 'idx_packet_logs_node_timestamp',
+        table: 'packet_logs',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'node_id', order: 'ASC' },
+            { name: 'timestamp', order: 'DESC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)'
+    },
+    {
+        name: 'idx_packet_logs_portnum_timestamp',
+        table: 'packet_logs',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'portnum', order: 'ASC' },
+            { name: 'timestamp', order: 'DESC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)'
+    },
+    {
+        name: 'idx_packet_logs_gw_ts',
+        table: 'packet_logs',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'gateway_id', order: 'ASC' },
+            { name: 'timestamp', order: 'DESC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)'
+    },
+    {
+        name: 'idx_packet_logs_ts_hops',
+        table: 'packet_logs',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'timestamp', order: 'DESC' },
+            { name: 'hops_away', order: 'ASC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)'
+    },
+    {
+        name: 'idx_chat_channel_timestamp',
+        table: 'chat_messages',
+        unique: false,
+        partial: false,
+        whereClause: null,
+        columns: [
+            { name: 'channel_name', order: 'ASC' },
+            { name: 'timestamp', order: 'DESC' }
+        ],
+        ddl: 'CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)'
+    }
 ];
 
 const IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -243,6 +352,48 @@ function assertValidIdentifier(ident, context) {
     if (!ident || typeof ident !== 'string' || !IDENTIFIER_REGEX.test(ident)) {
         throw new Error(`[SCHEMA_INVALID_IDENTIFIER] 非法的 SQL 識別字 (${context}): ${String(ident)}`);
     }
+}
+
+/**
+ * 解析索引預期定義 metadata (優先使用 idxSpec 明確宣告之欄位，若為自訂測試規格則由 DDL 解析)
+ */
+function _resolveExpectedIndexMetadata(idxSpec) {
+    const ddl = String(idxSpec.ddl || '').trim();
+    const isUniqueFromDdl = /^CREATE\s+UNIQUE\s+INDEX\b/i.test(ddl);
+    const whereMatch = ddl.match(/\)\s*WHERE\s+(.+)$/i);
+    const whereFromDdl = whereMatch ? whereMatch[1].trim().replace(/\s+/g, ' ') : null;
+
+    let columns = Array.isArray(idxSpec.columns) ? idxSpec.columns : null;
+    if (!columns && ddl) {
+        const parenMatch = ddl.match(/ON\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]+)\)/i);
+        if (parenMatch) {
+            columns = parenMatch[1].split(',').map(part => {
+                const tokens = part.trim().split(/\s+/);
+                const colName = tokens[0];
+                let order = 'ASC';
+                let collation = 'BINARY';
+                for (let i = 1; i < tokens.length; i++) {
+                    const upper = tokens[i].toUpperCase();
+                    if (upper === 'ASC' || upper === 'DESC') {
+                        order = upper;
+                    } else if (upper === 'COLLATE' && tokens[i + 1]) {
+                        collation = tokens[i + 1].toUpperCase();
+                        i++;
+                    }
+                }
+                return { name: colName, order, collation };
+            });
+        }
+    }
+
+    return {
+        name: idxSpec.name,
+        table: idxSpec.table,
+        unique: typeof idxSpec.unique === 'boolean' ? idxSpec.unique : isUniqueFromDdl,
+        partial: typeof idxSpec.partial === 'boolean' ? idxSpec.partial : Boolean(whereFromDdl),
+        whereClause: idxSpec.whereClause !== undefined ? idxSpec.whereClause : whereFromDdl,
+        columns: columns || []
+    };
 }
 
 /**
@@ -255,25 +406,195 @@ async function getTableColumns(adapter, tableName) {
 }
 
 /**
- * 驗證所有必要資料表、欄位與索引皆已完整存在
+ * 4.0.1.1 P2: 使用 SQLite 原生 PRAGMA (index_list, index_xinfo, index_info) 與 sqlite_master.sql
+ * 完整驗證單一索引之存在性、所屬資料表、欄位名稱、欄位順序、ASC/DESC 排序、UNIQUE 屬性與 Partial WHERE 條件
+ */
+async function verifySingleIndexDefinition(adapter, idxSpec, masterIndexMap, tableIndexListCache) {
+    assertValidIdentifier(idxSpec.name, 'indexSpec.name');
+    const expected = _resolveExpectedIndexMetadata(idxSpec);
+    if (expected.table) {
+        assertValidIdentifier(expected.table, 'indexSpec.table');
+    }
+
+    const masterEntry = masterIndexMap.get(String(expected.name).toLowerCase());
+    if (!masterEntry) {
+        return { exists: false, valid: false, mismatches: [] };
+    }
+
+    const mismatches = [];
+
+    // 1. 驗證索引所屬資料表 (sqlite_master.tbl_name)
+    if (
+        expected.table &&
+        String(masterEntry.tbl_name || '').toLowerCase() !== String(expected.table).toLowerCase()
+    ) {
+        mismatches.push({
+            index: expected.name,
+            reason: 'TABLE_MISMATCH',
+            expectedTable: expected.table,
+            actualTable: masterEntry.tbl_name
+        });
+        return { exists: true, valid: false, mismatches };
+    }
+
+    // 2. 透過 PRAGMA index_list(table_name) 驗證 UNIQUE 與 Partial 屬性
+    const targetTable = expected.table || masterEntry.tbl_name;
+    let indexList = tableIndexListCache.get(targetTable);
+    if (!indexList) {
+        indexList = await adapter.query(`PRAGMA index_list(${targetTable})`);
+        tableIndexListCache.set(targetTable, Array.isArray(indexList) ? indexList : []);
+    }
+
+    const listEntry = indexList.find(
+        item => String(item.name || '').toLowerCase() === String(expected.name).toLowerCase()
+    );
+    if (!listEntry) {
+        mismatches.push({
+            index: expected.name,
+            reason: 'INDEX_LIST_MISSING',
+            table: targetTable
+        });
+        return { exists: true, valid: false, mismatches };
+    }
+
+    const actualUnique = Number(listEntry.unique) === 1;
+    if (actualUnique !== Boolean(expected.unique)) {
+        mismatches.push({
+            index: expected.name,
+            reason: 'UNIQUE_MISMATCH',
+            expectedUnique: Boolean(expected.unique),
+            actualUnique
+        });
+    }
+
+    const actualPartial = Number(listEntry.partial) === 1;
+    const sqlText = String(masterEntry.sql || '').trim();
+    const whereMatch = sqlText.match(/\)\s*WHERE\s+(.+)$/i);
+    const actualWhereClause = whereMatch ? whereMatch[1].trim().replace(/\s+/g, ' ') : null;
+
+    if (actualPartial !== Boolean(expected.partial) || (!expected.partial && actualWhereClause !== null)) {
+        mismatches.push({
+            index: expected.name,
+            reason: 'PARTIAL_MISMATCH',
+            expectedPartial: Boolean(expected.partial),
+            actualPartial,
+            actualWhereClause
+        });
+    } else if (expected.partial && expected.whereClause) {
+        const normExpectedWhere = String(expected.whereClause).trim().replace(/\s+/g, ' ').toLowerCase();
+        const normActualWhere = String(actualWhereClause || '').trim().replace(/\s+/g, ' ').toLowerCase();
+        if (normExpectedWhere !== normActualWhere) {
+            mismatches.push({
+                index: expected.name,
+                reason: 'WHERE_CLAUSE_MISMATCH',
+                expectedWhereClause: expected.whereClause,
+                actualWhereClause
+            });
+        }
+    }
+
+    // 3. 透過 PRAGMA index_xinfo(index_name) 驗證欄位名稱、欄位順序、ASC/DESC 排序與 Collation
+    const xinfoRows = await adapter.query(`PRAGMA index_xinfo(${expected.name})`);
+    let keyColumns = Array.isArray(xinfoRows)
+        ? xinfoRows
+            .filter(r => Number(r.key) === 1)
+            .sort((a, b) => Number(a.seqno) - Number(b.seqno))
+        : [];
+
+    if (keyColumns.length === 0) {
+        // Fallback: PRAGMA index_info(index_name)
+        const infoRows = await adapter.query(`PRAGMA index_info(${expected.name})`);
+        keyColumns = Array.isArray(infoRows)
+            ? infoRows
+                .sort((a, b) => Number(a.seqno) - Number(b.seqno))
+                .map(r => ({ ...r, desc: 0, coll: 'BINARY', key: 1 }))
+            : [];
+    }
+
+    if (keyColumns.length !== expected.columns.length) {
+        mismatches.push({
+            index: expected.name,
+            reason: 'COLUMN_COUNT_MISMATCH',
+            expectedColumns: expected.columns.map(c => `${c.name} ${c.order || 'ASC'}`),
+            actualColumns: keyColumns.map(c => `${c.name || '(expr)'} ${Number(c.desc) === 1 ? 'DESC' : 'ASC'}`)
+        });
+    } else {
+        for (let i = 0; i < expected.columns.length; i++) {
+            const expCol = expected.columns[i];
+            const actCol = keyColumns[i];
+
+            const expName = String(expCol.name || '').toLowerCase();
+            const actName = actCol.name ? String(actCol.name).toLowerCase() : '';
+            if (!actName || actName !== expName) {
+                mismatches.push({
+                    index: expected.name,
+                    reason: 'COLUMN_NAME_OR_ORDER_MISMATCH',
+                    position: i,
+                    expectedColumn: expCol.name,
+                    actualColumn: actCol.name || '(expression)'
+                });
+                continue;
+            }
+
+            const expOrder = String(expCol.order || 'ASC').toUpperCase();
+            const actOrder = Number(actCol.desc) === 1 ? 'DESC' : 'ASC';
+            if (actOrder !== expOrder) {
+                mismatches.push({
+                    index: expected.name,
+                    reason: 'SORT_ORDER_MISMATCH',
+                    column: expCol.name,
+                    position: i,
+                    expectedOrder: expOrder,
+                    actualOrder: actOrder
+                });
+            }
+
+            const expCollation = String(expCol.collation || 'BINARY').toUpperCase();
+            const actCollation = String(actCol.coll || 'BINARY').toUpperCase();
+            if (actCollation !== expCollation) {
+                mismatches.push({
+                    index: expected.name,
+                    reason: 'COLLATION_MISMATCH',
+                    column: expCol.name,
+                    position: i,
+                    expectedCollation: expCollation,
+                    actualCollation: actCollation
+                });
+            }
+        }
+    }
+
+    return {
+        exists: true,
+        valid: mismatches.length === 0,
+        mismatches
+    };
+}
+
+/**
+ * 驗證所有必要資料表、欄位與索引定義皆已完整且正確存在 (4.0.1 P0 & 4.0.1.1 P2)
  */
 async function verifyDatabaseSchema(adapter, customSpec = {}) {
     const tables = customSpec.tables || REQUIRED_TABLES;
     const indexes = customSpec.indexes || REQUIRED_INDEXES;
 
     const masterRows = await adapter.query(
-        `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index')`
+        `SELECT name, type, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index')`
     );
     const existingTables = new Set(
         masterRows.filter(r => r.type === 'table').map(r => String(r.name))
     );
-    const existingIndexes = new Set(
-        masterRows.filter(r => r.type === 'index').map(r => String(r.name))
-    );
+    const masterIndexMap = new Map();
+    for (const row of masterRows) {
+        if (row.type === 'index' && row.name) {
+            masterIndexMap.set(String(row.name).toLowerCase(), row);
+        }
+    }
 
     const missingTables = [];
     const missingColumns = [];
     const missingIndexes = [];
+    const invalidIndexes = [];
 
     for (const tableSpec of tables) {
         if (!existingTables.has(tableSpec.name)) {
@@ -289,17 +610,32 @@ async function verifyDatabaseSchema(adapter, customSpec = {}) {
         }
     }
 
+    const tableIndexListCache = new Map();
     for (const idxSpec of indexes) {
-        if (!existingIndexes.has(idxSpec.name)) {
+        const indexCheck = await verifySingleIndexDefinition(
+            adapter,
+            idxSpec,
+            masterIndexMap,
+            tableIndexListCache
+        );
+        if (!indexCheck.exists) {
             missingIndexes.push(idxSpec.name);
+        } else if (!indexCheck.valid) {
+            invalidIndexes.push(...indexCheck.mismatches);
         }
     }
 
-    if (missingTables.length > 0 || missingColumns.length > 0 || missingIndexes.length > 0) {
+    if (
+        missingTables.length > 0 ||
+        missingColumns.length > 0 ||
+        missingIndexes.length > 0 ||
+        invalidIndexes.length > 0
+    ) {
         const details = {
             missingTables,
             missingColumns,
-            missingIndexes
+            missingIndexes,
+            invalidIndexes
         };
         const err = new Error(
             `[SCHEMA_VERIFICATION_FAILED] 資料庫 Schema 驗證未通過: ${JSON.stringify(details)}`
@@ -316,13 +652,13 @@ async function verifyDatabaseSchema(adapter, customSpec = {}) {
 }
 
 /**
- * 執行完整 Schema 初始化、欄位 Migration 與驗證屏障 (4.0.1 P0)
+ * 執行完整 Schema 初始化、欄位 Migration 與驗證屏障 (4.0.1 P0 & 4.0.1.1 P2)
  * 嚴格順序：
  *   1. 建立核心資料表 (CREATE TABLE IF NOT EXISTS)
  *   2. 執行欄位擴充 Migration (PRAGMA table_info 預檢 + ALTER TABLE ADD COLUMN，區分已存在欄位與真實錯誤)
  *   3. 清理廢棄索引 (DROP INDEX IF EXISTS)
  *   4. 建立核心索引 (CREATE INDEX IF NOT EXISTS — 依賴 Step 2 遷移完成之欄位)
- *   5. 執行最終 Schema Verification
+ *   5. 執行最終 Schema Verification (含索引定義、欄位順序、ASC/DESC、UNIQUE 與 Partial 條件驗證)
  */
 async function bootstrapDatabaseSchema(adapter, options = {}) {
     const tables = options.tables || REQUIRED_TABLES;
@@ -495,7 +831,7 @@ async function bootstrapDatabaseSchema(adapter, options = {}) {
         }
     }
 
-    // 5. 階段五：執行最終 Schema Verification
+    // 5. 階段五：執行最終 Schema Verification (包含索引欄位、順序、ASC/DESC、UNIQUE 與 Partial 條件檢驗)
     migrationReport.verification = await verifyDatabaseSchema(adapter, { tables, indexes });
 
     return migrationReport;
@@ -507,7 +843,7 @@ module.exports = {
     OBSOLETE_INDEXES,
     REQUIRED_INDEXES,
     getTableColumns,
+    verifySingleIndexDefinition,
     verifyDatabaseSchema,
     bootstrapDatabaseSchema
 };
-

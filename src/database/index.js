@@ -2,13 +2,14 @@
 const { SQLiteAdapter, ADAPTER_STATES, AUTH_TYPES } = require('./sqlite.adapter');
 const { WriteQueue, QUEUE_STATES, ITEM_STATUS } = require('./write-queue');
 const { ShutdownHandler } = require('./shutdown-handler');
-const { BackupManager, BACKUP_VERIFY_STATUS } = require('./backup-manager');
+const { BackupManager, BACKUP_VERIFY_STATUS, RESTORE_STATUS } = require('./backup-manager');
 const {
     REQUIRED_TABLES,
     COLUMN_MIGRATIONS,
     OBSOLETE_INDEXES,
     REQUIRED_INDEXES,
     getTableColumns,
+    verifySingleIndexDefinition,
     verifyDatabaseSchema,
     bootstrapDatabaseSchema
 } = require('./schema-bootstrap');
@@ -266,6 +267,8 @@ async function createDatabaseSubsystem(options = {}) {
     };
 
     const adapter = new SQLiteAdapter(mergedConfig);
+    adapter.dbPath = dbPath;
+    BackupManager.registerAdapter(adapter, dbPath);
     const shutdownAuthority = adapter.bindShutdownHandler();
     const writeQueue = new WriteQueue(adapter, mergedConfig.queue);
     const shutdownHandler = new ShutdownHandler({
@@ -312,6 +315,8 @@ function initDatabaseSubsystemSync(options = {}) {
     };
 
     const adapter = new SQLiteAdapter(mergedConfig);
+    adapter.dbPath = dbPath;
+    BackupManager.registerAdapter(adapter, dbPath);
     const shutdownAuthority = adapter.bindShutdownHandler();
     const writeQueue = new WriteQueue(adapter, mergedConfig.queue);
     const shutdownHandler = new ShutdownHandler({
@@ -346,6 +351,7 @@ module.exports = {
     initDatabaseSubsystemSync,
     executeWithStartupBarrier,
     bootstrapDatabaseSchema,
+    verifySingleIndexDefinition,
     verifyDatabaseSchema,
     getTableColumns,
     REQUIRED_TABLES,
@@ -360,5 +366,6 @@ module.exports = {
     ITEM_STATUS,
     ShutdownHandler,
     BackupManager,
-    BACKUP_VERIFY_STATUS
+    BACKUP_VERIFY_STATUS,
+    RESTORE_STATUS
 };

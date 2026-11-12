@@ -1,19 +1,20 @@
-# Meshtastic-DashBoard 4.0.1 — Database Bootstrap & Backup Integrity
+# Meshtastic-DashBoard 4.0.1.1 — Backup Isolation & Verification Hardening
 
-> **版本定位**：4.0.1 Data Integrity Round 1（資料完整性強固：啟動初始化屏障與線上備份完整性）
-> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7 架構之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline）。
+> **版本定位**：4.0.1.1 Backup Isolation & Verification Hardening（修正 4.0.1 的 Backup Scheduler 長時間占用、Restore 活躍資料庫安全防護、Schema Index Definition Verification、Backup Path Containment，以及測試邊界與文件精確度）
+> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7 與 4.0.1 Data Integrity 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
 
 ---
 
-## 1. Database Bootstrap 流程
+## 1. Database Bootstrap 與保護範圍（含 `TURSO_URL` 分支澄清）
 
-在 4.0.1 中，SQLite 資料庫的啟動初始化由原本 `index.js` 分散、不等待回傳（Fire-and-Forget）的 `db.serialize()` 呼叫，收斂為受 `readyPromise` 嚴格管控的五階段序列流程（實作於 [`src/database/schema-bootstrap.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js) 與 [`src/database/index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js)）：
+### 1.1 本地 SQLite 分支之五階段 Bootstrap 流程
+當環境變數未設定 `TURSO_URL` 時，系統走本地 SQLite 分支，由 [`src/database/index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) 與 [`src/database/schema-bootstrap.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js) 透過 `readyPromise` 嚴格管控以下序列步驟：
 
 ```text
 [Step 0] SQLiteAdapter.initialize(dbPath)
-   ├── 開啟 SQLite 連線
-   ├── 設定並強驗證核心 PRAGMA (journal_mode=WAL, synchronous=NORMAL, foreign_keys=ON, busy_timeout, wal_autocheckpoint)
-   └── 若失敗：執行 awaited _cleanupFailedInit() 並拋出致命錯誤
+   ├── 開啟 SQLite 連線並綁定 adapter.dbPath 與活躍 Adapter 註冊表
+   ├── 設定並強驗證核心 PRAGMA (journal_mode=WAL, synchronous=NORMAL, foreign_keys=OFF, busy_timeout=10000, wal_autocheckpoint)
+   └── 若失敗：執行 awaited _cleanupFailedInitConnection() 並轉入 ADAPTER_STATES.ERROR
 
 [Step 1] Core Table Creation (CREATE TABLE IF NOT EXISTS)
    └── 依序建立 8 張核心資料表 (telemetry_data, nodes, packet_logs, neighbors, chat_messages, packets, daily_analytics_summary, cwa_weather_stations)
@@ -27,184 +28,153 @@
 [Step 4] Required Index Creation (CREATE INDEX IF NOT EXISTS)
    └── 在欄位 Migration 完成後，依序建立 11 個必要索引（包含依賴遷移欄位 gateway_id 與 hops_away 的索引）
 
-[Step 5] Final Schema Verification (verifyDatabaseSchema)
-   └── 查詢 sqlite_master 與各表 PRAGMA table_info，確認 8 張表、全部必要欄位與 11 個索引均已完整就緒
+[Step 5] Final Schema & Index Definition Verification (verifyDatabaseSchema)
+   └── 查詢 sqlite_master、PRAGMA table_info、PRAGMA index_list、PRAGMA index_xinfo，確認 8 張表、全部必要欄位與 11 個索引的定義（表名、欄位順序、ASC/DESC、UNIQUE、Partial WHERE）均完整正確
 
 [Step 6] Mark Subsystem Bootstrap Ready
    └── 設定 db.isSchemaReady = true，db.isBootstrapReady() 回傳 true，解除啟動屏障
 ```
 
----
-
-## 2. Schema Initialization Barrier
-
-為防止資料庫尚未完成建表、Migration 或索引建立前就開始接收業務讀寫流量，4.0.1 建立了雙重 **Schema Initialization Barrier**：
-
-1. **Subsystem Promise Barrier (`db.readyPromise` & `executeWithStartupBarrier`)**：
-   - `createDatabaseSubsystem({ dbPath, backupDir, bootstrapSchema: true })` 與 `initDatabaseSubsystemSync({ dbPath, backupDir, bootstrapSchema: true })` 將 `adapter.initialize(dbPath)` 與 `bootstrapDatabaseSchema(adapter)` 封裝於同一個 `readyPromise` 中。
-   - [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 的 `startServer()` 必須 `await db.readyPromise` 並確認 `db.isBootstrapReady() === true` 後，才允許綁定 HTTP Server Port、接受 REST API 與 Socket.IO 連線，並啟動背景資料庫清理與日結壓縮排程（`startDatabaseMaintenanceWorkers()`）。
-2. **Entry-Point Readiness Guard (`db.isBootstrapReady()`)**：
-   - 在 Protobuf 載入完成回呼（`initProtobuf()`）準備啟動 `startMqtt()` 時，以及 CWA 氣象資料背景抓取與首次 `cleanupOldData()` 執行前，皆檢查 `db.isBootstrapReady()`，避免任何背景任務在 Schema 屏障完成前偷跑寫入。
+### 1.2 `TURSO_URL` 分支保護範圍澄清（Out of Scope for 4.0.1 / 4.0.1.1）
+- **重要聲明**：本次 4.0.1 / 4.0.1.1 的 `bootstrapDatabaseSchema()`、`verifyDatabaseSchema()`、`isBootstrapReady()`、`executeWithStartupBarrier()` 以及 `BackupManager` **僅涵蓋本地 SQLite 執行路徑（未設定 `TURSO_URL` 時）**。
+- 當設定 `TURSO_URL` 時，[`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 仍使用原有的 `@libsql/client` 相容包裝器與未等待回傳的 `db.serialize()` 建表邏輯，**並不具備與本地 SQLite 相同的 Schema Initialization Barrier、Index Definition Verification 或 BackupManager 功能**。依專案規範，本次不修改 Turso 架構，特此明確區分保護邊界。
 
 ---
 
-## 3. Table / Column / Index 依賴順序
+## 2. Schema Verification 機制（4.0.1.1 P2 強化）
 
-舊版 `index.js` 在執行 `ALTER TABLE` 之前就先嘗試建立部分索引，且在 `db.serialize()` 中未等待 Promise 完成。4.0.1 強制固定以下不可顛倒的依賴順序：
+SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有索引，不會自動替換。因此 4.0.1.1 在 [`verifyDatabaseSchema()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js#L438-L511) 與 [`verifySingleIndexDefinition()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js#L298-L433) 中，除了檢查資料表與欄位名稱外，更結合 `sqlite_master`、`PRAGMA index_list(table_name)` 與 `PRAGMA index_xinfo(index_name)`（及 `PRAGMA index_info` fallback）對全部 11 個必要索引執行完整定義驗證：
 
-1. **先建立核心資料表 (`REQUIRED_TABLES`)**：確保 `nodes`、`packet_logs`、`telemetry_data` 等基礎表存在。
-2. **再執行欄位遷移 (`COLUMN_MIGRATIONS`)**：確保舊版資料庫補齊 `packet_logs.gateway_id`、`packet_logs.hops_away`、`packet_logs.latitude`、`packet_logs.longitude`、`packet_logs.source`、`nodes.last_gateway`、`telemetry_data.adc_voltage` 等 26 個擴充欄位。
-3. **接著清理廢棄索引 (`OBSOLETE_INDEXES`)**：移除不再使用的舊索引。
-4. **最後建立必要索引 (`REQUIRED_INDEXES`)**：此時 `idx_packet_logs_gw_ts`（依賴 `gateway_id`）與 `idx_packet_logs_ts_hops`（依賴 `hops_away`）所需的欄位皆已確保存在，不會在舊版資料庫升級時因缺少欄位而建索引失敗。
-
----
-
-## 4. Migration 相容性與失敗處理
-
-舊版程式碼使用 `db.run('ALTER TABLE ...', (err) => {})` 空回呼忽略所有錯誤，導致語法錯誤、I/O 錯誤、唯讀權限或磁碟損壞也會被靜默吞掉。
-
-4.0.1 在 [`bootstrapDatabaseSchema()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js) 中改採嚴格相容處理：
-
-1. **識別字與定義安全檢查**：驗證表名与欄位名稱符合合法 SQL 識別字，拒絕無效欄位定義。
-2. **`PRAGMA table_info` 前置檢查**：
-   - 執行 `ALTER TABLE` 前先讀取目標表結構。若目標表不存在，立即拋出 `[SCHEMA_MIGRATION_FAILED]`。
-   - 若欄位已存在，比對既有欄位的基礎型別與預期型別：
-     - 型別相容：視為已遷移完成（記錄於 `migrationReport.columnsAlreadyExisted`），安全跳過 `ALTER TABLE`。
-     - 型別衝突（例如預期 `INTEGER` 但既有為 `BLOB`）：立即拋出 `[SCHEMA_INCOMPATIBLE_COLUMN]`。
-3. **錯誤分類與熔斷**：
-   - 若 `ALTER TABLE` 執行失敗，僅在錯誤訊息為 `duplicate column name` 且二次查詢 `PRAGMA table_info` 確認欄位確實存在時視為冪等完成。
-   - 任何其他 SQL 錯誤、磁碟滿載、權限不足或資料庫損壞，一律封裝診斷資訊（`step`、`table`、`column`、`code`、`cause`）拋出 `[SCHEMA_MIGRATION_FAILED]`，並呼叫 `adapter.setFatalError(err)` 將 Adapter 轉入 `ADAPTER_STATES.ERROR`，阻止系統進入 `READY`。
+1. **Index Name Verification**：確認索引名稱存在於 `sqlite_master (type = 'index')`。
+2. **Table Binding Verification (`TABLE_MISMATCH`)**：確認 `sqlite_master.tbl_name` 與預期所屬資料表完全一致，且存在於該表的 `PRAGMA index_list` 中。
+3. **UNIQUE Attribute Verification (`UNIQUE_MISMATCH`)**：比對 `PRAGMA index_list.unique` 與預期 `unique` 屬性（目前 11 個索引皆為非 UNIQUE，`unique: false`）。
+4. **Partial Index Verification (`PARTIAL_MISMATCH` / `WHERE_CLAUSE_MISMATCH`)**：比對 `PRAGMA index_list.partial` 及 `sqlite_master.sql` 中的 `WHERE` 子句，防止非預期的 Partial Index 導致查詢漏資料。
+5. **Index Columns, Column Order & Sort Direction (`COLUMN_COUNT_MISMATCH` / `COLUMN_NAME_OR_ORDER_MISMATCH` / `SORT_ORDER_MISMATCH` / `COLLATION_MISMATCH`)**：
+   - 透過 `PRAGMA index_xinfo(index_name)` 取出所有 `key = 1` 的索引鍵欄位並按 `seqno` 排序。
+   - 逐一比對每個位置的**欄位名稱**、**欄位先後順序**（例如 `idx_packet_logs_ts_hops` 必須是 `timestamp` 在前、`hops_away` 在後）、**排序方向**（`desc === 1` 為 `DESC`，`desc === 0` 為 `ASC`）與 **Collation**（預設 `BINARY`）。
+6. **Schema Mismatch 處理方式**：
+   - 若發現任何缺失表、缺失欄位、缺失索引或索引定義不符，**絕不靜默修改或刪除既有資料庫結構**，而是立即拋出 `[SCHEMA_VERIFICATION_FAILED]`（附帶 `err.details = { missingTables, missingColumns, missingIndexes, invalidIndexes }`），並將 Adapter 轉入 `ADAPTER_STATES.ERROR`，阻止系統進入服務狀態。
 
 ---
 
-## 5. Schema Verification 機制
+## 3. Backup Lifecycle 與 Scheduler Isolation（4.0.1.1 P1 & P2）
 
-在所有 Table、Column Migration 與 Index 執行完畢後，[`verifyDatabaseSchema(adapter)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js) 會執行最終結構盤點：
+### 3.1 修正問題背景
+在 4.0.1 中，`performBackup()` 將 `VACUUM INTO`、`verifyIntegrity()`、檔案 rename 與 `_rotateOldBackups()` 全部包在 `adapter.maintenanceTask('ONLINE_BACKUP', ...)` 內。對於約 4.5GB 的大型資料庫，`PRAGMA integrity_check` 與舊備份掃描可能耗時數十秒，期間會使 SQLite Adapter Scheduler 持續處於 `maintenanceInProgress = true`，阻塞 `WriteQueue` 批次寫入與 API 查詢。
 
-- 查詢 `sqlite_master` 驗證 8 張核心資料表全數存在。
-- 對每張表執行 `PRAGMA table_info(table)`，驗證所有基礎欄位與遷移欄位（例如 `nodes` 的 21 個欄位、`packet_logs` 的 16 個欄位、`telemetry_data` 的 15 個欄位等）全數齊備。
-- 查詢 `sqlite_master` 驗證 11 個必要索引全數存在。
-- 只要缺少任何一張表、一個欄位或一個索引，即拋出 `[SCHEMA_VERIFICATION_FAILED]`（附帶 `missingTables`、`missingColumns`、`missingIndexes` 診斷明細），系統拒絕進入正常服務。
+### 3.2 4.0.1.1 完整 Backup 生命週期
+在 [`BackupManager.performBackup()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L247-L407) 中，Scheduler 佔用範圍已被嚴格隔離至**僅限 `VACUUM INTO` 建立快照階段**：
 
----
+```text
+[Phase 0] Pre-check & Path Containment
+   ├── 檢查 #backupInProgress 防重疊鎖
+   ├── 呼叫 validateBackupFilePath(filename, targetDir) 驗證檔名邊界
+   │     (拒絕 NUL、../、/、\、POSIX/Windows 絕對路徑、磁碟機前綴 C:、UNC 路徑 \\server\share)
+   ├── 產生唯一暫存檔名 .staging-<filename>-<pid>-<timestamp>-<rand> (不以 .db 結尾)
+   └── 設定 #backupInProgress = true，並將 stagingPath 與 targetPath 加入 #inProgressBackupPaths
 
-## 6. 舊版 `fs.copyFileSync()` 備份問題說明
+[Phase 1] VACUUM INTO Inside adapter.maintenanceTask('ONLINE_BACKUP')
+   ├── 在 SQLite Adapter Scheduler 串行保護下執行 VACUUM INTO '<stagingPath>'
+   ├── 若失敗：立即清理 stagingPath 及 sidecars，記錄 FAILED_VACUUM_INTO 並拋錯
+   └── 若成功：確認 stagingPath 存在後立即結束 maintenanceTask，釋放 SQLite Adapter Scheduler！
+       (此刻起 adapter.maintenanceInProgress === false，WriteQueue 與 API 可立即恢復正常讀寫)
 
-在 4.0.1 之前，`index.js` 的定期備份排程直接執行：
+[Phase 2] Independent Integrity Verification (Outside Scheduler)
+   ├── 保持 #backupInProgress = true 與 #inProgressBackupPaths 保護
+   ├── 使用獨立唯讀連線 (sqlite3.OPEN_READONLY) 對 stagingPath 執行 verifyIntegrity()
+   │     (檢查檔案存在、stats.size > 0、可唯讀開啟、PRAGMA integrity_check === 'ok')
+   └── 若未通過：清理 stagingPath (或於 retainFailedStaging: true 時改名為 .invalid 供調查)，
+       絕不影響 targetPath 既有有效備份，記錄 FAILED_VERIFICATION 並拋錯
 
-```js
-fs.copyFileSync(sourceDbPath, targetBackupPath);
+[Phase 3] Reversible Staging Install to Official Backup File
+   ├── 若 targetPath 已存在舊的有效備份，先移至同目錄 .prev-<filename>-<suffix>
+   ├── 將通過驗證的 stagingPath rename 為正式 targetPath
+   │     ├── 若 rename 成功：清理 .prev-* 暫存檔，將 targetPath 加入 #verifiedBackups
+   │     └── 若 rename 失敗：立即將 .prev-* 還原回 targetPath（確保既有有效備份絕不損毀），清理 stagingPath 並拋錯
+
+[Phase 4] Backup Rotation (Outside Scheduler)
+   ├── 執行 _rotateOldBackups()：忽略 .staging-* / .prev-* / 非 .db 檔案與未驗證檔案
+   ├── 按 mtimeMs 由舊到新清理超過 retentionDays 或 maxBackups 之已驗證備份
+   └── 強制保留至少 1 份最新有效備份（retainedCount >= 1，絕不刪除唯一可用備份）
+
+[Phase 5] Final Convergence (finally block)
+   └── 確保殘留 stagingPath 被清除，自 #inProgressBackupPaths 移除路徑，並將 #backupInProgress 設回 false
 ```
 
-在 SQLite `journal_mode = WAL` 模式下，這種做法存在嚴重的資料完整性風險：
-
-1. **遺漏 `-wal` 與 `-shm` 狀態**：WAL 模式下已提交的新交易可能仍位於 `meshtastic.db-wal` 中尚未回寫至主檔，單純複製 `.db` 主檔會遺失最近已提交的資料。
-2. **頁面撕裂（Torn Pages）與不一致快照**：若複製期間正好發生寫入或自动 Checkpoint，`fs.copyFileSync` 無法與 SQLite 鎖機制協調，可能複製出前後不一致甚至損壞的資料庫檔案。
-3. **缺乏完整性檢驗**：複製完成後未執行 `PRAGMA integrity_check`，即使產出損壞備份也會被當作成功備份，甚至觸發舊備份清理而刪掉真正可用的歷史備份。
-
----
-
-## 7. 新版 BackupManager 備份流程
-
-4.0.1 已移除 `index.js` 中的 `fs.copyFileSync()`，正式將排程整合至 [`BackupManager`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)：
-
-1. **防重疊檢查（Non-Overlapping Guard）**：
-   - 若 `#backupInProgress === true`，排程觸發（`triggerScheduledBackup()`）會安全略過並回傳 `{ success: false, skipped: true, reason: 'BACKUP_ALREADY_IN_PROGRESS' }`；直接呼叫 `performBackup()` 則拋出 `[BACKUP_ALREADY_IN_PROGRESS]`，絕不同時啟動兩個備份任務。
-2. **Scheduler 串行協調與線上快照（`VACUUM INTO`）**：
-   - 透過 `adapter.maintenanceTask('ONLINE_BACKUP', ...)` 排入 SQLite Adapter Scheduler，與 `WriteQueue` 寫入交易及 `checkpoint` 妥善協調（備份期間 `maintenanceInProgress === true`，阻止 `emergencyClose` 與 `TRUNCATE` checkpoint 干擾）。
-   - 若目標路徑已存在同名檔案，先寫入獨立 `.staging-<pid>-<timestamp>` 暫存檔，避免覆蓋既有完好備份。
-   - 執行 `VACUUM INTO '<escaped_path>'`，由 SQLite 引擎將主資料庫與 WAL 中已提交的頁面整合輸出為單一、一致且緊湊的獨立 SQLite 資料庫檔案。
-3. **不完整備份自動清理**：
-   - 若 `VACUUM INTO` 執行失敗或中途異常，立即刪除未完成的半成品檔案，並記錄至 `lastBackupError` 與 `lastBackupResult`，絕不將半成品視為有效備份。
+### 3.3 備份排程政策（Backup Scheduling Policy）現況與待確認事項
+- 在 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L4517-L4533) 中，定時備份排程之 `shouldRun()` 目前檢查 `process.env.BACKUP_PATH` 是否存在；若未設定 `BACKUP_PATH`，排程觸發時會回傳 `false` 而不執行自動備份（即使 `BackupManager` 建構子本身具備預設本地 `./backups` 目錄）。
+- 此外，`index.js` 原始註解寫為「每 12 小時自動備份資料庫至雲端」，實際 Cron 表達式為 `'0 0 * * 0'`（每週日 00:00），而 [`src/database/sqlite.config.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js) 中的 `backup.cronSchedule` 則為 `'0 4 * * *'`（每日 04:00）。
+- **處理原則**：在未獲明確指示變更排程政策前，4.0.1.1 嚴格保留 `index.js` 現有的 `BACKUP_PATH` 檢查與 `'0 0 * * 0'` 行為不變，並將上述兩項設定差異列為待確認事項。
 
 ---
 
-## 8. Backup Integrity Check
+## 4. Restore Safety 與可回復替換機制（4.0.1.1 P1）
 
-每次 `VACUUM INTO` 完成後，[`BackupManager.verifyIntegrity(backupFilePath)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js) 會對產出的備份檔執行四道驗證：
+[`BackupManager.restoreFromBackup(backupFilePath, targetRestoreDbPath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L510-L760) 針對還原作業實施嚴格的前置檢查與可回復（Rollback）替換流程：
 
-1. **檔案存在性檢查**：確認備份檔存在於磁碟。
-2. **非空檔案大小檢查**：透過 `fs.statSync` 確認 `stats.isFile() && stats.size > 0`（防止 0-byte 空檔案在 SQLite 開啟時被誤判為 `'ok'`）。
-3. **唯讀獨立連線開啟**：以 `sqlite3.OPEN_READONLY` 開啟備份檔，確認檔頭與結構可被 SQLite 讀取。
-4. **`PRAGMA integrity_check` 檢驗**：確認回傳單列且結果為 `'ok'`，並等待唯讀連線完整 `close()`。
+### 4.1 Restore 前置檢查（Preconditions）
+1. **參數與路徑正規化檢查**：拒絕空字串或含 NUL 字元之路徑；使用 `_normalizeComparablePath()`（結合 `path.resolve`、`fs.realpathSync.native` 與 Windows 不分大小寫正規化）確認來源備份路徑與目標還原路徑不相同。
+2. **禁止覆蓋進行中備份**：若來源或目標路徑位於 `#inProgressBackupPaths` 中，拒絕執行。
+3. **Active Adapter DB Path 防護（`_findActiveAdapterUsingPath`）**：
+   - 比對目前 `BackupManager` 所屬 `adapter` 以及程序內所有已註冊 `SQLiteAdapter` 實例的資料庫路徑（`adapter.dbPath` / `adapter.db.filename`）。
+   - 只要目標路徑對應的 `SQLiteAdapter` 尚未完全關閉（`state !== ADAPTER_STATES.CLOSED`、`db !== null` 或 `nativeClosePending === true`），立即以 `[BACKUP_RESTORE_ACTIVE_DB_FORBIDDEN]` 拒絕還原，**絕不在資料庫仍被 Adapter 使用時刪除或替換其 DB / WAL / SHM 檔案**。
+4. **Offline Restore 鎖定探測（`_assertTargetDbOffline`）**：
+   - 若目標資料庫檔案已存在於磁碟，還原前會開啟短暫探測連線設定 `PRAGMA busy_timeout = 0` 並執行 `BEGIN EXCLUSIVE TRANSACTION; ROLLBACK;`。
+   - 若目標資料庫正被其他程序或未關閉連線鎖定，立即以 `[BACKUP_RESTORE_TARGET_BUSY_ONLINE]` 拒絕執行。
+5. **來源備份與 Staging 雙重完整性驗證**：
+   - 先對 `backupFilePath` 執行 `verifyIntegrity()`。
+   - 再於目標資料庫同一目錄下透過 `VACUUM INTO` 建立 `.restore-staging-<basename>-<suffix>`，並對該 staging DB 執行 `verifyIntegrity()`。
+   - 替換前再次執行 `_assertTargetDbOffline()` 二次確認。
 
-唯有通過上述全部檢查（`status === BACKUP_VERIFY_STATUS.VALID`），該備份才會被納入 `#verifiedBackups` 有效清單並標記為成功；否則立即報錯 `[BACKUP_VERIFY_FAILED]` 並清理損壞輸出。
-
----
-
-## 9. Backup Retention 規則
-
-[`BackupManager._rotateOldBackups()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js) 在每次新備份通過完整性驗證後執行，遵循以下安全保留原則：
-
-1. **只計算與清理已驗證成功的備份**：未驗證、損壞或 0-byte 的檔案不會被計入有效備份數量，避免因壞檔佔用名額而誤刪舊的完好備份。
-2. **保護進行中備份**：位於 `#inProgressBackupPaths` 中的檔案絕不被清理程序碰觸。
-3. **由最舊往較新依序清理**：依 `mtimeMs` 由新到舊排序，從最舊的過期備份（超過 `retentionDays` 或超過選配之 `maxBackups`）開始清理。
-4. **絕不刪除唯一可用備份**：若目前目錄中已驗證的有效備份數量 `<= 1`（即使該備份的修改時間已超過 `retentionDays`），系統強制保留該份備份（`retainedCount >= 1`），確保任何時刻至少保有最後一份可用備份。
-5. **錯誤隔離**：清理舊檔時的檔案系統警告不會導致剛完成的備份或主服務失敗。
-
----
-
-## 10. Backup Restore Verification 流程
-
-[`BackupManager.restoreFromBackup(backupFilePath, targetRestoreDbPath)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js) 提供安全、可驗證的還原流程：
-
-1. **拒絕原地覆蓋**：檢查來源備份路徑與目標還原路徑不得相同。
-2. **來源備份驗證**：還原前先對來源備份執行 `verifyIntegrity()`，未通過則拒絕還原（`[BACKUP_RESTORE_REJECTED]`）。
-3. **Staging 安全還原**：以唯讀模式開啟來源備份，透過 `VACUUM INTO` 輸出至目標目錄下的 `.restore-staging-<pid>-<timestamp>` 暫存檔。
-4. **還原後完整性驗證**：對還原出的暫存檔再次執行 `verifyIntegrity()`（包含 `PRAGMA integrity_check === 'ok'`）。
-5. **原子替換與清理舊 WAL/SHM**：驗證通過後，清除目標路徑可能殘留的 `-wal` / `-shm` 檔案，並將暫存檔 rename 為目標資料庫路徑。
-
----
-
-## 11. 測試執行方式與測試項目列表
-
-所有測試皆使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫與臨時目錄，**完全不碰觸正式環境與任何正式資料庫**。
-
-### 執行指令
-
-```bash
-npm run test:database
-```
-
-### 測試套件總覽（共 59 項測試全數通過）
-
-1. **[`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有測試）**：
-   - 完整保留 v2.7.7 結案之 Scheduler、WriteQueue、Transaction、Retry、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 測試（46 / 46 通過）。
-2. **[`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（13 項新增測試）**：
-   - **Test A — Normal Initialization**：空臨時 DB 建立全部 8 張表、26 個遷移欄位与 11 個索引後通過驗證並進入 `READY`。
-   - **Test B — Repeated Initialization**：對同一臨時 DB 連續執行兩次初始化，不產生重複欄位錯誤且完整保留既有資料。
-   - **Test C — Migration Failure**：模擬 `ALTER TABLE` SQL 失敗與欄位型別衝突，驗證初始化失敗、不標記為 `READY`、Adapter 進入 `ERROR` 並保留診斷資訊。
-   - **Test D — DDL Failure**：模擬 `CREATE TABLE` 與 `CREATE INDEX` 失敗，驗證啟動屏障阻擋服務啟動且不吞掉錯誤。
-   - **Test E — Initialization Barrier**：人為延遲 Schema 初始化，驗證 HTTP API、Socket.IO、MQTT 與 Background Workers 在屏障完成前絕不提前啟動。
-   - **Test F — Existing Database Compatibility**：建立舊版結構臨時 DB 並寫入既有測試資料，執行 Bootstrap 與 Migration 後驗證舊資料 100% 保留且新欄位與索引齊全。
-   - **Test G — WAL Consistent Backup**：WAL 模式下寫入資料（含未截斷 WAL 幀）並執行備份，驗證備份檔包含所有已提交資料。
-   - **Test H — Concurrent Writes During Backup**：備份期間持續透過 `WriteQueue` 併發寫入，驗證備份通過完整性檢查且原 DB 保持一致可讀寫。
-   - **Test I — Backup Integrity Failure**：模擬備份損壞與 0-byte 空檔案，驗證不會標記成功、記錄錯誤且不影響原 DB。
-   - **Test J — Incomplete Backup Cleanup**：模擬 `VACUUM INTO` 中途失敗留下半成品，驗證半成品立即被清除且後續備份可正常成功。
-   - **Test K — Backup Retention**：驗證多份備份按時間順序清理、未驗證壞檔不計入有效備份名額、且唯一可用備份絕不被刪除。
-   - **Test L — Backup Restore Verification**：備份後還原至第二個獨立臨時 DB，驗證資料一致、`PRAGMA integrity_check === 'ok'` 且可正常讀寫。
-   - **Test M — Backup Scheduler Non-Overlap & Shutdown Coordination**：驗證排程重疊觸發會安全跳過、備份期間阻擋危險關閉、完成後下一輪排程正常運作。
+### 4.2 原始 DB 保留、WAL/SHM 處理與 Rollback 狀態定義
+1. **移至可回復 Rollback 路徑（絕不直接先行刪除）**：
+   - 將目標路徑既有的 `<db>`、`<db>-wal`、`<db>-shm` 依序 `fs.renameSync` 至同目錄下的 `.rollback-<suffix>` 路徑。
+   - **不忽略任何 WAL / SHM 移動錯誤**：若移動過程中任何一個檔案失敗，立即按反序將已移動的 `.rollback-*` 檔案復原回原位，清理 staging DB 並報錯。
+2. **安裝 Staging DB 與自動 Rollback**：
+   - 將已驗證的 `stagingRestorePath` rename 至 `resolvedTarget`，並對安裝後的 `resolvedTarget` 再次執行 `verifyIntegrity()`。
+   - 若安裝 rename 或安裝後驗證失敗：
+     - 自動移除不完整的目標檔，並按反序將 `<db>.rollback-*`、`<db>-wal.rollback-*`、`<db>-shm.rollback-*` 移回原始路徑。
+     - 清理 `stagingRestorePath`。
+   - 唯有在安裝與驗證完全成功後，才刪除 `.rollback-*` 備份檔。
+3. **明確的還原結果狀態（`RESTORE_STATUS`）**：
+   - `RESTORE_COMPLETED`：還原成功且安裝後通過 `verifyIntegrity()`，原始 `.rollback-*` 已清理。
+   - `RESTORE_REJECTED_PRECONDITION`：於替換原始檔案前因前置條件（如目標為活躍 Adapter DB、外部鎖定、來源備份損壞或 staging 驗證失敗）被安全攔截，原始目標資料庫完全未動。
+   - `RESTORE_FAILED_ROLLED_BACK`：替換過程中發生錯誤，且原始目標 DB 與 WAL/SHM 已自動從 `.rollback-*` 完整復原（`err.rollbackSucceeded === true`）。
+   - `RESTORE_FAILED_ROLLBACK_INCOMPLETE`：替換失敗且自動復原過程中遭遇檔案系統錯誤（`err.rollbackSucceeded === false`），此時保留磁碟上的 `.rollback-*` 檔案並於 `err.preservedRollbackPaths` 與 `err.rollbackErrors` 提供完整救援路徑與診斷資訊。
 
 ---
 
-## 12. 狀態區分：已實作功能、待確認事項與未來規劃
+## 5. 測試覆蓋與測試性質分類（Test Coverage Classification）
 
-### 12.1 已實作並通過測試的功能（4.0.1 完成）
-- SQLite Schema 結構化 Bootstrap（8 表、26 欄位 Migration、5 廢棄索引清理、11 必要索引建立）。
-- `PRAGMA table_info` 欄位預檢、型別相容性檢查與 Migration/DDL 錯誤熔斷。
-- `verifyDatabaseSchema` 最終結構完整性驗證。
-- `readyPromise`、`isBootstrapReady()` 與 `executeWithStartupBarrier` 啟動初始化屏障。
-- 移除 `index.js` 不安全的 `fs.copyFileSync()`，整合 `BackupManager` 線上 `VACUUM INTO` 一致性備份。
-- 備份完整性驗證（含檔案大小 `> 0` 與 `PRAGMA integrity_check`）、半成品清理、保留策略（永不刪除唯一可用備份）、防重疊排程與獨立還原驗證（`restoreFromBackup`）。
+所有測試均於開發環境透過 `npm run test:database` 實際執行，並使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫檔案，測試後完整關閉連線與清除暫存檔。
 
-### 12.2 待確認事項（Pending Confirmation）
-- **定期備份排程頻率設定不一致**：
-  - `index.js` 原始註解寫為「每 12 小時自動備份資料庫至雲端」，但原始程式碼實際排程為 `'0 0 * * 0'`（每週日 00:00），而 [`src/database/sqlite.config.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js) 中的 `backup.cronSchedule` 則為 `'0 4 * * *'`（每日 04:00）。
-  - 本次 4.0.1 依規範保留 `index.js` 既有的 `'0 0 * * 0'` 排程行為不變，待使用者確認最終期望的備份頻率後再統一調整。
+為確保技術審查透明度，以下明確區分各項測試的**實際測試類型**（真實 SQLite 整合測試 vs. Coordinator 單元測試 vs. 錯誤注入模擬測試）：
 
-### 12.3 已知限制與尚未實作的未來規劃（Out of Scope for 4.0.1）
-- **Turso Replication**：目前僅保留既有環境變數相容分支，尚未實作雙寫或遠端同步機制。
-- **Durable Outbox**：`WriteQueue` 為記憶體佇列（Memory Queue），可防護 SQLite 暫時鎖競爭與優雅關機排空，但無法防止突發斷電、作業系統崩潰或 `SIGKILL` 導致的未提交記憶體資料遺失。
-- **Off-host Backup（異地/雲端自動上傳與端到端驗證）**：目前 `BackupManager` 將一致性快照輸出至本地或掛載之 `BACKUP_PATH` 目錄，尚未內建獨立的雲端 API 異地傳輸與遠端雜湊校驗。
-- **Backend Modularization**：`index.js` 的路由與業務邏輯模組化拆分不在 4.0.1 範圍內。
+### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（17 項測試）
 
+| 測試編號與名稱 | 測試分類 | 實際驗證方式與邊界說明 |
+| :--- | :--- | :--- |
+| **Test A — Normal Initialization** | 真實 SQLite Integration Test | 對空臨時 SQLite DB 實際執行建表、26 欄位 Migration、11 索引建立與 `verifyDatabaseSchema`，並驗證讀寫。 |
+| **Test B — Repeated Initialization** | 真實 SQLite Integration Test | 對寫有資料之同一臨時 SQLite DB 連續執行兩次完整初始化與重複 `bootstrapSchema()`，驗證冪等與資料保留。 |
+| **Test C — Migration Failure** | 真實 SQLite Error Test | 在臨時 SQLite DB 上執行真實無效 SQL 語法之 `ALTER TABLE` 以及真實 `BLOB` vs `INTEGER` 欄位型別衝突，驗證轉入 `ERROR` 且不吞錯。 |
+| **Test D — DDL Failure** | 真實 SQLite Error + Coordinator Test | 在臨時 SQLite DB 上觸發真實 `CREATE TABLE` 語法錯誤與 `CREATE INDEX` 無此欄位錯誤，驗證 `executeWithStartupBarrier` 阻擋啟動。 |
+| **Test E — Initialization Barrier** | **Coordinator Unit Test (with Real SQLite Bootstrap & Service Stubs)** | 對臨時 SQLite DB 執行真實 `initDatabaseSubsystemSync` 與 `bootstrapDatabaseSchema`（透過 `beforeSchemaBootstrap` Gate 控制時序），驗證 `executeWithStartupBarrier()` 協調器不會提前呼叫 `startHttp`/`startSocketIo`/`startMqtt`/`startBackgroundWorkers` 測試樁（Stub Callbacks）。**註：此為協調器單元測試，並非直接啟動整支 `index.js` 實體伺服器程序。** |
+| **Test F — Existing Database Compatibility** | 真實 SQLite Integration Test | 以原生 `sqlite3` 建立舊版無擴充欄位之資料表並寫入歷史資料，再執行完整 Bootstrap & Migration，驗證資料保留與新欄位可讀寫。 |
+| **Test G — WAL Consistent Backup** | 真實 SQLite Integration Test | 在 WAL 模式下透過 `WriteQueue` 寫入 25 筆資料並執行 `performBackup()`（真實 `VACUUM INTO`），以獨立唯讀連線驗證備份檔內容。 |
+| **Test H — Backup Snapshot Consistency** | 真實 SQLite Integration Test (Deterministic Gate) | 寫入 50 筆初始資料，於真實 `VACUUM INTO` 進入執行瞬間（透過確定性 Gate）排入 30 筆 `WriteQueue` 寫入，驗證備份檔精確為初始 **50 筆**、主 DB 完成寫入後為 **80 筆**，且兩者皆通過 `PRAGMA integrity_check`。 |
+| **Test I — Backup Integrity Failure** | 真實 0-byte 檔案測試 + Verification Failure Injection | 1. 對真實 0-byte 空檔案執行 `verifyIntegrity()` 驗證回傳 `CORRUPTED`；2. 透過 stubbing `verifyIntegrity` 模擬損壞結果，驗證 `performBackup()` 拒絕標記成功並清理 staging。 |
+| **Test J — Incomplete Backup Cleanup** | Mid-Backup I/O Failure Simulation + Real Retry | 攔截第一次 `VACUUM INTO` 寫入半成品 staging 檔案後拋出模擬 I/O 錯誤，驗證 `.staging-*` 被徹底清除，且第二次真實 `VACUUM INTO` 備份成功。 |
+| **Test K — Backup Retention** | 真實 SQLite Backup + Filesystem mtime Test | 建立 3 份真實備份並調整 `utimesSync` 與置入未驗證壞檔，驗證按順序刪除最舊備份、忽略未驗證檔，且當僅剩 1 份有效備份時即使過期 365 天也絕不刪除。 |
+| **Test L — Backup Restore Verification** | 真實 SQLite End-to-End Backup & Restore Test | 對真實臨時 DB 備份後，呼叫 `restoreFromBackup()` 還原至第二個獨立臨時 DB，並以新 `createDatabaseSubsystem` 開啟驗證資料一致性與後續讀寫。 |
+| **Test M — Backup Scheduler Non-Overlap & Shutdown Race** | 真實 SQLite + `ShutdownHandler.handle()` Integration Test | 驗證重疊排程自動跳過；並測試在 `VACUUM INTO` 執行期間觸發真實 `ShutdownHandler.handle('SIGTERM')`（涵蓋「於 Deadline 內完成並安全關閉」與「超過 Deadline 時拒絕呼叫 `db.close()` 保護活動連線」兩種情境）。 |
+| **Test N — P1 Backup Scheduler Isolation** | 真實 SQLite Integration + Rename Failure Injection | 在 `VACUUM INTO` 完成後、`verifyIntegrity` 開始前（`afterVacuumBeforeVerify` Gate），驗證 `maintenanceInProgress === false` 且 `WriteQueue` 可立即寫入主 DB；同時以 `renameImpl` 注入錯誤驗證同名舊有效備份不會因新備份安裝失敗而損毀。 |
+| **Test O — P1 Restore Safety Hardening** | 真實 SQLite Active DB & Lock Detection + Rollback Injection | 驗證拒絕還原至當前活躍 Adapter DB、拒絕還原至另一活躍 Adapter DB、拒絕還原至被外部連線 `BEGIN IMMEDIATE` 鎖定之 DB；並以 `renameImpl` 注入錯誤驗證替換失敗時自動從 `.rollback-*` 完整復原原始離線 DB。 |
+| **Test P — P2 Schema Index Definition Verification** | 真實 SQLite PRAGMA Verification Test | 在真實臨時 SQLite DB 中預先建立同名但欄位順序顛倒、`ASC`/`DESC` 相反、`UNIQUE` 不符、含 Partial `WHERE` 或掛錯資料表的索引，驗證 `verifyDatabaseSchema()` 全數檢出並阻擋啟動。 |
+| **Test Q — P2 Backup Path Containment** | Unit & Integration Validation Test | 驗證 `validateBackupFilePath()` 與 `performBackup()` 接受合法檔名，並拒絕 `../`、`..\`、POSIX/Windows 絕對路徑、`C:` 磁碟機路徑、UNC 路徑、子目錄斜線與 NUL 字元。 |
+
+### 5.2 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線測試）
+- 完整保留 v2.7.7 結案之 46 項測試（包含真实 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。
+
+### 5.3 尚未驗證或受限於環境之項目
+- **跨程序 OS 突發斷電 / SIGKILL 實體崩潰測試**：目前半成品與 Rollback 測試係透過受控錯誤注入模擬中斷，並未在測試中對真實 4.5GB 資料庫執行實體斷電。
+- **整支 `index.js` 含外部 MQTT Broker / 網路埠口之端到端程序啟動測試**：因 `index.js` 頂層要求真實外部 `MQTT_BROKER` 連線環境，啟動屏障係透過 `executeWithStartupBarrier` 協調器與真實臨時 SQLite 子系統驗證。
