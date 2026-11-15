@@ -52,7 +52,7 @@ function cleanupTempDir(dirPath) {
     } catch (_) {}
 }
 
-describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity Suite', () => {
+describe('Meshtastic-DashBoard 4.0.1.2 — Database Bootstrap & Backup Integrity Suite', () => {
 
     // =========================================================================
     // Part A: Database Bootstrap & Schema Initialization Barrier (Tests A - F)
@@ -912,7 +912,8 @@ describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity
             // 2. 執行還原至第二個獨立 Temporary DB
             const restoreRes = await sourceDb.backupManager.restoreFromBackup(
                 backupRes.targetPath,
-                restoredDbPath
+                restoredDbPath,
+                { offlineConfirmed: true }
             );
             assert.equal(restoreRes.success, true);
             assert.equal(restoreRes.restoreStatus, RESTORE_STATUS.COMPLETED);
@@ -1279,7 +1280,11 @@ describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity
             try {
                 await assert.rejects(
                     async () => {
-                        await dbActive.backupManager.restoreFromBackup(validBackup.targetPath, offlineTargetDbPath);
+                        await dbActive.backupManager.restoreFromBackup(
+                            validBackup.targetPath,
+                            offlineTargetDbPath,
+                            { offlineConfirmed: true }
+                        );
                     },
                     (err) => {
                         assert.match(err.message, /BACKUP_RESTORE_TARGET_BUSY_ONLINE/);
@@ -1300,6 +1305,7 @@ describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity
                         validBackup.targetPath,
                         offlineTargetDbPath,
                         {
+                            offlineConfirmed: true,
                             renameImpl: () => {
                                 throw new Error('EIO: simulated filesystem error during staging install rename');
                             }
@@ -1328,7 +1334,8 @@ describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity
             // 3c. 正常執行離線還原覆蓋，驗證成功替換並清理 rollback 檔案
             const successRestore = await dbActive.backupManager.restoreFromBackup(
                 validBackup.targetPath,
-                offlineTargetDbPath
+                offlineTargetDbPath,
+                { offlineConfirmed: true }
             );
             assert.equal(successRestore.success, true);
             assert.equal(successRestore.restoreStatus, RESTORE_STATUS.COMPLETED);
@@ -1582,6 +1589,406 @@ describe('Meshtastic-DashBoard 4.0.1.1 — Database Bootstrap & Backup Integrity
                     `performBackup 應拒絕非法備份檔名: ${JSON.stringify(badName)}`
                 );
             }
+
+            await db.close();
+        } finally {
+            cleanupTempDb(dbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    // =========================================================================
+    // Part D: 4.0.1.2 Hardening Specific Tests (Tests R - T)
+    // =========================================================================
+
+    it('Test R — Restore Offline Confirmation (4.0.1.2 P1): 預設強制要求 offlineConfirmed === true，並驗證 WAL 唯讀/閒置連線不會繞過離線契約、目標 DB 與 WAL/SHM 未被修改', async () => {
+        const sourceDbPath = getTempDbPath('test_r_source');
+        const targetDbPath = getTempDbPath('test_r_target');
+        const backupDir = getTempDir('test_r_backups');
+
+        try {
+            const sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_from_backup', 'BackupPayloadNode']);
+            const backupRes = await sourceDb.backupManager.performBackup('test_r_valid_backup.db');
+            assert.equal(backupRes.success, true);
+
+            // 建立一個具有既有資料與 WAL/SHM sidecar 的目標資料庫
+            const targetPrep = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await targetPrep.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_orig_target', 'OriginalTargetNode']);
+            await targetPrep.close();
+
+            // 建立明確的 -wal / -shm 測試內容以驗證拒絕時檔案完全不被觸碰或刪除
+            const walPath = `${targetDbPath}-wal`;
+            const shmPath = `${targetDbPath}-shm`;
+            const origDbBytes = fs.readFileSync(targetDbPath);
+            fs.writeFileSync(walPath, Buffer.from('WAL_SENTINEL_KEEP_INTACT'));
+            fs.writeFileSync(shmPath, Buffer.from('SHM_SENTINEL_KEEP_INTACT'));
+
+            // 1. 未傳入 offlineConfirmed (預設拒絕) -> 必須拒絕且錯誤碼為 BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(backupRes.targetPath, targetDbPath);
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED/);
+                    assert.equal(err.code, 'BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED');
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                    return true;
+                }
+            );
+
+            // 2. 傳入 offlineConfirmed: false -> 必須拒絕且錯誤碼為 BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(
+                        backupRes.targetPath,
+                        targetDbPath,
+                        { offlineConfirmed: false }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED/);
+                    assert.equal(err.code, 'BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED');
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                    return true;
+                }
+            );
+
+            // 3. 驗證拒絕後，原始目標 DB、-wal、-shm 完全未被修改或刪除
+            assert.equal(Buffer.compare(fs.readFileSync(targetDbPath), origDbBytes), 0, '拒絕時原始 DB 位元組不得被修改');
+            assert.equal(fs.readFileSync(walPath, 'utf8'), 'WAL_SENTINEL_KEEP_INTACT', '拒絕時 -wal 不得被刪除或修改');
+            assert.equal(fs.readFileSync(shmPath, 'utf8'), 'SHM_SENTINEL_KEEP_INTACT', '拒絕時 -shm 不得被刪除或修改');
+
+            // 清除人工 sentinel sidecars 以便開啟真實 SQLite WAL Read 連線測試
+            fs.unlinkSync(walPath);
+            fs.unlinkSync(shmPath);
+
+            // 4. 驗證 WAL 模式下：即使外部連線持有閒置連線或 Read Transaction (BEGIN DEFERRED + SELECT)，
+            //    SQLite 的 BEGIN EXCLUSIVE 探測本身在 WAL 下不會失敗，但未明確傳入 offlineConfirmed: true 仍必須拒絕
+            const externalReader = new sqlite3.Database(targetDbPath);
+            await new Promise((resolve, reject) => {
+                externalReader.serialize(() => {
+                    externalReader.run('PRAGMA journal_mode = WAL');
+                    externalReader.run('BEGIN DEFERRED TRANSACTION');
+                    externalReader.get('SELECT COUNT(*) AS cnt FROM nodes', (err) => err ? reject(err) : resolve());
+                });
+            });
+
+            try {
+                await assert.rejects(
+                    async () => {
+                        await sourceDb.backupManager.restoreFromBackup(backupRes.targetPath, targetDbPath, {});
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED/);
+                        assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                        return true;
+                    }
+                );
+            } finally {
+                await new Promise((resolve) => {
+                    externalReader.run('ROLLBACK', () => externalReader.close(() => resolve()));
+                });
+            }
+
+            // 5. 即使傳入 offlineConfirmed: true，若外部連線持有寫入鎖 (BEGIN IMMEDIATE)，Lock Contention Probe 仍會攔截並拒絕
+            const externalWriter = new sqlite3.Database(targetDbPath);
+            await new Promise((resolve, reject) => {
+                externalWriter.run('BEGIN IMMEDIATE TRANSACTION', (err) => err ? reject(err) : resolve());
+            });
+
+            try {
+                await assert.rejects(
+                    async () => {
+                        await sourceDb.backupManager.restoreFromBackup(
+                            backupRes.targetPath,
+                            targetDbPath,
+                            { offlineConfirmed: true }
+                        );
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_RESTORE_TARGET_BUSY_ONLINE/);
+                        assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                        return true;
+                    }
+                );
+            } finally {
+                await new Promise((resolve) => {
+                    externalWriter.run('ROLLBACK', () => externalWriter.close(() => resolve()));
+                });
+            }
+
+            // 6. 確認離線且傳入 offlineConfirmed: true 時，Restore 正常成功
+            const okRestore = await sourceDb.backupManager.restoreFromBackup(
+                backupRes.targetPath,
+                targetDbPath,
+                { offlineConfirmed: true }
+            );
+            assert.equal(okRestore.success, true);
+            assert.equal(okRestore.restoreStatus, RESTORE_STATUS.COMPLETED);
+
+            const restoredVerifyDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            const restoredRow = await restoredVerifyDb.get(`SELECT * FROM nodes WHERE node_id = ?`, ['!node_from_backup']);
+            assert.ok(restoredRow);
+            assert.equal(restoredRow.long_name, 'BackupPayloadNode');
+            await restoredVerifyDb.close();
+
+            await sourceDb.close();
+        } finally {
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(targetDbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test S — Restore Rollback Without Existing Target (4.0.1.2 P1): 驗證目標 DB 原先不存在時，安裝前失敗、安裝後驗證失敗自動清除新檔回退、以及清除失敗之狀態分類', async () => {
+        const sourceDbPath = getTempDbPath('test_s_source');
+        const targetDir = getTempDir('test_s_target_dir');
+        const brandNewTargetPath = path.join(targetDir, 'brand_new_target.db');
+        const siblingDbPath = path.join(targetDir, 'unrelated_sibling.db');
+        const backupDir = getTempDir('test_s_backups');
+
+        try {
+            const sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_s', 'NodeS']);
+            const validBackup = await sourceDb.backupManager.performBackup('test_s_backup.db');
+            assert.equal(validBackup.success, true);
+
+            // 在同一目標目錄放置一個無關的同目錄檔案，確保清理絕不會誤傷無關檔案
+            fs.writeFileSync(siblingDbPath, 'UNRELATED_SIBLING_DB_CONTENT');
+            assert.equal(fs.existsSync(brandNewTargetPath), false, '初始目標 DB 必須不存在');
+
+            // =========================================================================
+            // 情境 S-1 (Case B): 原始目標不存在，rename 安裝前失敗 -> 目標維持不存在、staging 已清理，且不偽造 rollback 成功
+            // =========================================================================
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(
+                        validBackup.targetPath,
+                        brandNewTargetPath,
+                        {
+                            offlineConfirmed: true,
+                            renameImpl: () => {
+                                throw new Error('EXDEV: simulated rename failure before new target installed');
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_INSTALL_FAILED/);
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.FAILED_INSTALL_ABORTED);
+                    assert.equal(err.rollbackSucceeded, false, '尚未安裝新檔且無舊檔可還原時，不得偽報 rollbackSucceeded: true');
+                    assert.equal(err.lifecycle.hadExistingTargetDb, false);
+                    assert.equal(err.lifecycle.newTargetInstalled, false);
+                    return true;
+                }
+            );
+            assert.equal(fs.existsSync(brandNewTargetPath), false, '安裝前失敗後目標路徑應維持不存在');
+            assert.equal(
+                fs.readdirSync(targetDir).filter(f => f.includes('.restore-staging-')).length,
+                0,
+                'staging 暫存檔必須被清理乾淨'
+            );
+
+            // =========================================================================
+            // 情境 S-2 (Case C 成功清除): 原始目標不存在，已 rename 安裝至目標路徑，但安裝後驗證失敗 ->
+            // 必須刪除剛安裝的新目標 DB 與新產生之 -wal/-shm，使目標恢復為「不存在」狀態，且不誤刪 sibling 檔案
+            // =========================================================================
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(
+                        validBackup.targetPath,
+                        brandNewTargetPath,
+                        {
+                            offlineConfirmed: true,
+                            postInstallVerifyImpl: async (installedPath) => {
+                                assert.equal(fs.existsSync(installedPath), true, '此時新目標 DB 應已安裝至目標路徑');
+                                // 模擬安裝後產生了對應的 -wal / -shm sidecar
+                                fs.writeFileSync(`${installedPath}-wal`, 'NEW_TARGET_WAL');
+                                fs.writeFileSync(`${installedPath}-shm`, 'NEW_TARGET_SHM');
+                                return {
+                                    status: BACKUP_VERIFY_STATUS.CORRUPTED,
+                                    details: 'simulated post-install corruption on brand new target'
+                                };
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_POST_INSTALL_INVALID/);
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.FAILED_ROLLED_BACK);
+                    assert.equal(err.rollbackSucceeded, true, '成功清除新安裝之無效目標檔並回到不存在狀態時，rollbackSucceeded 應為 true');
+                    assert.equal(err.lifecycle.hadExistingTargetDb, false);
+                    assert.equal(err.lifecycle.newTargetInstalled, true);
+                    assert.equal(err.lifecycle.postInstallVerified, false);
+                    assert.equal(err.lifecycle.newTargetCleanedUp, true);
+                    return true;
+                }
+            );
+
+            assert.equal(fs.existsSync(brandNewTargetPath), false, '無效的新目標 DB 必須被移除，恢復為不存在狀態');
+            assert.equal(fs.existsSync(`${brandNewTargetPath}-wal`), false, '新產生的 -wal 必須一併被清理');
+            assert.equal(fs.existsSync(`${brandNewTargetPath}-shm`), false, '新產生的 -shm 必須一併被清理');
+            assert.equal(fs.readFileSync(siblingDbPath, 'utf8'), 'UNRELATED_SIBLING_DB_CONTENT', '同目錄無關檔案絕不可被誤刪');
+
+            // =========================================================================
+            // 情境 S-3 (Case C 清除失敗): 原始目標不存在，安裝後驗證失敗，且刪除新目標檔時發生 I/O 失敗 ->
+            // 必須標記為 RESTORE_FAILED_ROLLBACK_INCOMPLETE (rollbackSucceeded: false) 並保留未清除路徑供救援
+            // =========================================================================
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(
+                        validBackup.targetPath,
+                        brandNewTargetPath,
+                        {
+                            offlineConfirmed: true,
+                            postInstallVerifyImpl: async () => ({
+                                status: BACKUP_VERIFY_STATUS.CORRUPTED,
+                                details: 'simulated post-install corruption with unlink failure'
+                            }),
+                            unlinkImpl: (p) => {
+                                if (path.resolve(p) === path.resolve(brandNewTargetPath)) {
+                                    throw new Error('EPERM: simulated unlink failure on newly installed target');
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_POST_INSTALL_INVALID/);
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE);
+                    assert.equal(err.rollbackSucceeded, false, '無法移除殘留新目標檔時嚴禁標記為 rollbackSucceeded: true');
+                    assert.equal(err.lifecycle.newTargetInstalled, true);
+                    assert.equal(err.lifecycle.newTargetCleanedUp, false);
+                    assert.ok(Array.isArray(err.uncleanedTargetPaths));
+                    assert.ok(err.uncleanedTargetPaths.includes(path.resolve(brandNewTargetPath)));
+                    return true;
+                }
+            );
+
+            // 手動清理 S-3 刻意留下的目標檔後，驗證 Case A：對不存在的目標路徑正常還原成功
+            if (fs.existsSync(brandNewTargetPath)) {
+                fs.unlinkSync(brandNewTargetPath);
+            }
+            const okNewRestore = await sourceDb.backupManager.restoreFromBackup(
+                validBackup.targetPath,
+                brandNewTargetPath,
+                { offlineConfirmed: true }
+            );
+            assert.equal(okNewRestore.success, true);
+            assert.equal(okNewRestore.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(okNewRestore.hadExistingTarget, false);
+            assert.equal(okNewRestore.lifecycle.newTargetInstalled, true);
+            assert.equal(okNewRestore.lifecycle.postInstallVerified, true);
+            assert.equal(fs.existsSync(brandNewTargetPath), true);
+
+            await sourceDb.close();
+        } finally {
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(brandNewTargetPath);
+            cleanupTempDir(targetDir);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test T — Backup Rotation maxBackups Exact Count (4.0.1.2 P2): 驗證最新驗證完成之備份計入 maxBackups 總數、不因 #inProgressBackupPaths 漏算，且不受 retentionDays 混淆', async () => {
+        const dbPath = getTempDbPath('test_t_rotation_exact');
+        const backupDir = getTempDir('test_t_backups');
+
+        try {
+            // 設定 maxBackups: 2，並設定超長 retentionDays: 365，確保刪除完全由 maxBackups 觸發而非過期天數
+            const db = await createDatabaseSubsystem({
+                dbPath,
+                backupDir,
+                bootstrapSchema: true,
+                config: {
+                    backup: {
+                        backupDir,
+                        retentionDays: 365,
+                        maxBackups: 2
+                    }
+                }
+            });
+
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_t1', 'NodeT1']);
+
+            // 在同目錄放置未驗證的 .db 檔、staging 暫存檔與非 .db 檔，確認這些檔案不會被計入有效備份數，且 staging 檔不會被誤刪
+            const unverifiedDbFile = path.join(backupDir, 'unverified_manual.db');
+            const activeStagingFile = path.join(backupDir, '.staging-other-job-99999');
+            const invalidExtFile = path.join(backupDir, 'notes.invalid');
+            fs.writeFileSync(unverifiedDbFile, 'UNVERIFIED_DB_BYTES');
+            fs.writeFileSync(activeStagingFile, 'ACTIVE_STAGING_BYTES');
+            fs.writeFileSync(invalidExtFile, 'INVALID_EXT_BYTES');
+
+            // 1. 建立第 1 份真實備份 (b1.db)
+            let b1InProgressDuringRotation = false;
+            const b1 = await db.backupManager.performBackup('b1.db', {
+                beforeRotation: ({ targetPath }) => {
+                    b1InProgressDuringRotation = db.backupManager.getInProgressBackupPaths().includes(targetPath);
+                }
+            });
+            assert.equal(b1.success, true);
+            assert.equal(b1InProgressDuringRotation, true, '輪替執行前 targetPath 仍應位於 #inProgressBackupPaths 中受保護');
+            assert.equal(b1.rotation.retainedCount, 1, '第 1 份備份必須立即計入 retainedCount (1)');
+
+            // 確保時間戳有明確先後順序（且全部在今天，遠小於 retentionDays: 365）
+            const nowSec = Math.floor(Date.now() / 1000);
+            fs.utimesSync(b1.targetPath, nowSec - 30, nowSec - 30);
+
+            // 2. 建立第 2 份真實備份 (b2.db)
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_t2', 'NodeT2']);
+            const b2 = await db.backupManager.performBackup('b2.db');
+            assert.equal(b2.success, true);
+            fs.utimesSync(b2.targetPath, nowSec - 20, nowSec - 20);
+            assert.equal(b2.rotation.retainedCount, 2, '第 2 份備份後 retainedCount 應為 2');
+            assert.equal(fs.existsSync(b1.targetPath), true);
+            assert.equal(fs.existsSync(b2.targetPath), true);
+
+            // 3. 建立第 3 份真實備份 (b3.db) -> 此時有效備份達 3 份，因 maxBackups = 2，最舊的 b1.db 必須在本輪被刪除！
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_t3', 'NodeT3']);
+            let b3StillInProgressAtRotation = false;
+            const b3 = await db.backupManager.performBackup('b3.db', {
+                beforeRotation: ({ targetPath }) => {
+                    b3StillInProgressAtRotation = db.backupManager.getInProgressBackupPaths().includes(targetPath);
+                }
+            });
+            assert.equal(b3.success, true);
+            assert.equal(b3StillInProgressAtRotation, true);
+
+            // 驗證：最新備份 b3.db 已計入總數，因此保留數量精確為 maxBackups (2)，不會殘留 3 份 (maxBackups + 1)
+            assert.equal(b3.rotation.retainedCount, 2, 'retainedCount 必須精確等於 maxBackups (2)');
+            assert.equal(b3.rotation.deletedCount, 1, '應精確刪除 1 份最舊的有效備份 (b1.db)');
+            assert.equal(fs.existsSync(b1.targetPath), false, '最舊的第 1 份備份 b1.db 必須已被輪替刪除');
+            assert.equal(fs.existsSync(b2.targetPath), true, '第 2 新備份 b2.db 必須保留');
+            assert.equal(fs.existsSync(b3.targetPath), true, '最新備份 b3.db 必須保留且不可被誤刪');
+
+            const verifiedList = db.backupManager.getVerifiedBackups();
+            assert.equal(verifiedList.length, 2, '#verifiedBackups 集合必須同步更新為 2 份');
+            assert.equal(verifiedList.includes(b1.targetPath), false);
+            assert.equal(verifiedList.includes(b2.targetPath), true);
+            assert.equal(verifiedList.includes(b3.targetPath), true);
+
+            // 驗證未驗證檔、staging 檔、非 .db 檔均未被當成有效備份且未被誤刪
+            assert.equal(fs.existsSync(unverifiedDbFile), true);
+            assert.equal(fs.existsSync(activeStagingFile), true);
+            assert.equal(fs.existsSync(invalidExtFile), true);
 
             await db.close();
         } finally {

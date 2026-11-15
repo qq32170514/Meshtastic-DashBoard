@@ -103,23 +103,24 @@
 
 ---
 
-### 7. Meshtastic-DashBoard 4.0.1 & 4.0.1.1 — Database Bootstrap, Backup Isolation & Verification Hardening
-- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成啟動階段 Schema Initialization Barrier（P0）、WAL 模式線上備份完整性整合（P1）、Backup Scheduler 隔離（4.0.1.1 P1）、Restore 活躍 DB 防護與可回復 Rollback（4.0.1.1 P1）、Schema Index 完整定義驗證（4.0.1.1 P2）及 Backup Path Containment（4.0.1.1 P2）。
+### 7. Meshtastic-DashBoard 4.0.1 / 4.0.1.1 / 4.0.1.2 — Database Bootstrap, Backup Isolation, Restore Offline Assurance & Retention Fix
+- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成啟動階段 Schema Initialization Barrier（P0）、WAL 模式線上備份完整性整合（P1）、Backup Scheduler 隔離（4.0.1.1 P1）、Restore 活躍 DB 防護與可回復 Rollback（4.0.1.1 P1）、Schema Index 完整定義驗證（4.0.1.1 P2）、Backup Path Containment（4.0.1.1 P2）、Restore 離線保證三層契約（4.0.1.2 P1）、Restore 無既有目標時之安裝後失敗清理與 Rollback 狀態（4.0.1.2 P1），以及 Backup Rotation `maxBackups` 最新備份精確計數修正（4.0.1.2 P2）。
 - **新增與修改模組**：
   - [schema-bootstrap.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js)（新增與強化）：
     - 嚴格定義並依序執行：**Step 1 核心資料表建立（8 張表）** $\rightarrow$ **Step 2 欄位擴充 Migration（26 個欄位，`PRAGMA table_info` 預檢 + 型別相容性檢查 + 錯誤分類，禁止以空回呼吞錯）** $\rightarrow$ **Step 3 清理廢棄索引（5 個）** $\rightarrow$ **Step 4 建立必要索引（11 個，位於 Migration 後確保 `gateway_id` 與 `hops_away` 已存在）** $\rightarrow$ **Step 5 最終 Schema & Index Definition Verification（`verifyDatabaseSchema` + `verifySingleIndexDefinition`，透過 `PRAGMA index_list`、`PRAGMA index_xinfo` 與 `sqlite_master.sql` 檢驗索引所屬表、欄位順序、ASC/DESC、UNIQUE 與 Partial WHERE 條件）**。
   - [backup-manager.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)：
     - **Backup Scheduler Isolation (4.0.1.1 P1)**：`performBackup()` 僅將 `VACUUM INTO`（寫入唯一 `.staging-*` 暫存檔）放入 `adapter.maintenanceTask()`，完成後立即釋放 Scheduler；後續 `verifyIntegrity()`、可回復式 `.prev-*` rename 安裝與 `_rotateOldBackups()` 均於 Scheduler 外以獨立唯讀連線執行，且全流程受 `#backupInProgress` 與 `#inProgressBackupPaths` 保護。
-    - **Restore Safety Hardening (4.0.1.1 P1)**：`restoreFromBackup()` 新增活躍 `SQLiteAdapter` 路徑檢查（`_findActiveAdapterUsingPath`）與離線鎖探測（`BEGIN EXCLUSIVE` with `busy_timeout=0`），嚴禁對線上活躍資料庫還原；替換時先將原始 DB/WAL/SHM 移至 `.rollback-*` 路徑，安裝或驗證失敗時自動 Rollback 恢復原始資料庫，並明確區分 `RESTORE_COMPLETED`、`RESTORE_REJECTED_PRECONDITION`、`RESTORE_FAILED_ROLLED_BACK` 與 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`。
+    - **Restore Offline Assurance & Safety Hardening (4.0.1.1 P1 / 4.0.1.2 P1)**：`restoreFromBackup()` 實施三層離線保護：(1) **Adapter Path Protection**（`_findActiveAdapterUsingPath` 拒絕覆蓋程序內活躍或等待 native close 之 Adapter DB）；(2) **Offline Confirmation**（預設強制要求 `options.offlineConfirmed === true`，未提供或為 `false` 時立即以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 拒絕，防止 WAL 模式下外部閒置或唯讀連線繞過鎖探測）；(3) **Lock Contention Probe**（`BEGIN EXCLUSIVE` with `busy_timeout=0` 輔助偵測外部寫入鎖競爭）。
+    - **Restore Rollback for Existing & New Target (4.0.1.1 P1 / 4.0.1.2 P1)**：完整追蹤還原 `lifecycle` 狀態；若原始目標已存在，替換前移至 `.rollback-*` 並於失敗時自動還原；若原始目標不存在且已安裝新目標後驗證失敗，自動清除剛安裝之無效目標 DB 與新產生的 `-wal`/`-shm` sidecars 回到不存在狀態，並精確區分 `RESTORE_COMPLETED`、`RESTORE_REJECTED_PRECONDITION`、`RESTORE_FAILED_INSTALL_ABORTED`、`RESTORE_FAILED_ROLLED_BACK` 與 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`。
+    - **Backup Rotation `maxBackups` Exact Count (4.0.1.2 P2)**：修正 `_rotateOldBackups(targetDir, latestVerifiedPath)`，將本輪剛通過驗證並安裝完成的 `latestVerifiedPath` 明確納入 `verifiedCandidates` 計數一次並標記 `protectedFromDeletion: true`，同時保留 `#inProgressBackupPaths` 對其他進行中/暫存路徑的保護，消除最新備份被漏算導致保留 `maxBackups + 1` 份的問題。
     - **Backup Path Containment (4.0.1.1 P2)**：`validateBackupFilePath()` 嚴格拒絕 NUL 字元、`../`、POSIX/Windows 絕對路徑、磁碟機路徑、UNC 路徑與子目錄斜線。
-    - 強化 `_rotateOldBackups()`（僅計入與清理已驗證成功的備份、保護進行中備份、由舊到新依序清理、**絕不刪除唯一可用備份**）。
   - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
     - 新增 `isSchemaReady`、`bootstrapError`、`schemaReport`、`isBootstrapReady()` 與 `executeWithStartupBarrier()`，並註冊 `adapter.dbPath` 至 `BackupManager.registerAdapter()`。
     - 移除 `index.js` 頂層未等待的 `db.serialize()` DDL 與 `(err) => {}` 空回呼，以及頂層過早執行的 `cleanupOldData()`；統一由 `startServer()` 等待 `db.readyPromise` 與 `db.isBootstrapReady()` 後才啟動 HTTP/API、Socket.IO、MQTT 與背景清理工作者。
     - 移除 `index.js` 中 WAL 模式下不安全的 `fs.copyFileSync(sourceDbPath, targetBackupPath)`，正式串接 `db.backupManager.startSchedule('0 0 * * 0', ...)`，並於 `handleShutdown()` 停止備份排程。
 - **測試與文件**：
-  - [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Test A 至 Test Q 共 17 項測試），連同既有 46 項測試共 **63 項測試全數通過（63 passed, 0 failed, 0 skipped）**。
-  - 技術文件 [DATA_INTEGRITY_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/DATA_INTEGRITY_GUIDE.md)（更新至 `4.0.1.1 — Backup Isolation & Verification Hardening`）。
+  - [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Test A 至 Test T 共 20 項測試），連同既有 46 項測試共 **66 項測試全數通過（66 passed, 0 failed, 0 skipped）**。
+  - 技術文件 [DATA_INTEGRITY_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/DATA_INTEGRITY_GUIDE.md)（更新至 `4.0.1.2 — Restore Offline Assurance & Retention Fix`）。
 
 ---
 

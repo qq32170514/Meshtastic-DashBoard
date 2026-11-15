@@ -14,6 +14,7 @@ const BACKUP_VERIFY_STATUS = {
 const RESTORE_STATUS = {
     COMPLETED: 'RESTORE_COMPLETED',
     REJECTED_PRECONDITION: 'RESTORE_REJECTED_PRECONDITION',
+    FAILED_INSTALL_ABORTED: 'RESTORE_FAILED_INSTALL_ABORTED',
     FAILED_ROLLED_BACK: 'RESTORE_FAILED_ROLLED_BACK',
     FAILED_ROLLBACK_INCOMPLETE: 'RESTORE_FAILED_ROLLBACK_INCOMPLETE'
 };
@@ -50,6 +51,8 @@ class BackupManager {
     #backupInProgress = false;
     #inProgressBackupPaths = new Set();
     #verifiedBackups = new Set();
+    #verifiedBackupSeqMap = new Map();
+    #backupSeqCounter = 0;
     #scheduledTask = null;
     #scheduledCronExpression = null;
 
@@ -97,6 +100,33 @@ class BackupManager {
 
     get scheduledCronExpression() {
         return this.#scheduledCronExpression;
+    }
+
+    /**
+     * 取得目前正在執行中之備份保護路徑清單快照 (唯讀診斷與測試驗證用)
+     */
+    getInProgressBackupPaths() {
+        return Array.from(this.#inProgressBackupPaths);
+    }
+
+    /**
+     * 取得目前已通過驗證之有效備份路徑清單快照 (唯讀診斷與測試驗證用)
+     */
+    getVerifiedBackups() {
+        return Array.from(this.#verifiedBackups);
+    }
+
+    _markBackupVerified(fullPath) {
+        const resolved = path.resolve(fullPath);
+        this.#verifiedBackups.add(resolved);
+        this.#backupSeqCounter++;
+        this.#verifiedBackupSeqMap.set(resolved, this.#backupSeqCounter);
+    }
+
+    _unmarkBackupVerified(fullPath) {
+        const resolved = path.resolve(fullPath);
+        this.#verifiedBackups.delete(resolved);
+        this.#verifiedBackupSeqMap.delete(resolved);
     }
 
     /**
@@ -440,10 +470,16 @@ class BackupManager {
                 throw installErr;
             }
 
-            this.#verifiedBackups.add(targetPath);
+            this._markBackupVerified(targetPath);
             this.#inProgressBackupPaths.delete(stagingPath);
 
+            if (options && typeof options.beforeRotation === 'function') {
+                await options.beforeRotation({ targetPath });
+            }
+
             // 階段 4: 於 Scheduler 外執行舊備份掃描與輪替清理
+            // 注意：此時 targetPath 仍位於 #inProgressBackupPaths 中受保護，同時由 _rotateOldBackups 明確識別
+            // 納入有效備份總數計算一次且標記為本輪不可刪除。
             console.log(`✅ [BACKUP] 備份成功並通過完整性檢驗: ${targetPath}`);
             const rotation = await this._rotateOldBackups(resolvedTargetDir, targetPath);
 
@@ -519,36 +555,48 @@ class BackupManager {
     }
 
     /**
-     * 確認目標資料庫處於離線且未被鎖定狀態 (4.0.1.1 P1 Restore Precondition)
+     * 確認目標資料庫滿足 Restore 離線保證條件 (4.0.1.2 P1 — Restore Offline Assurance):
+     * 嚴格區分三層檢查：
+     * 1. Adapter Path Protection: 確認目標路徑未被程序內已註冊之 SQLiteAdapter 使用且無進行中之 Native Close。
+     * 2. Offline Confirmation: 強制要求呼叫端明確傳入 `options.offlineConfirmed === true`，確認目標已進入受控離線維護狀態。
+     * 3. Lock Contention Probe: 作為輔助檢查偵測當下寫入鎖衝突 (注意：WAL 模式下 BEGIN EXCLUSIVE 成功不等於無外部閒置或唯讀連線)。
      */
     async _assertTargetDbOffline(resolvedTarget, options = {}) {
-        // 1. 檢查是否為目前或任何程序內活躍 SQLiteAdapter 正在使用的路徑
+        // 1. Adapter Path Protection
         const activeMatch = this._findActiveAdapterUsingPath(resolvedTarget);
         if (activeMatch) {
             const err = new Error(
                 `[BACKUP_RESTORE_ACTIVE_DB_FORBIDDEN] 目標路徑 (${resolvedTarget}) 正由活躍的 SQLiteAdapter 使用中 (state: ${activeMatch.state}, nativeClosePending: ${activeMatch.nativeClosePending})，禁止對線上資料庫執行 Restore`
             );
+            err.code = 'BACKUP_RESTORE_ACTIVE_DB_FORBIDDEN';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             err.reason = 'ACTIVE_ADAPTER_DB_PATH';
             throw err;
         }
 
-        // 2. 若呼叫端明確要求離線確認旗標但未提供，拒絕執行
-        if (options && options.requireOfflineConfirmation === true && options.offlineConfirmed !== true) {
+        // 2. Offline Confirmation (預設強制要求，不得省略)
+        if (!options || options.offlineConfirmed !== true) {
             const err = new Error(
-                `[BACKUP_RESTORE_OFFLINE_REQUIRED] 目標資料庫還原要求明確確認離線狀態 (offlineConfirmed: true)`
+                `[BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED] 執行 Restore 必須由呼叫端明確傳入 { offlineConfirmed: true } 確認目標資料庫已進入受控離線維護狀態`
             );
+            err.code = 'BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
-            err.reason = 'OFFLINE_CONFIRMATION_MISSING';
+            err.reason = 'OFFLINE_CONFIRMATION_REQUIRED';
             throw err;
         }
 
-        // 3. 若目標檔案已存在於磁碟，透過 busy_timeout=0 + BEGIN EXCLUSIVE 探測是否被其他程序或未關閉連線持有鎖
+        // 3. Lock Contention Probe (輔助檢查：偵測外部寫入交易鎖衝突，不作為無外部連線之唯一證明)
         if (fs.existsSync(resolvedTarget)) {
             await new Promise((resolve, reject) => {
                 const probeDb = new sqlite3.Database(resolvedTarget, sqlite3.OPEN_READWRITE, (openErr) => {
                     if (openErr) {
-                        return reject(new Error(`[BACKUP_RESTORE_TARGET_UNAVAILABLE] 無法開啟目標資料庫以確認離線狀態: ${openErr.message}`));
+                        const unavailErr = new Error(
+                            `[BACKUP_RESTORE_TARGET_UNAVAILABLE] 無法開啟目標資料庫以執行輔助鎖定探測: ${openErr.message}`
+                        );
+                        unavailErr.code = 'BACKUP_RESTORE_TARGET_UNAVAILABLE';
+                        unavailErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
+                        unavailErr.reason = 'TARGET_DB_OPEN_FAILED';
+                        return reject(unavailErr);
                     }
                     probeDb.serialize(() => {
                         probeDb.run('PRAGMA busy_timeout = 0');
@@ -556,8 +604,9 @@ class BackupManager {
                             if (lockErr) {
                                 return probeDb.close(() => {
                                     const busyErr = new Error(
-                                        `[BACKUP_RESTORE_TARGET_BUSY_ONLINE] 目標資料庫 (${resolvedTarget}) 目前被其他連線或程序鎖定中 (${lockErr.message})，禁止執行線上覆蓋還原`
+                                        `[BACKUP_RESTORE_TARGET_BUSY_ONLINE] 目標資料庫 (${resolvedTarget}) 目前被其他連線或程序持有衝突鎖定 (${lockErr.message})，禁止執行還原`
                                     );
+                                    busyErr.code = 'BACKUP_RESTORE_TARGET_BUSY_ONLINE';
                                     busyErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
                                     busyErr.reason = 'TARGET_DB_LOCKED_OR_ONLINE';
                                     reject(busyErr);
@@ -566,7 +615,12 @@ class BackupManager {
                             probeDb.run('ROLLBACK', () => {
                                 probeDb.close((closeErr) => {
                                     if (closeErr) {
-                                        return reject(new Error(`[BACKUP_RESTORE_TARGET_UNAVAILABLE] 關閉離線探測連線失敗: ${closeErr.message}`));
+                                        const closeProbeErr = new Error(
+                                            `[BACKUP_RESTORE_TARGET_UNAVAILABLE] 關閉輔助鎖定探測連線失敗: ${closeErr.message}`
+                                        );
+                                        closeProbeErr.code = 'BACKUP_RESTORE_TARGET_UNAVAILABLE';
+                                        closeProbeErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
+                                        return reject(closeProbeErr);
                                     }
                                     resolve();
                                 });
@@ -579,17 +633,20 @@ class BackupManager {
     }
 
     /**
-     * 從已驗證之備份檔案安全還原至獨立離線目標資料庫路徑，並具備可回復 Rollback 保護 (4.0.1.1 P1 Restore Safety Hardening)
+     * 從已驗證之備份檔案安全還原至獨立離線目標資料庫路徑，
+     * 具備 Offline Assurance 與針對既有/全新目標之精確 Rollback 狀態追蹤 (4.0.1.2 P1)
      */
     async restoreFromBackup(backupFilePath, targetRestoreDbPath, options = {}) {
         if (!backupFilePath || !targetRestoreDbPath || typeof backupFilePath !== 'string' || typeof targetRestoreDbPath !== 'string') {
             const err = new Error('[BACKUP_RESTORE_ERROR] backupFilePath 與 targetRestoreDbPath 皆為必填非空字串');
+            err.code = 'BACKUP_RESTORE_ERROR';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             this.lastRestoreError = err;
             throw err;
         }
         if (backupFilePath.includes('\0') || targetRestoreDbPath.includes('\0')) {
             const err = new Error('[BACKUP_RESTORE_ERROR] 路徑包含非法 NUL 字元');
+            err.code = 'BACKUP_RESTORE_ERROR';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             this.lastRestoreError = err;
             throw err;
@@ -601,6 +658,7 @@ class BackupManager {
         // Precondition 1: 目標路徑不能與來源備份路徑相同 (含正規化與不分大小寫比對)
         if (_normalizeComparablePath(resolvedSource) === _normalizeComparablePath(resolvedTarget)) {
             const err = new Error('[BACKUP_RESTORE_ERROR] 來源備份路徑與目標還原路徑不得相同');
+            err.code = 'BACKUP_RESTORE_ERROR';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             this.lastRestoreError = err;
             throw err;
@@ -609,12 +667,13 @@ class BackupManager {
         // Precondition 2: 目標路徑不得是正在進行中之備份路徑
         if (this.#inProgressBackupPaths.has(resolvedTarget) || this.#inProgressBackupPaths.has(resolvedSource)) {
             const err = new Error('[BACKUP_RESTORE_REJECTED] 來源或目標路徑正在執行備份作業中，禁止同時還原');
+            err.code = 'BACKUP_RESTORE_REJECTED';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             this.lastRestoreError = err;
             throw err;
         }
 
-        // Precondition 3: 目標路徑不得為現有活躍 Adapter 使用中之 DB，且必須處於離線狀態
+        // Precondition 3: 檢查 Adapter Path Protection、Offline Confirmation (必填) 與輔助 Lock Contention Probe
         try {
             await this._assertTargetDbOffline(resolvedTarget, options);
         } catch (preErr) {
@@ -622,6 +681,7 @@ class BackupManager {
             this.lastRestoreResult = {
                 success: false,
                 restoreStatus: preErr.restoreStatus || RESTORE_STATUS.REJECTED_PRECONDITION,
+                reason: preErr.reason || null,
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: preErr.message,
@@ -636,6 +696,7 @@ class BackupManager {
             const err = new Error(
                 `[BACKUP_RESTORE_REJECTED] 來源備份未通過完整性檢驗 (${sourceVerify.status}): ${sourceVerify.details}`
             );
+            err.code = 'BACKUP_RESTORE_REJECTED';
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             this.lastRestoreError = err;
             this.lastRestoreResult = {
@@ -653,6 +714,20 @@ class BackupManager {
         if (!fs.existsSync(targetDir)) {
             fs.mkdirSync(targetDir, { recursive: true });
         }
+
+        // 明確追蹤 Restore 生命週期狀態 (4.0.1.2 P1 — Restore Rollback for New Target)
+        const lifecycle = {
+            stagingCreated: false,
+            stagingVerified: false,
+            hadExistingTargetDb: fs.existsSync(resolvedTarget),
+            hadExistingSidecars: fs.existsSync(`${resolvedTarget}-wal`) || fs.existsSync(`${resolvedTarget}-shm`),
+            originalMovedToRollback: false,
+            newTargetInstalled: false,
+            postInstallVerified: false,
+            newTargetCleanedUp: false,
+            originalRestored: false
+        };
+        const hadAnyExistingTargetFiles = lifecycle.hadExistingTargetDb || lifecycle.hadExistingSidecars;
 
         // Step 1: 在目標 DB 同一目錄 (同一檔案系統) 建立唯一 staging DB
         const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
@@ -681,12 +756,15 @@ class BackupManager {
                     });
                 });
             });
+            lifecycle.stagingCreated = fs.existsSync(stagingRestorePath);
         } catch (stageErr) {
             stageErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
+            stageErr.lifecycle = { ...lifecycle };
             this.lastRestoreError = stageErr;
             this.lastRestoreResult = {
                 success: false,
                 restoreStatus: RESTORE_STATUS.REJECTED_PRECONDITION,
+                lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: stageErr.message,
@@ -703,10 +781,12 @@ class BackupManager {
                 `[BACKUP_RESTORE_VERIFY_FAILED] 還原 staging DB 未通過完整性檢驗 (${stagingVerify.status}): ${stagingVerify.details}`
             );
             err.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
+            err.lifecycle = { ...lifecycle };
             this.lastRestoreError = err;
             this.lastRestoreResult = {
                 success: false,
                 restoreStatus: RESTORE_STATUS.REJECTED_PRECONDITION,
+                lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: err.message,
@@ -714,16 +794,19 @@ class BackupManager {
             };
             throw err;
         }
+        lifecycle.stagingVerified = true;
 
         // Step 3: 替換前再次確認目標 DB 離線且未被活躍 Adapter 使用
         try {
             await this._assertTargetDbOffline(resolvedTarget, options);
         } catch (recheckErr) {
             this._cleanupFileAndSidecars(stagingRestorePath);
+            recheckErr.lifecycle = { ...lifecycle };
             this.lastRestoreError = recheckErr;
             this.lastRestoreResult = {
                 success: false,
                 restoreStatus: recheckErr.restoreStatus || RESTORE_STATUS.REJECTED_PRECONDITION,
+                lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: recheckErr.message,
@@ -732,7 +815,7 @@ class BackupManager {
             throw recheckErr;
         }
 
-        // Step 4: 將原始目標 DB 與其 -wal / -shm sidecar 移至可回復之 rollback 路徑 (絕不先行直接刪除)
+        // Step 4: 若原始目標 DB 或其 -wal / -shm 存在，移至可回復之 rollback 路徑 (絕不先行直接刪除)
         const targetFilesToProtect = [
             { original: resolvedTarget, rollback: `${resolvedTarget}.rollback-${uniqueSuffix}` },
             { original: `${resolvedTarget}-wal`, rollback: `${resolvedTarget}-wal.rollback-${uniqueSuffix}` },
@@ -742,6 +825,12 @@ class BackupManager {
         const renameFn = (options && typeof options.renameImpl === 'function')
             ? options.renameImpl
             : fs.renameSync;
+        const unlinkFn = (options && typeof options.unlinkImpl === 'function')
+            ? options.unlinkImpl
+            : fs.unlinkSync;
+        const postInstallVerifyFn = (options && typeof options.postInstallVerifyImpl === 'function')
+            ? options.postInstallVerifyImpl
+            : (filePath) => this.verifyIntegrity(filePath);
 
         try {
             for (const item of targetFilesToProtect) {
@@ -749,6 +838,9 @@ class BackupManager {
                     fs.renameSync(item.original, item.rollback);
                     movedRollbacks.push(item);
                 }
+            }
+            if (movedRollbacks.length > 0) {
+                lifecycle.originalMovedToRollback = true;
             }
         } catch (moveOriginalErr) {
             // 若移動原始 DB 或 WAL/SHM 失敗，立即按反序回復已移動之檔案
@@ -765,21 +857,27 @@ class BackupManager {
             }
             this._cleanupFileAndSidecars(stagingRestorePath);
 
-            const status = rollbackErrors.length === 0
+            const rollbackSucceeded = rollbackErrors.length === 0;
+            lifecycle.originalRestored = rollbackSucceeded;
+            const status = rollbackSucceeded
                 ? RESTORE_STATUS.FAILED_ROLLED_BACK
                 : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
             const err = new Error(
                 `[BACKUP_RESTORE_PREPARE_FAILED] 備份原始目標檔案至 rollback 路徑時失敗 (${moveOriginalErr.message}) | 狀態: ${status}`
             );
             err.restoreStatus = status;
-            err.rollbackSucceeded = rollbackErrors.length === 0;
+            err.rollbackSucceeded = rollbackSucceeded;
             err.rollbackErrors = rollbackErrors;
+            err.preservedRollbackPaths = rollbackSucceeded ? [] : movedRollbacks.map(m => m.rollback);
+            err.lifecycle = { ...lifecycle };
             this.lastRestoreError = err;
             this.lastRestoreResult = {
                 success: false,
                 restoreStatus: status,
-                rollbackSucceeded: rollbackErrors.length === 0,
+                rollbackSucceeded,
                 rollbackErrors,
+                preservedRollbackPaths: err.preservedRollbackPaths,
+                lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: err.message,
@@ -788,20 +886,24 @@ class BackupManager {
             throw err;
         }
 
-        // Step 5: 將已驗證的 staging DB 安裝至目標路徑並驗證替換成功，若失敗則自動執行 Rollback
+        // Step 5: 將已驗證的 staging DB 安裝至目標路徑並執行安裝後完整性驗證
         try {
             if (options && typeof options.beforeFinalInstall === 'function') {
                 await options.beforeFinalInstall({ stagingRestorePath, resolvedTarget, movedRollbacks });
             }
 
             renameFn(stagingRestorePath, resolvedTarget);
+            lifecycle.newTargetInstalled = true;
 
-            const installedVerify = await this.verifyIntegrity(resolvedTarget);
-            if (installedVerify.status !== BACKUP_VERIFY_STATUS.VALID) {
+            const installedVerify = await postInstallVerifyFn(resolvedTarget);
+            if (!installedVerify || installedVerify.status !== BACKUP_VERIFY_STATUS.VALID) {
+                const vStatus = installedVerify ? installedVerify.status : 'UNKNOWN';
+                const vDetails = installedVerify ? installedVerify.details : 'NO_VERIFY_RESULT';
                 throw new Error(
-                    `[BACKUP_RESTORE_POST_INSTALL_INVALID] 安裝後目標資料庫驗證失敗 (${installedVerify.status}): ${installedVerify.details}`
+                    `[BACKUP_RESTORE_POST_INSTALL_INVALID] 安裝後目標資料庫驗證失敗 (${vStatus}): ${vDetails}`
                 );
             }
+            lifecycle.postInstallVerified = true;
 
             // Step 6: 確認替換與驗證完全成功後，才清理 rollback 檔案
             const cleanupWarnings = [];
@@ -820,7 +922,8 @@ class BackupManager {
                 restoreStatus: RESTORE_STATUS.COMPLETED,
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
-                hadExistingTarget: movedRollbacks.length > 0,
+                hadExistingTarget: hadAnyExistingTargetFiles,
+                lifecycle: { ...lifecycle },
                 cleanupWarnings,
                 verify: installedVerify,
                 timestamp: new Date().toISOString()
@@ -829,31 +932,109 @@ class BackupManager {
             this.lastRestoreResult = result;
             return result;
         } catch (installErr) {
-            // 中途失敗：移除不完整的目標檔並將 rollback 檔案完整復原回原始路徑
-            try {
-                if (fs.existsSync(resolvedTarget) && movedRollbacks.length > 0) {
-                    fs.unlinkSync(resolvedTarget);
-                }
-            } catch (_) {}
-
             const rollbackErrors = [];
-            for (let i = movedRollbacks.length - 1; i >= 0; i--) {
-                const moved = movedRollbacks[i];
-                try {
-                    if (fs.existsSync(moved.rollback)) {
-                        fs.renameSync(moved.rollback, moved.original);
+            const uncleanedTargetPaths = [];
+
+            // 檢查新目標檔案或本次新產生的 sidecars 是否已存在於目標路徑 (不依賴 movedRollbacks.length！)
+            const targetOrSidecarPresent =
+                lifecycle.newTargetInstalled ||
+                fs.existsSync(resolvedTarget) ||
+                fs.existsSync(`${resolvedTarget}-wal`) ||
+                fs.existsSync(`${resolvedTarget}-shm`);
+
+            if (targetOrSidecarPresent) {
+                for (const newFile of [resolvedTarget, `${resolvedTarget}-wal`, `${resolvedTarget}-shm`]) {
+                    if (fs.existsSync(newFile)) {
+                        try {
+                            unlinkFn(newFile);
+                        } catch (unlinkErr) {
+                            rollbackErrors.push(`無法移除安裝失敗之新目標檔案 ${newFile}: ${unlinkErr.message}`);
+                            uncleanedTargetPaths.push(newFile);
+                        }
                     }
-                } catch (rbErr) {
-                    rollbackErrors.push(`${moved.rollback} -> ${moved.original}: ${rbErr.message}`);
                 }
+                lifecycle.newTargetCleanedUp =
+                    uncleanedTargetPaths.length === 0 &&
+                    !fs.existsSync(resolvedTarget) &&
+                    !fs.existsSync(`${resolvedTarget}-wal`) &&
+                    !fs.existsSync(`${resolvedTarget}-shm`);
             }
 
+            // 若原始目標存在且已移至 rollback 路徑，按反序將 rollback 檔案復原回原始路徑
+            if (movedRollbacks.length > 0) {
+                for (let i = movedRollbacks.length - 1; i >= 0; i--) {
+                    const moved = movedRollbacks[i];
+                    try {
+                        if (fs.existsSync(moved.rollback)) {
+                            fs.renameSync(moved.rollback, moved.original);
+                        }
+                    } catch (rbErr) {
+                        rollbackErrors.push(`${moved.rollback} -> ${moved.original}: ${rbErr.message}`);
+                    }
+                }
+                lifecycle.originalRestored =
+                    rollbackErrors.length === 0 &&
+                    (!lifecycle.hadExistingTargetDb || fs.existsSync(resolvedTarget));
+            }
+
+            // 清理殘留之 staging 檔案
             this._cleanupFileAndSidecars(stagingRestorePath);
 
-            const rollbackSucceeded = rollbackErrors.length === 0;
-            const status = rollbackSucceeded
-                ? RESTORE_STATUS.FAILED_ROLLED_BACK
-                : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
+            // 判定最終狀態 (嚴格區分 Case B / Case C / Case D):
+            // - Case B: 原始目標不存在 (!hadAnyExistingTargetFiles) 且新目標根本未安裝成功 (!targetOrSidecarPresent)
+            //           -> 並未發生新目標安裝與 Rollback，回傳 FAILED_INSTALL_ABORTED (rollbackSucceeded: false)
+            // - Case C: 原始目標不存在 (!hadAnyExistingTargetFiles)，但新目標已安裝 (targetOrSidecarPresent)，
+            //           因安裝後驗證失敗而移除新目標以恢復「原本不存在」之狀態：
+            //           -> 若成功移除且確認目標恢復為不存在：回傳 FAILED_ROLLED_BACK (rollbackSucceeded: true)
+            //           -> 若移除失敗留有殘留檔：回傳 FAILED_ROLLBACK_INCOMPLETE (rollbackSucceeded: false)，並保留救援路徑
+            // - Case D: 原始目標存在 (hadAnyExistingTargetFiles)，替換失敗後自 rollback 恢復原始檔案：
+            //           -> 若新壞檔已清除且原始檔案完整恢復：回傳 FAILED_ROLLED_BACK (rollbackSucceeded: true)
+            //           -> 若恢復失敗：回傳 FAILED_ROLLBACK_INCOMPLETE (rollbackSucceeded: false)，並保留救援路徑
+            let status;
+            let rollbackSucceeded;
+            let preservedRollbackPaths = [];
+
+            if (!hadAnyExistingTargetFiles && !targetOrSidecarPresent) {
+                // Case B: 原始目標不存在且 Rename 階段即失敗 (未安裝新檔)
+                const targetStillAbsent =
+                    !fs.existsSync(resolvedTarget) &&
+                    !fs.existsSync(`${resolvedTarget}-wal`) &&
+                    !fs.existsSync(`${resolvedTarget}-shm`);
+                rollbackSucceeded = false;
+                status = targetStillAbsent
+                    ? RESTORE_STATUS.FAILED_INSTALL_ABORTED
+                    : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
+                if (!targetStillAbsent) {
+                    preservedRollbackPaths = [...uncleanedTargetPaths];
+                }
+            } else if (!hadAnyExistingTargetFiles && targetOrSidecarPresent) {
+                // Case C: 原始目標不存在，新目標已安裝但安裝後驗證失敗
+                const targetRestoredToAbsent =
+                    lifecycle.newTargetCleanedUp &&
+                    rollbackErrors.length === 0 &&
+                    !fs.existsSync(resolvedTarget) &&
+                    !fs.existsSync(`${resolvedTarget}-wal`) &&
+                    !fs.existsSync(`${resolvedTarget}-shm`);
+                rollbackSucceeded = targetRestoredToAbsent;
+                status = targetRestoredToAbsent
+                    ? RESTORE_STATUS.FAILED_ROLLED_BACK
+                    : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
+                if (!targetRestoredToAbsent) {
+                    preservedRollbackPaths = [...uncleanedTargetPaths];
+                }
+            } else {
+                // Case D: 原始目標存在，需恢復原始 DB 與 sidecars
+                rollbackSucceeded = rollbackErrors.length === 0 && lifecycle.originalRestored;
+                status = rollbackSucceeded
+                    ? RESTORE_STATUS.FAILED_ROLLED_BACK
+                    : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
+                if (!rollbackSucceeded) {
+                    preservedRollbackPaths = [
+                        ...movedRollbacks.map(m => m.rollback).filter(p => fs.existsSync(p)),
+                        ...uncleanedTargetPaths
+                    ];
+                }
+            }
 
             const finalErr = new Error(
                 `[BACKUP_RESTORE_INSTALL_FAILED] 還原替換失敗 (${installErr.message}) | 回復狀態: ${status}`
@@ -862,7 +1043,9 @@ class BackupManager {
             finalErr.restoreStatus = status;
             finalErr.rollbackSucceeded = rollbackSucceeded;
             finalErr.rollbackErrors = rollbackErrors;
-            finalErr.preservedRollbackPaths = rollbackSucceeded ? [] : movedRollbacks.map(m => m.rollback);
+            finalErr.uncleanedTargetPaths = uncleanedTargetPaths;
+            finalErr.preservedRollbackPaths = preservedRollbackPaths;
+            finalErr.lifecycle = { ...lifecycle };
 
             this.lastRestoreError = finalErr;
             this.lastRestoreResult = {
@@ -870,7 +1053,9 @@ class BackupManager {
                 restoreStatus: status,
                 rollbackSucceeded,
                 rollbackErrors,
-                preservedRollbackPaths: finalErr.preservedRollbackPaths,
+                uncleanedTargetPaths,
+                preservedRollbackPaths,
+                lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
                 error: finalErr.message,
@@ -881,7 +1066,11 @@ class BackupManager {
     }
 
     /**
-     * 清理過期或超額備份 (4.0.1 P1: 僅清理已驗證成功之備份、絕不刪除唯一可用備份、絕不刪除建立中備份)
+     * 清理過期或超額備份 (4.0.1.2 P2 — Backup Rotation maxBackups Exact Count):
+     * 1. 明確識別本輪剛通過完整性驗證並完成安裝的 `latestVerifiedPath`，將其納入有效備份總數計算一次（不因 #inProgressBackupPaths 而忽略，也不重複計數）。
+     * 2. 將 `latestVerifiedPath` 標記為本輪不可刪除保護對象。
+     * 3. 其他位於 `#inProgressBackupPaths` 中的 staging 或進行中檔案仍維持嚴格跳過與保護。
+     * 4. 僅將通過驗證的有效備份納入計數，並確保至少保留 1 份最新可用備份。
      */
     async _rotateOldBackups(targetDir = this.#backupDir, latestVerifiedPath = null) {
         try {
@@ -893,16 +1082,34 @@ class BackupManager {
                 : null;
             const cutoffTime = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
 
+            const resolvedLatest = latestVerifiedPath ? path.resolve(latestVerifiedPath) : null;
+            const normLatest = (
+                resolvedLatest &&
+                this.#verifiedBackups.has(resolvedLatest) &&
+                fs.existsSync(resolvedLatest)
+            )
+                ? _normalizeComparablePath(resolvedLatest)
+                : null;
+
             const files = fs.readdirSync(targetDir);
             const verifiedCandidates = [];
+            const seenNormalizedPaths = new Set();
 
             for (const file of files) {
                 if (!file.endsWith('.db')) continue;
                 if (file.startsWith('.staging-') || file.startsWith('.prev-') || file.startsWith('.restore-staging-')) continue;
-                const fullPath = path.resolve(targetDir, file);
 
-                // 絕不碰觸正在建立中的備份
-                if (this.#inProgressBackupPaths.has(fullPath)) continue;
+                const fullPath = path.resolve(targetDir, file);
+                const normPath = _normalizeComparablePath(fullPath);
+                if (!normPath || seenNormalizedPaths.has(normPath)) continue;
+
+                const isCurrentLatestVerified = Boolean(normLatest && normPath === normLatest);
+
+                // 絕不碰觸其他正在建立中的備份或 staging 檔案；
+                // 但允許本輪剛完成驗證與安裝的 latestVerifiedPath 納入有效備份總數並受不可刪除保護
+                if (this.#inProgressBackupPaths.has(fullPath) && !isCurrentLatestVerified) {
+                    continue;
+                }
 
                 let stats;
                 try {
@@ -913,47 +1120,69 @@ class BackupManager {
                 if (!stats.isFile() || stats.size <= 0) continue;
 
                 // 只將已驗證成功之備份納入保留計數與清理候選
-                let isVerified = this.#verifiedBackups.has(fullPath) || (latestVerifiedPath && fullPath === path.resolve(latestVerifiedPath));
+                let isVerified = this.#verifiedBackups.has(fullPath) || isCurrentLatestVerified;
                 if (!isVerified) {
                     const check = await this.verifyIntegrity(fullPath);
                     if (check.status === BACKUP_VERIFY_STATUS.VALID) {
-                        this.#verifiedBackups.add(fullPath);
+                        this._markBackupVerified(fullPath);
                         isVerified = true;
                     }
                 }
 
                 if (isVerified) {
+                    seenNormalizedPaths.add(normPath);
                     verifiedCandidates.push({
                         file,
                         fullPath,
-                        mtimeMs: stats.mtimeMs
+                        mtimeMs: stats.mtimeMs,
+                        verifiedSeq: this.#verifiedBackupSeqMap.get(fullPath) || 0,
+                        isCurrentLatestVerified,
+                        protectedFromDeletion: isCurrentLatestVerified
                     });
                 }
             }
 
             // 若有效備份數 <= 1，絕不刪除唯一可用備份
             if (verifiedCandidates.length <= 1) {
-                return { retainedCount: verifiedCandidates.length, deletedFiles: [] };
+                return {
+                    retainedCount: verifiedCandidates.length,
+                     retainedFiles: verifiedCandidates.map(c => c.file),
+                    deletedFiles: []
+                };
             }
 
-            // 依修改時間由新到舊排序 (index 0 為最新有效備份，永遠保留)
-            verifiedCandidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+            // 依下列優先序由新到舊排序 (index 0 為最新有效備份，永遠保留):
+            // 1. 本輪剛完成驗證的 latestVerifiedPath 優先置於 index 0 (受本輪不可刪除保護)
+            // 2. 依檔案修改時間 mtimeMs 由新到舊
+            // 3. 若同一毫秒內建立多份備份 (mtimeMs 相同)，依驗證序號 verifiedSeq 由新到舊
+            verifiedCandidates.sort((a, b) => {
+                if (a.isCurrentLatestVerified !== b.isCurrentLatestVerified) {
+                    return a.isCurrentLatestVerified ? -1 : 1;
+                }
+                if (b.mtimeMs !== a.mtimeMs) {
+                    return b.mtimeMs - a.mtimeMs;
+                }
+                return b.verifiedSeq - a.verifiedSeq;
+            });
 
             const deletedFiles = [];
+            const retainedFiles = [];
             let remainingValidCount = verifiedCandidates.length;
 
-            // 由最舊往較新方向依序檢查刪除，確保保留順序與最低 1 份可用備份
+            // 由最舊往較新方向依序檢查刪除，確保保留順序、保護最新備份與最低 1 份可用備份
             for (let i = verifiedCandidates.length - 1; i >= 1; i--) {
-                if (remainingValidCount <= 1) break;
-
                 const candidate = verifiedCandidates[i];
+                if (remainingValidCount <= 1 || candidate.protectedFromDeletion) {
+                    continue;
+                }
+
                 const expiredByAge = candidate.mtimeMs < cutoffTime;
-                const exceededMaxCount = maxBackups !== null && i >= maxBackups;
+                const exceededMaxCount = maxBackups !== null && remainingValidCount > maxBackups;
 
                 if (expiredByAge || exceededMaxCount) {
                     try {
                         fs.unlinkSync(candidate.fullPath);
-                        this.#verifiedBackups.delete(candidate.fullPath);
+                        this._unmarkBackupVerified(candidate.fullPath);
                         remainingValidCount--;
                         deletedFiles.push(candidate.file);
                         console.log(`🗑️ [BACKUP_ROTATE] 已清除舊備份: ${candidate.file}`);
@@ -963,10 +1192,21 @@ class BackupManager {
                 }
             }
 
-            return { retainedCount: remainingValidCount, deletedFiles };
+            for (const candidate of verifiedCandidates) {
+                if (!deletedFiles.includes(candidate.file) && fs.existsSync(candidate.fullPath)) {
+                    retainedFiles.push(candidate.file);
+                }
+            }
+
+            return {
+                retainedCount: remainingValidCount,
+                deletedCount: deletedFiles.length,
+                retainedFiles,
+                deletedFiles
+            };
         } catch (err) {
             console.warn('⚠️ [BACKUP_ROTATE_WARN] 清理過期備份遭遇警告:', err.message);
-            return { retainedCount: 0, deletedFiles: [], error: err.message };
+            return { retainedCount: 0, deletedCount: 0, retainedFiles: [], deletedFiles: [], error: err.message };
         }
     }
 

@@ -1,7 +1,7 @@
-# Meshtastic-DashBoard 4.0.1.1 — Backup Isolation & Verification Hardening
+# Meshtastic-DashBoard 4.0.1.2 — Restore Offline Assurance & Retention Fix
 
-> **版本定位**：4.0.1.1 Backup Isolation & Verification Hardening（修正 4.0.1 的 Backup Scheduler 長時間占用、Restore 活躍資料庫安全防護、Schema Index Definition Verification、Backup Path Containment，以及測試邊界與文件精確度）
-> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7 與 4.0.1 Data Integrity 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
+> **版本定位**：4.0.1.2 Restore Offline Assurance & Retention Fix（在 4.0.1.1 Backup Isolation & Verification Hardening 基礎上，強化 Restore 離線保證三層契約、補齊目標資料庫原先不存在時之安裝後失敗清理與 Rollback 狀態分類，以及修正 Backup Rotation 中最新已驗證備份未計入 `maxBackups` 之問題）
+> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7、4.0.1 與 4.0.1.1 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
 
 ---
 
@@ -89,13 +89,16 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 [Phase 3] Reversible Staging Install to Official Backup File
    ├── 若 targetPath 已存在舊的有效備份，先移至同目錄 .prev-<filename>-<suffix>
    ├── 將通過驗證的 stagingPath rename 為正式 targetPath
-   │     ├── 若 rename 成功：清理 .prev-* 暫存檔，將 targetPath 加入 #verifiedBackups
+   │     ├── 若 rename 成功：清理 .prev-* 暫存檔，呼叫 _markBackupVerified(targetPath) 納入 #verifiedBackups（附單調序號）
    │     └── 若 rename 失敗：立即將 .prev-* 還原回 targetPath（確保既有有效備份絕不損毀），清理 stagingPath 並拋錯
 
-[Phase 4] Backup Rotation (Outside Scheduler)
-   ├── 執行 _rotateOldBackups()：忽略 .staging-* / .prev-* / 非 .db 檔案與未驗證檔案
-   ├── 按 mtimeMs 由舊到新清理超過 retentionDays 或 maxBackups 之已驗證備份
-   └── 強制保留至少 1 份最新有效備份（retainedCount >= 1，絕不刪除唯一可用備份）
+[Phase 4] Backup Rotation (Outside Scheduler, 4.0.1.2 P2 修正)
+   ├── 執行 _rotateOldBackups(resolvedTargetDir, targetPath)：
+   │     ├── 將本輪剛通過驗證並安裝完成的 latestVerifiedPath (targetPath) 明確納入 verifiedCandidates 計數一次，
+   │     │   並標記 protectedFromDeletion: true（本輪絕不刪除最新備份，亦不因仍位於 #inProgressBackupPaths 而漏算）
+   │     ├── 其餘位於 #inProgressBackupPaths 的暫存檔或進行中路徑、.staging-* / .prev-* / 非 .db 檔案與未驗證檔案一律跳過保護
+   │     ├── 按 mtimeMs 由新到舊排序（同毫秒時以驗證序號打破平手），由最舊候選開始檢查 retentionDays 與 remainingValidCount > maxBackups
+   │     └── 強制保留至少 1 份最新有效備份（retainedCount >= 1，絕不刪除唯一可用備份）
 
 [Phase 5] Final Convergence (finally block)
    └── 確保殘留 stagingPath 被清除，自 #inProgressBackupPaths 移除路徑，並將 #backupInProgress 設回 false
@@ -104,43 +107,64 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 ### 3.3 備份排程政策（Backup Scheduling Policy）現況與待確認事項
 - 在 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L4517-L4533) 中，定時備份排程之 `shouldRun()` 目前檢查 `process.env.BACKUP_PATH` 是否存在；若未設定 `BACKUP_PATH`，排程觸發時會回傳 `false` 而不執行自動備份（即使 `BackupManager` 建構子本身具備預設本地 `./backups` 目錄）。
 - 此外，`index.js` 原始註解寫為「每 12 小時自動備份資料庫至雲端」，實際 Cron 表達式為 `'0 0 * * 0'`（每週日 00:00），而 [`src/database/sqlite.config.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/sqlite.config.js) 中的 `backup.cronSchedule` 則為 `'0 4 * * *'`（每日 04:00）。
-- **處理原則**：在未獲明確指示變更排程政策前，4.0.1.1 嚴格保留 `index.js` 現有的 `BACKUP_PATH` 檢查與 `'0 0 * * 0'` 行為不變，並將上述兩項設定差異列為待確認事項。
+- **處理原則**：在未獲明確指示變更排程政策前，4.0.1.2 嚴格保留 `index.js` 現有的 `BACKUP_PATH` 檢查與 `'0 0 * * 0'` 行為不變，並將上述兩項設定差異列為待確認事項。
 
 ---
 
-## 4. Restore Safety 與可回復替換機制（4.0.1.1 P1）
+## 4. Restore Offline Assurance 與可回復替換機制（4.0.1.1 P1 & 4.0.1.2 P1）
 
-[`BackupManager.restoreFromBackup(backupFilePath, targetRestoreDbPath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L510-L760) 針對還原作業實施嚴格的前置檢查與可回復（Rollback）替換流程：
+[`BackupManager.restoreFromBackup(backupFilePath, targetRestoreDbPath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L525-L895) 針對還原作業實施三層離線安全防護與完整生命週期可回復（Rollback）替換流程。
 
-### 4.1 Restore 前置檢查（Preconditions）
-1. **參數與路徑正規化檢查**：拒絕空字串或含 NUL 字元之路徑；使用 `_normalizeComparablePath()`（結合 `path.resolve`、`fs.realpathSync.native` 與 Windows 不分大小寫正規化）確認來源備份路徑與目標還原路徑不相同。
-2. **禁止覆蓋進行中備份**：若來源或目標路徑位於 `#inProgressBackupPaths` 中，拒絕執行。
-3. **Active Adapter DB Path 防護（`_findActiveAdapterUsingPath`）**：
-   - 比對目前 `BackupManager` 所屬 `adapter` 以及程序內所有已註冊 `SQLiteAdapter` 實例的資料庫路徑（`adapter.dbPath` / `adapter.db.filename`）。
-   - 只要目標路徑對應的 `SQLiteAdapter` 尚未完全關閉（`state !== ADAPTER_STATES.CLOSED`、`db !== null` 或 `nativeClosePending === true`），立即以 `[BACKUP_RESTORE_ACTIVE_DB_FORBIDDEN]` 拒絕還原，**絕不在資料庫仍被 Adapter 使用時刪除或替換其 DB / WAL / SHM 檔案**。
-4. **Offline Restore 鎖定探測（`_assertTargetDbOffline`）**：
-   - 若目標資料庫檔案已存在於磁碟，還原前會開啟短暫探測連線設定 `PRAGMA busy_timeout = 0` 並執行 `BEGIN EXCLUSIVE TRANSACTION; ROLLBACK;`。
-   - 若目標資料庫正被其他程序或未關閉連線鎖定，立即以 `[BACKUP_RESTORE_TARGET_BUSY_ONLINE]` 拒絕執行。
-5. **來源備份與 Staging 雙重完整性驗證**：
-   - 先對 `backupFilePath` 執行 `verifyIntegrity()`。
-   - 再於目標資料庫同一目錄下透過 `VACUUM INTO` 建立 `.restore-staging-<basename>-<suffix>`，並對該 staging DB 執行 `verifyIntegrity()`。
-   - 替換前再次執行 `_assertTargetDbOffline()` 二次確認。
+### 4.1 為什麼 WAL 模式下 `BEGIN EXCLUSIVE` 不能證明外部連線已關閉（4.0.1.2 P1）
+- 在 SQLite **WAL（Write-Ahead Logging）模式**下，讀寫並發採快照隔離（Snapshot Isolation）：
+  1. **外部閒置連線（Idle Connection）**：開啟資料庫檔案但未持有進行中交易時，不會持有寫入鎖，另一條連線執行 `BEGIN EXCLUSIVE TRANSACTION` 會直接成功。
+  2. **外部唯讀或讀取交易連線（Read-Only / `BEGIN DEFERRED` + `SELECT`）**：在 WAL 模式下，Reader 僅讀取 WAL end mark 快照，不會阻擋 Writer 取得 `EXCLUSIVE` 寫入鎖。
+- 若在此情況下直接對磁碟上的 `<db>`、`<db>-wal`、`<db>-shm` 進行檔案層級 `rename` / `unlink` 替換，外部仍開啟檔案描述符的連線會出現描述符與磁碟路徑脫鉤（Split-Brain）、WAL Shared-Memory Index (`-shm`) 不一致，甚至導致資料庫損毀。
+- 因此，**SQLite Lock Probe（`BEGIN EXCLUSIVE`）只能作為「是否有活躍外部寫入鎖競爭」的輔助檢查，絕不能單獨作為目標資料庫已完全離線的充分證明**。`restoreFromBackup()` 預設強制要求呼叫端明確傳入 `options.offlineConfirmed === true`。
 
-### 4.2 原始 DB 保留、WAL/SHM 處理與 Rollback 狀態定義
-1. **移至可回復 Rollback 路徑（絕不直接先行刪除）**：
-   - 將目標路徑既有的 `<db>`、`<db>-wal`、`<db>-shm` 依序 `fs.renameSync` 至同目錄下的 `.rollback-<suffix>` 路徑。
-   - **不忽略任何 WAL / SHM 移動錯誤**：若移動過程中任何一個檔案失敗，立即按反序將已移動的 `.rollback-*` 檔案復原回原位，清理 staging DB 並報錯。
-2. **安裝 Staging DB 與自動 Rollback**：
-   - 將已驗證的 `stagingRestorePath` rename 至 `resolvedTarget`，並對安裝後的 `resolvedTarget` 再次執行 `verifyIntegrity()`。
-   - 若安裝 rename 或安裝後驗證失敗：
-     - 自動移除不完整的目標檔，並按反序將 `<db>.rollback-*`、`<db>-wal.rollback-*`、`<db>-shm.rollback-*` 移回原始路徑。
-     - 清理 `stagingRestorePath`。
-   - 唯有在安裝與驗證完全成功後，才刪除 `.rollback-*` 備份檔。
-3. **明確的還原結果狀態（`RESTORE_STATUS`）**：
-   - `RESTORE_COMPLETED`：還原成功且安裝後通過 `verifyIntegrity()`，原始 `.rollback-*` 已清理。
-   - `RESTORE_REJECTED_PRECONDITION`：於替換原始檔案前因前置條件（如目標為活躍 Adapter DB、外部鎖定、來源備份損壞或 staging 驗證失敗）被安全攔截，原始目標資料庫完全未動。
-   - `RESTORE_FAILED_ROLLED_BACK`：替換過程中發生錯誤，且原始目標 DB 與 WAL/SHM 已自動從 `.rollback-*` 完整復原（`err.rollbackSucceeded === true`）。
-   - `RESTORE_FAILED_ROLLBACK_INCOMPLETE`：替換失敗且自動復原過程中遭遇檔案系統錯誤（`err.rollbackSucceeded === false`），此時保留磁碟上的 `.rollback-*` 檔案並於 `err.preservedRollbackPaths` 與 `err.rollbackErrors` 提供完整救援路徑與診斷資訊。
+### 4.2 Restore 三層離線安全機制職責表
+
+| 防護層級 | 實作方法 / 參數 | 職責與保護範圍 | 失敗時錯誤碼與狀態 |
+| :--- | :--- | :--- | :--- |
+| **Layer 1: Adapter Path Protection** | `_findActiveAdapterUsingPath(resolvedTarget)` | 檢查程序內所有已註冊之 `SQLiteAdapter`（含 `state !== CLOSED`、`db !== null` 或 `nativeClosePending === true`），禁止還原覆蓋本程序正在使用或尚在等待 native close 的資料庫路徑。 | `BACKUP_RESTORE_ACTIVE_DB_FORBIDDEN` (`RESTORE_REJECTED_PRECONDITION`) |
+| **Layer 2: Offline Confirmation (預設強制)** | `options.offlineConfirmed === true` | 要求呼叫端明確聲明並確認目標資料庫已處於受控離線維護狀態（所有服務、背景工作與外部讀寫連線均已關閉）。未提供或為 `false` 時一律預設拒絕，絕不修改任何 DB / WAL / SHM 檔案。 | `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` (`RESTORE_REJECTED_PRECONDITION`) |
+| **Layer 3: Lock Contention Probe (輔助探測)** | `PRAGMA busy_timeout = 0` + `BEGIN EXCLUSIVE TRANSACTION; ROLLBACK;` | 於目標檔案已存在時，在替換前與實際 rename 前二次探測是否有其他程序或外部連線正持有活躍 SQLite 寫入鎖（如 `BEGIN IMMEDIATE` / `EXCLUSIVE`）。 | `BACKUP_RESTORE_TARGET_BUSY_ONLINE` (`RESTORE_REJECTED_PRECONDITION`) |
+
+### 4.3 Restore 生命週期與 Rollback 機制（含「既有目標 DB」與「全新目標 DB」）
+
+`restoreFromBackup()` 以明確的 `lifecycle` 結構追蹤每個階段：
+`{ stagingCreated, stagingVerified, hadExistingTargetDb, hadExistingSidecars, originalMovedToRollback, newTargetInstalled, postInstallVerified, newTargetCleanedUp, originalRestored }`。
+
+1. **前置驗證與 Staging 建立**：
+   - 驗證路徑正規化、禁止覆蓋 `#inProgressBackupPaths`、通過三層離線檢查（`_assertTargetDbOffline`）。
+   - 對來源備份 `backupFilePath` 執行 `verifyIntegrity()`。
+   - 在目標同目錄下透過 `VACUUM INTO` 建立 `.restore-staging-<basename>-<suffix>`（`stagingCreated = true`），並對 staging DB 執行 `verifyIntegrity()`（`stagingVerified = true`）。
+2. **區分目標路徑初始狀態與四種完成/失敗情境（Cases A / B / C / D）**：
+   - **Case A — 原始目標不存在，還原成功**：
+     - 直接將已驗證之 `stagingRestorePath` rename 至 `resolvedTarget`（`newTargetInstalled = true`），並通過安裝後 `verifyIntegrity(resolvedTarget)`（`postInstallVerified = true`），回傳 `RESTORE_COMPLETED`。
+   - **Case B — 原始目標不存在，於新目標檔安裝前失敗（例如 `rename` 失敗）**：
+     - `newTargetInstalled === false`，目標路徑維持不存在，清理 `stagingRestorePath`。
+     - 因未曾安裝新檔亦無舊檔可還原，**絕不偽報 Rollback 成功**，標記為 `RESTORE_FAILED_INSTALL_ABORTED`（`rollbackSucceeded: false`）。
+   - **Case C — 原始目標不存在，新目標 DB 已安裝至目標路徑，但安裝後 `verifyIntegrity()` 失敗**：
+     - `hadExistingTargetDb === false` 且 `newTargetInstalled === true`。
+     - 立即移除剛安裝到目標路徑的無效 DB 以及本次還原新產生的 `<db>-wal` / `<db>-shm` sidecars（僅針對 `resolvedTarget` 及其 `-wal`/`-shm`，絕不觸碰同目錄其他無關檔案），使目標路徑回到「不存在」的乾淨初始狀態。
+     - 若無效新目標與 sidecars 全數清除成功（確認目標路徑已不存在）：`newTargetCleanedUp = true`，標記為 `RESTORE_FAILED_ROLLED_BACK`（`rollbackSucceeded: true`）。
+     - 若移除無效新目標檔時遭遇檔案系統錯誤導致殘留：`newTargetCleanedUp = false`，標記為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`rollbackSucceeded: false`），並於 `err.uncleanedTargetPaths` 與 `err.preservedRollbackPaths` 保留殘留路徑供人工處理。
+   - **Case D — 原始目標已存在，替換或安裝後驗證失敗**：
+     - 替換前先將既有 `<db>`、`<db>-wal`、`<db>-shm` 依序移至 `.rollback-<suffix>`（不忽略任何移動失敗）。
+     - 若後續安裝 `rename` 或安裝後 `verifyIntegrity()` 失敗：先移除目標路徑上不完整的新檔案與 sidecars，再按反序將 `.rollback-*` 移回原始 `<db>`、`<db>-wal`、`<db>-shm`。
+     - 若原始資料庫與 sidecars 全數復原成功：`originalRestored = true`，標記為 `RESTORE_FAILED_ROLLED_BACK`（`rollbackSucceeded: true`）。
+     - 若復原失敗：保留 `.rollback-*` 檔案並標記為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`rollbackSucceeded: false`）。
+
+### 4.4 `RESTORE_STATUS` 狀態定義總表
+
+| 狀態常數 (`RESTORE_STATUS`) | 狀態值 | 意義與觸發條件 |
+| :--- | :--- | :--- |
+| `COMPLETED` | `'RESTORE_COMPLETED'` | 還原替換完成且安裝後目標資料庫通過 `verifyIntegrity()`，所有暫存與 `.rollback-*` 已清理。 |
+| `REJECTED_PRECONDITION` | `'RESTORE_REJECTED_PRECONDITION'` | 於觸碰目標檔案前因前置條件（未傳 `offlineConfirmed: true`、目標為活躍 Adapter DB、外部鎖競爭、來源備份無效或 staging 驗證失敗）被安全拒絕，目標 DB / WAL / SHM 毫髮無損。 |
+| `FAILED_INSTALL_ABORTED` | `'RESTORE_FAILED_INSTALL_ABORTED'` | 原始目標資料庫不存在（`hadExistingTargetDb === false`），且在將 staging 安裝至目標路徑前即失敗（`newTargetInstalled === false`）；staging 已清理，目標維持不存在（`rollbackSucceeded: false`）。 |
+| `FAILED_ROLLED_BACK` | `'RESTORE_FAILED_ROLLED_BACK'` | 安裝或安裝後驗證失敗，但系統已成功回退至還原前狀態：(1) 既有目標 DB 已從 `.rollback-*` 完整復原，或 (2) 原先不存在之目標路徑已將新安裝之無效目標檔與 sidecars 徹底清除回不存在狀態（`rollbackSucceeded: true`）。 |
+| `FAILED_ROLLBACK_INCOMPLETE` | `'RESTORE_FAILED_ROLLBACK_INCOMPLETE'` | 安裝或安裝後驗證失敗，且在還原 `.rollback-*` 或清除無效新目標檔時發生檔案系統錯誤（`rollbackSucceeded: false`），保留現場檔案路徑於 `err.preservedRollbackPaths` / `err.uncleanedTargetPaths`。 |
 
 ---
 
@@ -148,9 +172,7 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 
 所有測試均於開發環境透過 `npm run test:database` 實際執行，並使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫檔案，測試後完整關閉連線與清除暫存檔。
 
-為確保技術審查透明度，以下明確區分各項測試的**實際測試類型**（真實 SQLite 整合測試 vs. Coordinator 單元測試 vs. 錯誤注入模擬測試）：
-
-### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（17 項測試）
+### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（20 項測試：Tests A – T）
 
 | 測試編號與名稱 | 測試分類 | 實際驗證方式與邊界說明 |
 | :--- | :--- | :--- |
@@ -165,12 +187,15 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test I — Backup Integrity Failure** | 真實 0-byte 檔案測試 + Verification Failure Injection | 1. 對真實 0-byte 空檔案執行 `verifyIntegrity()` 驗證回傳 `CORRUPTED`；2. 透過 stubbing `verifyIntegrity` 模擬損壞結果，驗證 `performBackup()` 拒絕標記成功並清理 staging。 |
 | **Test J — Incomplete Backup Cleanup** | Mid-Backup I/O Failure Simulation + Real Retry | 攔截第一次 `VACUUM INTO` 寫入半成品 staging 檔案後拋出模擬 I/O 錯誤，驗證 `.staging-*` 被徹底清除，且第二次真實 `VACUUM INTO` 備份成功。 |
 | **Test K — Backup Retention** | 真實 SQLite Backup + Filesystem mtime Test | 建立 3 份真實備份並調整 `utimesSync` 與置入未驗證壞檔，驗證按順序刪除最舊備份、忽略未驗證檔，且當僅剩 1 份有效備份時即使過期 365 天也絕不刪除。 |
-| **Test L — Backup Restore Verification** | 真實 SQLite End-to-End Backup & Restore Test | 對真實臨時 DB 備份後，呼叫 `restoreFromBackup()` 還原至第二個獨立臨時 DB，並以新 `createDatabaseSubsystem` 開啟驗證資料一致性與後續讀寫。 |
+| **Test L — Backup Restore Verification** | 真實 SQLite End-to-End Backup & Restore Test | 對真實臨時 DB 備份後，呼叫 `restoreFromBackup(..., { offlineConfirmed: true })` 還原至第二個獨立臨時 DB，並以新 `createDatabaseSubsystem` 開啟驗證資料一致性與後續讀寫。 |
 | **Test M — Backup Scheduler Non-Overlap & Shutdown Race** | 真實 SQLite + `ShutdownHandler.handle()` Integration Test | 驗證重疊排程自動跳過；並測試在 `VACUUM INTO` 執行期間觸發真實 `ShutdownHandler.handle('SIGTERM')`（涵蓋「於 Deadline 內完成並安全關閉」與「超過 Deadline 時拒絕呼叫 `db.close()` 保護活動連線」兩種情境）。 |
 | **Test N — P1 Backup Scheduler Isolation** | 真實 SQLite Integration + Rename Failure Injection | 在 `VACUUM INTO` 完成後、`verifyIntegrity` 開始前（`afterVacuumBeforeVerify` Gate），驗證 `maintenanceInProgress === false` 且 `WriteQueue` 可立即寫入主 DB；同時以 `renameImpl` 注入錯誤驗證同名舊有效備份不會因新備份安裝失敗而損毀。 |
-| **Test O — P1 Restore Safety Hardening** | 真實 SQLite Active DB & Lock Detection + Rollback Injection | 驗證拒絕還原至當前活躍 Adapter DB、拒絕還原至另一活躍 Adapter DB、拒絕還原至被外部連線 `BEGIN IMMEDIATE` 鎖定之 DB；並以 `renameImpl` 注入錯誤驗證替換失敗時自動從 `.rollback-*` 完整復原原始離線 DB。 |
+| **Test O — P1 Restore Safety Hardening (Existing Target)** | 真實 SQLite Active DB & Lock Detection + Rollback Injection | 驗證拒絕還原至當前活躍 Adapter DB、拒絕還原至另一活躍 Adapter DB、拒絕還原至被外部連線 `BEGIN IMMEDIATE` 鎖定之 DB；並以 `renameImpl` 注入錯誤驗證替換既有離線 DB 失敗時自動從 `.rollback-*` 完整復原原始離線 DB。 |
 | **Test P — P2 Schema Index Definition Verification** | 真實 SQLite PRAGMA Verification Test | 在真實臨時 SQLite DB 中預先建立同名但欄位順序顛倒、`ASC`/`DESC` 相反、`UNIQUE` 不符、含 Partial `WHERE` 或掛錯資料表的索引，驗證 `verifyDatabaseSchema()` 全數檢出並阻擋啟動。 |
 | **Test Q — P2 Backup Path Containment** | Unit & Integration Validation Test | 驗證 `validateBackupFilePath()` 與 `performBackup()` 接受合法檔名，並拒絕 `../`、`..\`、POSIX/Windows 絕對路徑、`C:` 磁碟機路徑、UNC 路徑、子目錄斜線與 NUL 字元。 |
+| **Test R — Restore Offline Confirmation (4.0.1.2 P1)** | 真實 SQLite WAL Read/Write Connection + Precondition Test | 驗證省略 `offlineConfirmed` 或傳入 `offlineConfirmed: false` 時皆以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 拒絕且不更動目標 DB / `-wal` / `-shm`；驗證外部連線持有 WAL Read Transaction 時仍受 `offlineConfirmed` 保護；驗證外部寫入鎖受 Lock Probe 攔截；並驗證離線且 `offlineConfirmed: true` 時成功還原。 |
+| **Test S — Restore Rollback Without Existing Target (4.0.1.2 P1)** | 真實 SQLite Restore + Post-Install Failure & Unlink Injection Test | 針對原始目標資料庫不存在之情境，驗證：(S-1) 安裝前 `rename` 失敗回傳 `RESTORE_FAILED_INSTALL_ABORTED` (`rollbackSucceeded: false`)；(S-2) 新目標已安裝但安裝後驗證失敗時，自動清除新目標 DB 與 `-wal`/`-shm` 回到不存在狀態且不傷及同目錄其他檔案，回傳 `RESTORE_FAILED_ROLLED_BACK` (`rollbackSucceeded: true`)；(S-3) 清除失敗時回傳 `RESTORE_FAILED_ROLLBACK_INCOMPLETE` (`rollbackSucceeded: false`)。 |
+| **Test T — Backup Rotation maxBackups Exact Count (4.0.1.2 P2)** | 真實 SQLite `VACUUM INTO` Backup Rotation Test | 設定 `maxBackups: 2` 與 `retentionDays: 365`（排除過期天數干擾），連續建立 3 份真實備份並確認輪替時 `targetPath` 仍位於 `#inProgressBackupPaths`，驗證最新備份計入總數、第 3 份完成後精確保留最新 2 份並刪除最舊第 1 份，且忽略未驗證檔與 staging 檔。 |
 
 ### 5.2 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線測試）
 - 完整保留 v2.7.7 結案之 46 項測試（包含真实 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。
