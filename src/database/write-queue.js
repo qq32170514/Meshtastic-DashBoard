@@ -168,7 +168,7 @@ class WriteQueue {
         }
         item.callbackInvoked = true;
         try {
-            item.callback(err, result);
+            item.callback.call(result || {}, err, result);
         } catch (cbErr) {
             console.error(`❌ [CALLBACK_EXCEPTION] 使用者回呼拋出異常 (item ${item.id}):`, cbErr.message);
         }
@@ -217,6 +217,11 @@ class WriteQueue {
                 id: item.id,
                 sql: item.sql,
                 params: item.params,
+                isTransactionUnit: Boolean(item.isTransactionUnit),
+                statements: item.statements || null,
+                packetMeta: item.packetMeta || null,
+                failedStatementIndex: error && typeof error.failedStatementIndex === 'number' ? error.failedStatementIndex : null,
+                failedStatementSql: error && error.failedStatementSql ? error.failedStatementSql : null,
                 attempt: item.attempt,
                 error: error ? error.message : 'QUARANTINED',
                 timestamp: Date.now()
@@ -227,6 +232,9 @@ class WriteQueue {
                 id: item.id,
                 sql: item.sql,
                 params: item.params,
+                isTransactionUnit: Boolean(item.isTransactionUnit),
+                statements: item.statements || null,
+                packetMeta: item.packetMeta || null,
                 seq: item.seq,
                 attempt: item.attempt,
                 error: error ? error.message : 'UNCOMMITTED_ERROR',
@@ -251,14 +259,39 @@ class WriteQueue {
     }
 
     /**
-     * 寫入請求入列
+     * 寫入請求入列 (支援單筆 SQL 或 4.0.2 不可拆分之多語句封包交易單位 statements)
      */
     enqueue(sqlOrItem, paramsOrCb, maybeCb) {
         let sql;
         let params = [];
         let callback = null;
+        let isTransactionUnit = false;
+        let statements = null;
+        let packetMeta = null;
 
-        if (typeof sqlOrItem === 'object' && sqlOrItem !== null && typeof sqlOrItem.sql === 'string') {
+        if (typeof sqlOrItem === 'object' && sqlOrItem !== null && Array.isArray(sqlOrItem.statements)) {
+            callback = sqlOrItem.callback || (typeof paramsOrCb === 'function' ? paramsOrCb : (typeof maybeCb === 'function' ? maybeCb : null));
+            const rawStatements = sqlOrItem.statements;
+            if (
+                rawStatements.length === 0 ||
+                !rawStatements.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
+            ) {
+                this.totalRejected++;
+                const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
+                this._safeRejectCallback(callback, err);
+                return false;
+            }
+            isTransactionUnit = true;
+            statements = rawStatements.map((s) => ({
+                sql: s.sql,
+                params: Array.isArray(s.params) ? s.params : []
+            }));
+            sql = typeof sqlOrItem.label === 'string' && sqlOrItem.label.trim().length > 0
+                ? sqlOrItem.label.trim()
+                : `[PACKET_TX:${statements.length}] ${statements[0].sql.trim()}`;
+            params = statements[0].params;
+            packetMeta = sqlOrItem.packetMeta || null;
+        } else if (typeof sqlOrItem === 'object' && sqlOrItem !== null && typeof sqlOrItem.sql === 'string') {
             sql = sqlOrItem.sql;
             params = sqlOrItem.params || [];
             callback = sqlOrItem.callback || (typeof paramsOrCb === 'function' ? paramsOrCb : null);
@@ -310,6 +343,9 @@ class WriteQueue {
             seq: ++this.#itemSeq,
             sql,
             params,
+            isTransactionUnit,
+            statements,
+            packetMeta,
             callback,
             callbackInvoked: false,
             status: ITEM_STATUS.QUEUED,
@@ -322,6 +358,18 @@ class WriteQueue {
 
         this._checkTriggerFlush();
         return true;
+    }
+
+    /**
+     * 🌟 4.0.2 Packet Transaction Boundary: 將同一個邏輯封包的多筆 SQL 作為單一不可拆分交易單位入列
+     */
+    enqueuePacketTransaction(statements, callback = null, options = {}) {
+        return this.enqueue({
+            statements,
+            callback,
+            label: options && options.label ? options.label : undefined,
+            packetMeta: options && options.packetMeta ? options.packetMeta : undefined
+        });
     }
 
     _checkTriggerFlush() {
@@ -523,23 +571,76 @@ class WriteQueue {
         };
 
         try {
+            const executionResults = new Map();
             await executeFn(async (tx) => {
                 for (const item of batch) {
-                    await tx.execute(item.sql, item.params);
+                    if (item.isTransactionUnit && Array.isArray(item.statements)) {
+                        const statementResults = [];
+                        let lastID = undefined;
+                        let totalChanges = 0;
+                        for (let stepIdx = 0; stepIdx < item.statements.length; stepIdx++) {
+                            const stmt = item.statements[stepIdx];
+                            try {
+                                const res = await tx.execute(stmt.sql, stmt.params);
+                                statementResults.push(res);
+                                if (res && res.lastID !== undefined) {
+                                    lastID = res.lastID;
+                                }
+                                if (res && typeof res.changes === 'number') {
+                                    totalChanges += res.changes;
+                                }
+                            } catch (stmtErr) {
+                                stmtErr.fromPacketTransactionUnit = true;
+                                stmtErr.failedStatementIndex = stepIdx;
+                                stmtErr.failedStatementSql = stmt.sql;
+                                stmtErr.packetUnitId = item.id;
+                                throw stmtErr;
+                            }
+                        }
+                        executionResults.set(item.id, {
+                            id: item.id,
+                            status: 'COMMITTED',
+                            isTransactionUnit: true,
+                            statementCount: item.statements.length,
+                            lastID,
+                            changes: totalChanges,
+                            statementResults
+                        });
+                    } else {
+                        const res = await tx.execute(item.sql, item.params);
+                        executionResults.set(item.id, {
+                            id: item.id,
+                            status: 'COMMITTED',
+                            isTransactionUnit: false,
+                            statementCount: 1,
+                            lastID: res ? res.lastID : undefined,
+                            changes: res ? res.changes : undefined
+                        });
+                    }
                 }
             });
 
             // 成功提交：Exactly-once Accounting (P1-02)
+            // 僅在底層 COMMIT 成功後，才轉換狀態並觸發回呼
             for (const item of batch) {
                 this._transitionItem(item, ITEM_STATUS.COMMITTED);
-                this._invokeCallback(item, null, { id: item.id, status: 'COMMITTED' });
+                const itemRes = executionResults.get(item.id) || { id: item.id, status: 'COMMITTED' };
+                this._invokeCallback(item, null, itemRes);
             }
         } catch (err) {
             const errType = classifyError(err);
 
-            // 僅在資料約束錯誤時遞迴二分拆分 (P0-1)
-            if (errType === ERROR_TYPES.DATA_CONSTRAINT) {
-                await this._binaryIsolateBatch(batch, capability, deadlineAt);
+            // 資料約束錯誤，或單一封包交易單位內部的語句錯誤（非磁碟滿額/鎖競爭/結構損毀/回滾失敗/Deadline）時，
+            // 以「整個 queue item（封包交易單位）」為最小不可拆分粒度進行遞迴二分隔離 (P0-1 & 4.0.2)
+            const isIsolatablePacketError = Boolean(
+                err &&
+                err.fromPacketTransactionUnit &&
+                errType === ERROR_TYPES.UNKNOWN &&
+                !(err.message && err.message.includes('DEADLINE_EXPIRED'))
+            );
+
+            if (errType === ERROR_TYPES.DATA_CONSTRAINT || isIsolatablePacketError) {
+                await this._binaryIsolateBatch(batch, capability, deadlineAt, err);
                 return;
             }
 
@@ -549,13 +650,21 @@ class WriteQueue {
     }
 
     /**
-     * 遞迴二分拆分：子層不自行退回，保持 Left 優先 (P0-1, P0-2)
+     * 遞迴二分拆分：子層不自行退回，保持 Left 優先，且永遠以單一 Item（或單一封包交易單位）為最小邊界，絕不拆開封包內部語句 (P0-1, P0-2, 4.0.2)
      */
-    async _binaryIsolateBatch(batch, capability = null, deadlineAt = null) {
+    async _binaryIsolateBatch(batch, capability = null, deadlineAt = null, lastErr = null) {
         if (batch.length === 1) {
-            // 單一壞資料：明確隔離並標記 QUARANTINED (P0-4)
+            // 單一壞資料或單一失敗封包交易單位：明確隔離並標記 QUARANTINED (P0-4 & 4.0.2)
             const badItem = batch[0];
-            const constraintErr = new Error(`[QUARANTINED_CONSTRAINT_ERROR] 資料約束違反: ${badItem.sql}`);
+            const detailSuffix = lastErr && lastErr.message ? ` (${lastErr.message})` : '';
+            const constraintErr = new Error(`[QUARANTINED_CONSTRAINT_ERROR] 資料約束違反: ${badItem.sql}${detailSuffix}`);
+            if (lastErr) {
+                constraintErr.cause = lastErr;
+                if (typeof lastErr.failedStatementIndex === 'number') {
+                    constraintErr.failedStatementIndex = lastErr.failedStatementIndex;
+                    constraintErr.failedStatementSql = lastErr.failedStatementSql;
+                }
+            }
             this._transitionItem(badItem, ITEM_STATUS.QUARANTINED, constraintErr);
             this._invokeCallback(badItem, constraintErr);
             return;

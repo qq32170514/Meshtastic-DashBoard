@@ -13,6 +13,11 @@ const {
     verifyDatabaseSchema,
     bootstrapDatabaseSchema
 } = require('./schema-bootstrap');
+const {
+    buildMqttPacketTransactionPlan,
+    buildRfTunnelPacketTransactionPlan,
+    executePacketTransactionPlan
+} = require('./packet-transaction');
 const defaultConfig = require('./sqlite.config');
 
 function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
@@ -172,6 +177,11 @@ function _buildDbCompat(adapter, writeQueue, shutdownHandler, backupManager) {
         // WriteQueue 便捷操作
         queueDbOp(sql, params, callback) {
             return writeQueue.enqueue(sql, params, callback);
+        },
+
+        // 4.0.2 Packet Transaction Boundary: 單一邏輯封包不可拆分的原子交易入列
+        queuePacketTransaction(statements, callback = null, options = {}) {
+            return writeQueue.enqueuePacketTransaction(statements, callback, options);
         },
 
         flushDbQueue() {
@@ -367,5 +377,8 @@ module.exports = {
     ShutdownHandler,
     BackupManager,
     BACKUP_VERIFY_STATUS,
-    RESTORE_STATUS
+    RESTORE_STATUS,
+    buildMqttPacketTransactionPlan,
+    buildRfTunnelPacketTransactionPlan,
+    executePacketTransactionPlan
 };

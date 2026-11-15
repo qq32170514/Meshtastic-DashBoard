@@ -124,7 +124,31 @@
   - 修改檔案：`src/database/backup-manager.js`、`tests/database/data_integrity_4_0_1.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
   - 新增測試：4 項（Test X — Cleanup State Verification & Backup Cleanup Call Sites、Test Y — Rollback Path Verification、Test Z — Backup Replacement `.prev-*` Cleanup & Rollback Error Diagnostics、Test AA — Pre-Cleanup Verification Before VACUUM INTO & Restore Staging）。
   - 實際測試結果：於 [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Tests A – AA 共 27 項）加上 [sqlite_reliability.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項），實際執行 `npm run test:database` 共 **73 項測試全數通過（73 passed, 0 failed, 0 skipped, 0 cancelled）**。
-  - 尚未完成/未涵蓋項目：4.0.2 Packet Transaction Boundary 尚未開始；`TURSO_URL` 分支與既有備份排程政策（`BACKUP_PATH` / `'0 0 * * 0'`）依規範維持未變動；跨程序實體斷電 / OS 檔案系統損毀未以實體硬體故障測試（採用受控錯誤注入測試）。
+  - 尚未完成/未涵蓋項目：4.0.2 Packet Transaction Boundary 已於後續 4.0.2 節完成。
+  - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
+
+---
+
+### 8. Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Policy Confirmation & Cross-Process Integration Tests (READY FOR REVIEW)
+- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，一次完成三大範圍：(1) **4.0.2 Packet Transaction Boundary**（將單一邏輯封包的跨表 SQLite 寫入合併為不可拆分的原子交易單位，確保全部成功才 `COMMIT`、任一失敗整包 `ROLLBACK`、二元隔離不拆開單一封包語句，且外部副作用僅於 `COMMIT` 成功後執行）；(2) **`TURSO_URL` 分支與備份排程政策確認**（明確盤點 `TURSO_URL` 與本地 SQLite 分支差異，以及 `BACKUP_PATH`、`'0 0 * * 0'` vs. `'0 4 * * *'` 與 `stopSchedule()` 現況）；(3) **跨程序異常終止 (`SIGKILL`) 與完整 `index.js` 子程序啟動整合測試**。
+- **新增與修改模組**：
+  - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
+    - 新增 `enqueuePacketTransaction(statements, callback, options)` 並擴充 `enqueue()` 支援多語句封包交易單位（`isTransactionUnit: true`、`statements: [...]`）。
+    - 於 `_commitOrIsolate(batch)` 中在同一個 `adapter.transaction(async (tx) => ...)` 內依序執行封包單位之全部語句；若任一語句失敗則標記 `fromPacketTransactionUnit`、`failedStatementIndex`、`failedStatementSql` 並立即回滾。
+    - 於 `_binaryIsolateBatch(batch)` 中確保二元隔離最小切分粒度為「單一封包交易單位」（`batch.length === 1`），**絕不拆開單一封包內部的多筆 SQL 個別提交**，並將失敗封包完整記錄於 `quarantinedItems`。
+  - [packet-transaction.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js)（新增）：
+    - 實作 `buildMqttPacketTransactionPlan(context)`、`buildRfTunnelPacketTransactionPlan(context)` 與 `executePacketTransactionPlan(plan, hooks, callback)`。
+    - 將 MQTT 各類封包（`ENCRYPTED`、`TEXT_MESSAGE_APP`、`POSITION_APP`、`NODEINFO_APP`、`ROUTING_APP`、`TELEMETRY_APP`、`TRACEROUTE_APP`、`NEIGHBORINFO_APP`、`MAP_REPORT_APP`）與 RF TCP Tunnel 座標封包之跨表寫入（`nodes`、`packet_logs`、`telemetry_data`、`chat_messages`、`neighbors`）封裝為單一原子交易計畫，並消除原本 `POSITION_APP` 重複的 `UPDATE nodes` 與 `TELEMETRY_APP` 重複的即時統計呼叫。
+    - 嚴格將 `batchEmit` 與 `recordLivePacketAnalytics` 移至交易 `COMMIT` 成功後的 callback 執行，交易失敗或回滾時保證 0 次觸發。
+  - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
+    - 於 `db` 相容介面公開 `queuePacketTransaction(statements, callback, options)`，並將 `index.js` 中 `client.on('message', ...)` 與 `setupRFListener` 全面改由 `buildMqttPacketTransactionPlan` / `buildRfTunnelPacketTransactionPlan` + `executePacketTransactionPlan` 執行（保持 `flushLiveAnalytics`、`computeAndSaveDaySummary`、`fetchAndSaveCWAData`、`cleanupOldData` 等獨立背景工作各自獨立）。
+    - 支援非侵入式環境變數覆寫（`DB_PATH`、`EVENT_LOG_PATH`、`DISABLE_RF_TUNNEL`）與子程序 IPC 封包注入鉤點（`TEST_INJECT_MQTT_PACKET`），使真實 `index.js` 子程序測試可在完全隔離的臨時目錄執行。
+  - [sigkill_tx_worker.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/helpers/sigkill_tx_worker.js) & [packet_transaction_4_0_2.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（新增）：
+    - 新增 10 項涵蓋單一封包多表成功、中段失敗回滾、末筆失敗回滾、同批次多封包二元隔離、高併發寫入+讀取+備份、關機排空、COMMIT 後副作用時序、`TURSO_URL`/備份排程政策確認、跨程序 `SIGKILL` 強制終止恢復，以及完整 `index.js` 子程序啟動/Protobuf 封包寫入/優雅關機/Schema 驗證失敗中止之整合測試。
+- **4.0.2 修改檔案與測試結果**：
+  - 新增與修改檔案：`src/database/write-queue.js`、`src/database/packet-transaction.js`、`src/database/index.js`、`index.js`、`tests/database/helpers/sigkill_tx_worker.js`、`tests/database/packet_transaction_4_0_2.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
+  - 實際測試結果：`sqlite_reliability.test.js`（46 項）+ `data_integrity_4_0_1.test.js`（27 項）+ `packet_transaction_4_0_2.test.js`（10 項），共 **83 項測試全數通過（83 passed, 0 failed, 0 skipped）**。
+  - 誠實測試邊界說明：`Test 4.0.2-SIGKILL` 為真實跨程序異常終止（`SIGKILL`）與 WAL 回滾恢復測試，不等同於實體主機斷電（Power Loss）、OS 核心崩潰或磁碟硬體損毀測試。
   - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
 
 ---
