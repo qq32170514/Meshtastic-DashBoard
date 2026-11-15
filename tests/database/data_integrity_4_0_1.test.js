@@ -52,7 +52,7 @@ function cleanupTempDir(dirPath) {
     } catch (_) {}
 }
 
-describe('Meshtastic-DashBoard 4.0.1.3 — Database Bootstrap & Backup Integrity Suite', () => {
+describe('Meshtastic-DashBoard 4.0.1.4 — Database Bootstrap & Backup Integrity Suite', () => {
 
     // =========================================================================
     // Part A: Database Bootstrap & Schema Initialization Barrier (Tests A - F)
@@ -2367,6 +2367,474 @@ describe('Meshtastic-DashBoard 4.0.1.3 — Database Bootstrap & Backup Integrity
             }
             if (sourceDb) {
                 try { await sourceDb.close(); } catch (_) {}
+            }
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(targetDbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    // =========================================================================
+    // Part F: 4.0.1.4 Cleanup State Verification Specific Tests (Tests X - Y)
+    // =========================================================================
+
+    it('Test X — Cleanup State Verification & Backup Cleanup Call Sites (4.0.1.4 P2): 驗證 ENOENT、非 ENOENT lstat 錯誤、unlink 失敗與所有 Backup 清理呼叫端之結構化結果保存', async () => {
+        const dbPath = getTempDbPath('test_x_cleanup_state');
+        const workDir = getTempDir('test_x_work');
+        const backupDir = getTempDir('test_x_backups');
+        const filesToForceClean = [];
+        let db = null;
+
+        try {
+            db = await createDatabaseSubsystem({
+                dbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_x', 'NodeX']);
+
+            // =========================================================================
+            // 1. ENOENT 正確歸類為 alreadyAbsent，且 complete === true
+            // =========================================================================
+            const absentBase = path.join(workDir, 'non_existent_sample.db');
+            const resAbsent = db.backupManager._cleanupFileAndSidecars(absentBase);
+            assert.equal(resAbsent.complete, true);
+            assert.equal(resAbsent.alreadyAbsent.length, 3);
+            assert.equal(resAbsent.removed.length, 0);
+            assert.equal(resAbsent.failures.length, 0);
+            assert.equal(resAbsent.remainingPaths.length, 0);
+            assert.equal(resAbsent.unverifiablePaths.length, 0);
+
+            // =========================================================================
+            // 2. lstat 發生非 ENOENT 錯誤 (如 EACCES) 時，不得誤判為 alreadyAbsent，且不得回報 complete: true
+            // =========================================================================
+            const unstatableBase = path.join(workDir, 'unstatable_target.db');
+            const resPreLstatErr = db.backupManager._cleanupFileAndSidecars(unstatableBase, {
+                lstatImpl: (p) => {
+                    if (path.resolve(p) === path.resolve(unstatableBase)) {
+                        const err = new Error('EACCES: permission denied during lstat');
+                        err.code = 'EACCES';
+                        throw err;
+                    }
+                    return fs.lstatSync(p);
+                }
+            });
+            assert.equal(resPreLstatErr.complete, false, 'lstat 非 ENOENT 錯誤時絕不可回報 complete: true');
+            assert.equal(resPreLstatErr.alreadyAbsent.includes(path.resolve(unstatableBase)), false, '無法確認狀態之檔案不得歸類為 alreadyAbsent');
+            assert.equal(resPreLstatErr.failures.length, 1);
+            assert.equal(resPreLstatErr.failures[0].path, path.resolve(unstatableBase));
+            assert.equal(resPreLstatErr.failures[0].code, 'EACCES');
+            assert.equal(resPreLstatErr.failures[0].stage, 'PRE_UNLINK_STAT');
+            assert.ok(resPreLstatErr.unverifiablePaths.includes(path.resolve(unstatableBase)));
+
+            // =========================================================================
+            // 3. unlink 成功但後續 lstat 發生非 ENOENT 錯誤無法確認狀態時，不得宣稱清理成功
+            // =========================================================================
+            const postUnverifiableBase = path.join(workDir, 'post_unverifiable.db');
+            fs.writeFileSync(postUnverifiableBase, 'TEMP_BYTES');
+            filesToForceClean.push(postUnverifiableBase);
+            let lstatCallCount = 0;
+            const resPostLstatErr = db.backupManager._cleanupFileAndSidecars(postUnverifiableBase, {
+                lstatImpl: (p) => {
+                    if (path.resolve(p) === path.resolve(postUnverifiableBase)) {
+                        lstatCallCount++;
+                        if (lstatCallCount >= 2) {
+                            const err = new Error('EPERM: post-unlink stat blocked');
+                            err.code = 'EPERM';
+                            throw err;
+                        }
+                    }
+                    return fs.lstatSync(p);
+                }
+            });
+            assert.equal(resPostLstatErr.complete, false, 'unlink 後無法確認檔案狀態時不得宣稱清理成功');
+            assert.equal(resPostLstatErr.removed.includes(path.resolve(postUnverifiableBase)), false);
+            assert.equal(resPostLstatErr.failures.length, 1);
+            assert.equal(resPostLstatErr.failures[0].code, 'EPERM');
+            assert.equal(resPostLstatErr.failures[0].stage, 'POST_UNLINK_STAT');
+            assert.ok(resPostLstatErr.unverifiablePaths.includes(path.resolve(postUnverifiableBase)));
+
+            // =========================================================================
+            // 4. unlink 失敗且檔案仍存在時，正確記錄 failures 並列於 remainingPaths
+            // =========================================================================
+            const lockedFileBase = path.join(workDir, 'locked_target.db');
+            fs.writeFileSync(lockedFileBase, 'LOCKED_BYTES');
+            filesToForceClean.push(lockedFileBase);
+            const resUnlinkFail = db.backupManager._cleanupFileAndSidecars(lockedFileBase, {
+                unlinkImpl: (p) => {
+                    if (path.resolve(p) === path.resolve(lockedFileBase)) {
+                        const err = new Error('EBUSY: file is locked');
+                        err.code = 'EBUSY';
+                        throw err;
+                    }
+                    return fs.unlinkSync(p);
+                }
+            });
+            assert.equal(resUnlinkFail.complete, false);
+            assert.equal(resUnlinkFail.failures.length, 1);
+            assert.equal(resUnlinkFail.failures[0].path, path.resolve(lockedFileBase));
+            assert.equal(resUnlinkFail.failures[0].code, 'EBUSY');
+            assert.ok(resUnlinkFail.remainingPaths.includes(path.resolve(lockedFileBase)));
+            assert.equal(resUnlinkFail.unverifiablePaths.length, 0);
+
+            // =========================================================================
+            // 5. 驗證 Backup 流程所有 Cleanup Helper 呼叫端在清理失敗時皆保存結構化結果且不覆蓋原始錯誤
+            // =========================================================================
+            // 5a. VACUUM INTO 失敗呼叫端 (約第 370 行)
+            const origMaint = db.adapter.maintenanceTask.bind(db.adapter);
+            db.adapter.maintenanceTask = async (taskName, taskFn) => {
+                return origMaint(taskName, async () => {
+                    return taskFn({
+                        execute: async (sql) => {
+                            const match = String(sql).match(/VACUUM INTO '([^']+)'/);
+                            if (match) {
+                                fs.writeFileSync(match[1], 'PARTIAL_VACUUM_STAGING');
+                                filesToForceClean.push(match[1]);
+                                const vacErr = new Error('SQLITE_IOERR: simulated disk error during VACUUM INTO');
+                                vacErr.code = 'SQLITE_IOERR';
+                                throw vacErr;
+                            }
+                        }
+                    });
+                });
+            };
+
+            try {
+                await assert.rejects(
+                    async () => {
+                        await db.backupManager.performBackup('fail_vacuum_cleanup.db', {
+                            unlinkImpl: (p) => {
+                                if (String(p).includes('.staging-fail_vacuum_cleanup.db')) {
+                                    const uErr = new Error('EPERM: cannot unlink partial vacuum staging');
+                                    uErr.code = 'EPERM';
+                                    throw uErr;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        });
+                    },
+                    (err) => {
+                        assert.match(err.message, /SQLITE_IOERR: simulated disk error during VACUUM INTO/);
+                        assert.equal(err.code, 'SQLITE_IOERR', '原始 VACUUM INTO 錯誤碼不得被覆蓋');
+                        assert.equal(err.cleanupComplete, false);
+                        assert.ok(err.cleanupResult);
+                        assert.equal(err.cleanupResult.complete, false);
+                        assert.equal(err.cleanupFailures.length, 1);
+                        assert.equal(err.cleanupFailures[0].code, 'EPERM');
+                        assert.equal(err.remainingPaths.length, 1);
+                        return true;
+                    }
+                );
+                assert.equal(db.backupManager.lastBackupResult.status, 'FAILED_VACUUM_INTO');
+                assert.equal(db.backupManager.lastBackupResult.cleanupComplete, false);
+                assert.equal(db.backupManager.lastBackupResult.remainingPaths.length, 1);
+            } finally {
+                db.adapter.maintenanceTask = origMaint;
+            }
+
+            // 5b. 備份完整性驗證失敗呼叫端 (約第 406 行) + retainFailedStaging rename 失敗回退呼叫端 (約第 403 行)
+            const origVerify = db.backupManager.verifyIntegrity.bind(db.backupManager);
+            db.backupManager.verifyIntegrity = async () => ({
+                status: BACKUP_VERIFY_STATUS.CORRUPTED,
+                details: 'simulated corrupted staging snapshot',
+                sizeBytes: 100
+            });
+
+            try {
+                // 一般驗證失敗 (第 406 行)
+                await assert.rejects(
+                    async () => {
+                        await db.backupManager.performBackup('fail_verify_cleanup.db', {
+                            afterVacuumBeforeVerify: ({ stagingPath }) => {
+                                filesToForceClean.push(stagingPath);
+                            },
+                            unlinkImpl: (p) => {
+                                if (String(p).includes('.staging-fail_verify_cleanup.db')) {
+                                    const uErr = new Error('EBUSY: staging locked after verify failure');
+                                    uErr.code = 'EBUSY';
+                                    throw uErr;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        });
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_VERIFY_FAILED/);
+                        assert.equal(err.cleanupComplete, false);
+                        assert.equal(err.cleanupResult.complete, false);
+                        assert.equal(err.cleanupFailures[0].code, 'EBUSY');
+                        assert.equal(err.remainingPaths.length, 1);
+                        return true;
+                    }
+                );
+                assert.equal(db.backupManager.lastBackupResult.status, 'FAILED_VERIFICATION');
+                assert.equal(db.backupManager.lastBackupResult.cleanupComplete, false);
+
+                // retainFailedStaging rename 失敗回退清理 (第 403 行)
+                await assert.rejects(
+                    async () => {
+                        await db.backupManager.performBackup('fail_retain_rename_cleanup.db', {
+                            retainFailedStaging: true,
+                            afterVacuumBeforeVerify: ({ stagingPath }) => {
+                                filesToForceClean.push(stagingPath);
+                            },
+                            renameImpl: () => {
+                                const rErr = new Error('EACCES: cannot rename staging to .invalid');
+                                rErr.code = 'EACCES';
+                                throw rErr;
+                            },
+                            unlinkImpl: (p) => {
+                                if (String(p).includes('.staging-fail_retain_rename_cleanup.db')) {
+                                    const uErr = new Error('EPERM: fallback unlink also blocked');
+                                    uErr.code = 'EPERM';
+                                    throw uErr;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        });
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_VERIFY_FAILED/);
+                        assert.ok(err.retainRenameError);
+                        assert.equal(err.retainRenameError.code, 'EACCES');
+                        assert.equal(err.cleanupComplete, false);
+                        assert.equal(err.cleanupFailures[0].code, 'EPERM');
+                        assert.equal(err.remainingPaths.length, 1);
+                        return true;
+                    }
+                );
+            } finally {
+                db.backupManager.verifyIntegrity = origVerify;
+            }
+
+            // 5c. 備份安裝 rename 失敗呼叫端 (約第 452 行)
+            await assert.rejects(
+                async () => {
+                    await db.backupManager.performBackup('fail_install_rename_cleanup.db', {
+                        afterVacuumBeforeVerify: ({ stagingPath }) => {
+                            filesToForceClean.push(stagingPath);
+                        },
+                        renameImpl: () => {
+                            const rErr = new Error('EXDEV: simulated rename install error');
+                            rErr.code = 'EXDEV';
+                            throw rErr;
+                        },
+                        unlinkImpl: (p) => {
+                            if (String(p).includes('.staging-fail_install_rename_cleanup.db')) {
+                                const uErr = new Error('EPERM: cannot unlink staging after install failure');
+                                uErr.code = 'EPERM';
+                                throw uErr;
+                            }
+                            return fs.unlinkSync(p);
+                        }
+                    });
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_INSTALL_FAILED/);
+                    assert.equal(err.cause.code, 'EXDEV', '原始 rename 錯誤不得被覆蓋');
+                    assert.equal(err.cleanupComplete, false);
+                    assert.equal(err.cleanupResult.complete, false);
+                    assert.equal(err.cleanupFailures[0].code, 'EPERM');
+                    assert.equal(err.remainingPaths.length, 1);
+                    return true;
+                }
+            );
+            assert.equal(db.backupManager.lastBackupResult.status, 'FAILED_RENAME_INSTALL');
+            assert.equal(db.backupManager.lastBackupResult.cleanupComplete, false);
+
+            // 5d. 正常完成備份時之最終 staging cleanup 呼叫端：驗證回傳結構化 cleanupResult
+            const okBackup = await db.backupManager.performBackup('ok_backup_with_cleanup_res.db');
+            assert.equal(okBackup.success, true);
+            assert.equal(okBackup.cleanupComplete, true);
+            assert.ok(okBackup.cleanupResult);
+            assert.equal(okBackup.cleanupResult.complete, true);
+            assert.equal(okBackup.remainingPaths.length, 0);
+
+            await db.close();
+            db = null;
+        } finally {
+            if (db) {
+                try { await db.close(); } catch (_) {}
+            }
+            for (const f of filesToForceClean) {
+                cleanupTempDb(f);
+            }
+            cleanupTempDb(dbPath);
+            cleanupTempDir(workDir);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test Y — Rollback Path Verification (4.0.1.4 P2): 驗證舊 .rollback-* 清理失敗時，嚴格依實際檔案存在狀態決定是否列入 preservedRollbackPaths', async () => {
+        const sourceDbPath = getTempDbPath('test_y_source');
+        const targetDbPath = getTempDbPath('test_y_target');
+        const backupDir = getTempDir('test_y_backups');
+        const rollbackFilesToClean = [];
+        let sourceDb = null;
+        let targetDb = null;
+
+        try {
+            sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_y_new', 'NewRestoredNodeY']);
+            const validBackup = await sourceDb.backupManager.performBackup('test_y_backup.db');
+            assert.equal(validBackup.success, true);
+
+            // 建立初始目標 DB
+            targetDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await targetDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_y_old', 'OldTargetNodeY']);
+            await targetDb.close();
+            targetDb = null;
+
+            // =========================================================================
+            // 情境 Y-1: unlink 拋出錯誤，但檔案實際上已從磁碟移除 (ABSENT) ->
+            // 必須記錄於 cleanupWarnings，但「不得」加入 preservedRollbackPaths！
+            // =========================================================================
+            const resY1 = await sourceDb.backupManager.restoreFromBackup(
+                validBackup.targetPath,
+                targetDbPath,
+                {
+                    offlineConfirmed: true,
+                    unlinkImpl: (p) => {
+                        if (String(p).includes('.rollback-')) {
+                            // 先實際刪除檔案，再模擬回傳/拋出後置 I/O 錯誤，使後續 lstat 確認為 ENOENT (ABSENT)
+                            if (fs.existsSync(p)) {
+                                fs.unlinkSync(p);
+                            }
+                            const err = new Error('EIO: simulated post-unlink callback error after file already removed');
+                            err.code = 'EIO';
+                            throw err;
+                        }
+                        return fs.unlinkSync(p);
+                    }
+                }
+            );
+            assert.equal(resY1.success, true);
+            assert.equal(resY1.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(resY1.cleanupComplete, false, 'unlink 報錯時 cleanupComplete 應為 false');
+            assert.ok(resY1.cleanupWarnings.length >= 1, 'cleanupWarnings 必須記錄該錯誤');
+            assert.equal(resY1.cleanupWarnings[0].code, 'EIO');
+            assert.equal(resY1.cleanupWarnings[0].stage, 'ROLLBACK_FILE_CLEANUP');
+            assert.equal(resY1.cleanupWarnings[0].existenceState, 'ABSENT');
+            assert.equal(
+                resY1.preservedRollbackPaths.length,
+                0,
+                '當檔案實際已不存在於磁碟時，絕不可誤加入 preservedRollbackPaths'
+            );
+
+            // =========================================================================
+            // 情境 Y-2: unlink 拋出錯誤，且 lstat 確認檔案仍然存在於磁碟 (PRESENT) ->
+            // 必須同時記錄於 cleanupWarnings 並加入 preservedRollbackPaths！
+            // =========================================================================
+            const resY2 = await sourceDb.backupManager.restoreFromBackup(
+                validBackup.targetPath,
+                targetDbPath,
+                {
+                    offlineConfirmed: true,
+                    unlinkImpl: (p) => {
+                        if (String(p).includes('.rollback-')) {
+                            rollbackFilesToClean.push(p);
+                            const err = new Error('EBUSY: rollback file still locked on disk');
+                            err.code = 'EBUSY';
+                            throw err;
+                        }
+                        return fs.unlinkSync(p);
+                    }
+                }
+            );
+            assert.equal(resY2.success, true);
+            assert.equal(resY2.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(resY2.cleanupComplete, false);
+            assert.ok(resY2.cleanupWarnings.length >= 1);
+            assert.equal(resY2.cleanupWarnings[0].code, 'EBUSY');
+            assert.equal(resY2.cleanupWarnings[0].existenceState, 'PRESENT');
+            assert.ok(
+                resY2.preservedRollbackPaths.includes(resY2.cleanupWarnings[0].path),
+                '當檔案確認仍存在於磁碟時，必須加入 preservedRollbackPaths'
+            );
+            assert.equal(fs.existsSync(resY2.cleanupWarnings[0].path), true);
+
+            // 先手動清理 Y-2 留下的 rollback 檔案
+            for (const rb of rollbackFilesToClean.splice(0)) {
+                if (fs.existsSync(rb)) fs.unlinkSync(rb);
+            }
+
+            // =========================================================================
+            // 情境 Y-3: unlink 失敗且後續 lstat 拋出 EACCES 無法確認檔案狀態 (UNKNOWN) ->
+            // 只記錄於 cleanupWarnings (existenceState: 'UNKNOWN')，不得誤報檔案仍存在於 preservedRollbackPaths！
+            // =========================================================================
+            const resY3 = await sourceDb.backupManager.restoreFromBackup(
+                validBackup.targetPath,
+                targetDbPath,
+                {
+                    offlineConfirmed: true,
+                    unlinkImpl: (p) => {
+                        if (String(p).includes('.rollback-')) {
+                            rollbackFilesToClean.push(p);
+                            const err = new Error('EPERM: unlink denied');
+                            err.code = 'EPERM';
+                            throw err;
+                        }
+                        return fs.unlinkSync(p);
+                    },
+                    lstatImpl: (p) => {
+                        // 在 Step 6 進入 unlink 後的 postStat 檢查時模擬 EACCES 無法確認狀態
+                        if (String(p).includes('.rollback-') && rollbackFilesToClean.includes(p)) {
+                            const statErr = new Error('EACCES: cannot stat rollback file');
+                            statErr.code = 'EACCES';
+                            throw statErr;
+                        }
+                        return fs.lstatSync(p);
+                    }
+                }
+            );
+            assert.equal(resY3.success, true);
+            assert.equal(resY3.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(resY3.cleanupComplete, false);
+            assert.ok(resY3.cleanupWarnings.length >= 1);
+            assert.equal(resY3.cleanupWarnings[0].code, 'EPERM');
+            assert.equal(resY3.cleanupWarnings[0].stage, 'ROLLBACK_FILE_CLEANUP');
+            assert.equal(resY3.cleanupWarnings[0].existenceState, 'UNKNOWN');
+            assert.equal(
+                resY3.preservedRollbackPaths.length,
+                0,
+                '無法確認檔案是否存在時，只記錄 warning，不得直接宣稱檔案仍保留於 preservedRollbackPaths'
+            );
+
+            // 確認歷經三次診斷測試後，新安裝之目標 DB 依然完整有效且通過 Integrity Check
+            targetDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            const integrityRow = await targetDb.get(`PRAGMA integrity_check`);
+            assert.equal(String(integrityRow.integrity_check).toLowerCase(), 'ok');
+            const nodeRow = await targetDb.get(`SELECT * FROM nodes WHERE node_id = ?`, ['!node_y_new']);
+            assert.ok(nodeRow);
+            assert.equal(nodeRow.long_name, 'NewRestoredNodeY');
+
+            await targetDb.close();
+            targetDb = null;
+            await sourceDb.close();
+            sourceDb = null;
+        } finally {
+            if (targetDb) {
+                try { await targetDb.close(); } catch (_) {}
+            }
+            if (sourceDb) {
+                try { await sourceDb.close(); } catch (_) {}
+            }
+            for (const rb of rollbackFilesToClean) {
+                try {
+                    if (fs.existsSync(rb)) fs.unlinkSync(rb);
+                } catch (_) {}
             }
             cleanupTempDb(sourceDbPath);
             cleanupTempDb(targetDbPath);

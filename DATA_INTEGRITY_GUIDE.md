@@ -1,7 +1,7 @@
-# Meshtastic-DashBoard 4.0.1.3 — Restore Cleanup Assurance
+# Meshtastic-DashBoard 4.0.1.4 — Cleanup State Verification
 
-> **版本定位**：4.0.1.3 Restore Cleanup Assurance（在 4.0.1.2 Restore Offline Assurance & Retention Fix 基礎上，強化 Restore Staging Cleanup 結構化診斷與殘留追蹤、補齊 Restore 成功後舊 `.rollback-*` 清理失敗之結構化警告與救援資訊，以及補上 WAL 模式下外部純閒置連線之獨立驗證測試）
-> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7、4.0.1、4.0.1.1 與 4.0.1.2 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
+> **版本定位**：4.0.1.4 Cleanup State Verification（在 4.0.1.3 Restore Cleanup Assurance 基礎上，將 `_cleanupFileAndSidecars()` 檔案存在性檢查由布林 `fs.existsSync()` 升級為基於 `fs.lstatSync()` 的三態檢查 `PRESENT` / `ABSENT` / `UNKNOWN`，修正 `preservedRollbackPaths` 僅於確認磁碟仍存在時寫入，並確保 `performBackup()` 所有 5 處清理呼叫點皆完整保存結構化清理結果）
+> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7、4.0.1、4.0.1.1、4.0.1.2 與 4.0.1.3 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
 
 ---
 
@@ -156,34 +156,45 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
      - 若原始資料庫與 sidecars 全數復原成功：`originalRestored = true`，標記為 `RESTORE_FAILED_ROLLED_BACK`（`rollbackSucceeded: true`）。
      - 若復原失敗：保留 `.rollback-*` 檔案並標記為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`rollbackSucceeded: false`）。
 
-### 4.4 Restore Staging Cleanup Assurance 與舊 `.rollback-*` 清理診斷（4.0.1.3 P2）
+### 4.4 Cleanup State Verification、Staging Cleanup Assurance 與舊 `.rollback-*` 清理診斷（4.0.1.3 & 4.0.1.4 P2）
 
-1. **Cleanup Helper 結構化回傳（[`_cleanupFileAndSidecars(filePath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L514-L573)）**：
-   - 僅針對傳入之單一基底路徑及其 `-wal`、`-shm`（共 3 個明確路徑）執行清理，**絕不使用 wildcard 掃描**，保證不誤刪同目錄其他資料庫或無關檔案。
+1. **基於 `fs.lstatSync()` 的三態存在性驗證（[`_inspectPathExistence(filePath, lstatFn)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L516-L534) & [`_cleanupFileAndSidecars(filePath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L539-L639)）**：
+   - `fs.existsSync()` 僅回傳布林值，無法區分「檔案確實不存在（`ENOENT`）」與「因權限或 I/O 錯誤（`EACCES`、`EPERM` 等）無法確認檔案狀態」，可能將無法確認狀態的檔案誤判為 `alreadyAbsent` 並偽報 `complete: true`。
+   - 4.0.1.4 改以 `fs.lstatSync()` 進行明確的三態判定：
+     - **`ENOENT`（`state: 'ABSENT'`）**：確認檔案不存在，初始檢查時歸類為 `alreadyAbsent`；於 `unlink` 後再次檢查確認為 `'ABSENT'` 時歸類為 `removed`。
+     - **成功取得檔案資訊（`state: 'PRESENT'`）**：確認檔案存在，執行 `unlinkFn(p)`，並在 `unlink` 完成後再次呼叫 `lstat` 驗證檔案是否確實已移除。
+     - **`EPERM`、`EACCES` 或其他非 `ENOENT` 錯誤（`state: 'UNKNOWN'`）**：記錄至 `failures`（含 `{ path, code, message, stage }`）與 `unverifiablePaths`，**絕不歸類為 `alreadyAbsent`，且絕不回報 `complete: true`**。
+   - 僅針對傳入之單一基底路徑及其 `-wal`、`-shm`（共 3 個明確路徑）執行清理，**絕不使用 wildcard 掃描**。
    - 回傳完整可檢查的結構化物件：
      ```js
      {
-         complete: true,      // boolean: failures.length === 0 && remainingPaths.length === 0
-         attempted: [],       // 嘗試檢查與清理之完整路徑清單 [base, `${base}-wal`, `${base}-shm`]
-         removed: [],         // 實際透過 unlink 移除成功且確認已不存在之路徑
-         alreadyAbsent: [],   // 初始即不存在，或於 existsSync 與 unlink 之間發生 ENOENT 競態而已不存在之路徑
-         failures: [],        // 每個失敗項目包含 { path, code, message }
-         remainingPaths: []   // 清理流程結束後，再次檢查磁碟確認仍殘留之完整檔案路徑
+         complete: true,          // boolean: 僅當所有候選檔案均已確認不存在 (alreadyAbsent + removed === attempted) 且無任何錯誤時為 true
+         attempted: [],           // 嘗試檢查與清理之完整路徑清單 [base, `${base}-wal`, `${base}-shm`]
+         removed: [],             // 實際透過 unlink 移除且經 lstat 二次確認為 ABSENT 之路徑
+         alreadyAbsent: [],       // 初始 lstat 即為 ENOENT，或 unlink 時 ENOENT 且經 lstat 確認為 ABSENT 之路徑
+         failures: [],            // 每個失敗項目包含 { path, code, message, stage }
+         remainingPaths: [],      // 清理流程結束後，經 lstat 確認仍存在於磁碟 (PRESENT) 之完整路徑
+         unverifiablePaths: []    // 因 EACCES / EPERM 等非 ENOENT lstat 錯誤而無法確認存在狀態 (UNKNOWN) 之完整路徑
      }
      ```
-2. **`ENOENT` 與真正清理失敗的區分**：
-   - 若檔案初始即不存在，或於 `fs.existsSync(p)` 與 `unlinkFn(p)` 之間被移除而拋出 `ENOENT`（且確認磁碟上已不存在），歸類為 `alreadyAbsent`，不視為錯誤。
-   - 若發生 `EPERM`、`EBUSY`、Windows 檔案鎖定或其他非 `ENOENT` 錯誤，或 `unlinkFn(p)` 返回後檔案仍殘留於磁碟，一律記錄至 `failures`（含 `{ path, code, message }`）與 `remainingPaths`，並將 `complete` 標記為 `false`。
-3. **Cleanup Failure 與原始 Restore Error 共存（不覆蓋原始錯誤）**：
+2. **Backup 清理呼叫點結構化結果完整保存（4.0.1.4 P2）**：
+   - `performBackup()` 中全部 5 處呼叫 `_cleanupFileAndSidecars()` 的位置皆透過 `_attachBackupCleanupDiagnostics()` 接收並保存結構化清理結果（`cleanupComplete`、`cleanupResult`、`cleanupFailures`、`remainingPaths`、`unverifiablePaths`）至拋出的錯誤物件（`this.lastBackupError`）與 `this.lastBackupResult`，且**絕不覆蓋原始 Backup 錯誤**：
+     1. `VACUUM INTO` 失敗後清理 `stagingPath`（`FAILED_VACUUM_INTO`）。
+     2. `verifyIntegrity()` 失敗且 `retainFailedStaging` 改名失敗後 fallback 清理 `stagingPath`（`FAILED_VERIFICATION`）。
+     3. `verifyIntegrity()` 失敗後清理 `stagingPath`（`FAILED_VERIFICATION`）。
+     4. 備份安裝 `rename` 失敗後清理 `stagingPath`（`FAILED_RENAME_INSTALL`）。
+     5. 備份安裝後 / `finally` 階段清理殘留 `stagingPath`（`COMPLETED` 或未預期例外收斂）。
+3. **Restore Cleanup Failure 與原始 Restore Error 共存（不覆蓋原始錯誤）**：
    - `_cleanupFileAndSidecars()` 內部捕獲檔案系統例外並轉為結構化 `failures`，**絕不拋出例外覆蓋原始 Restore 錯誤**。
-   - 當 Restore 在安裝階段（如 `rename` 失敗）與 staging cleanup 同時失敗時，拋出的錯誤完整保留原始錯誤（`err.cause`、`err.originalError`、`err.originalCode` 及原始錯誤訊息），並附加 `err.cleanupComplete = false`、`err.cleanupResult`、`err.cleanupFailures` 與 `err.remainingPaths`。
-   - 若原始目標資料庫不存在、安裝 `rename` 失敗且 staging 清理亦失敗（磁碟仍有殘留 staging 檔案），狀態將誠實歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`cleanupComplete: false`），**絕不謊稱 `RESTORE_FAILED_INSTALL_ABORTED` 或宣稱清理完成**。
-4. **Restore 成功後舊 `.rollback-*` 清理失敗之處理與欄位語意**：
+   - 當 Restore 在安裝階段（如 `rename` 失敗）與 staging cleanup 同時失敗（含殘留檔案 `remainingPaths` 或無法確認狀態 `unverifiablePaths`）時，拋出的錯誤完整保留原始錯誤（`err.cause`、`err.originalError`、`err.originalCode` 及原始錯誤訊息），並附加 `err.cleanupComplete = false`、`err.cleanupResult`、`err.cleanupFailures`、`err.remainingPaths` 與 `err.unverifiablePaths`。
+   - 若原始目標資料庫不存在、安裝 `rename` 失敗且 staging 清理未完成（`cleanupComplete === false`），狀態將誠實歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`，**絕不謊稱 `RESTORE_FAILED_INSTALL_ABORTED` 或宣稱清理完成**。
+4. **Restore 成功後舊 `.rollback-*` 清理失敗之處理與 `preservedRollbackPaths` 精確語意（4.0.1.3 & 4.0.1.4 P2）**：
    - 只要新目標 DB 已完成安裝並通過安裝後 `verifyIntegrity()`，Restore 本身即判定為成功（`restoreStatus: RESTORE_STATUS.COMPLETED`），**絕不因舊 `.rollback-*` 刪除失敗而反向刪除或破壞已驗證成功的新資料庫**。
-   - 若舊 `.rollback-*` 檔案刪除失敗，系統保留該救援檔案（且 `_rotateOldBackups()` 明確忽略 `.rollback-*`，不會將其當作新備份或誤刪），並在回傳結果中提供：
-     - `cleanupComplete`：`boolean`，當有任何 `.rollback-*` 或 staging 檔案清理失敗時為 `false`；全部清理乾淨時為 `true`。
-     - `cleanupWarnings`：結構化警告陣列，每筆包含 `{ path, code, message, stage: 'ROLLBACK_FILE_CLEANUP' }`（或 `'STAGING_FILE_CLEANUP'`）。
-     - `preservedRollbackPaths`：所有尚未刪除、仍保留於磁碟上的舊 `.rollback-*` 完整檔案路徑陣列，供維護人員於確認新 DB 正常後手動清理。
+   - 針對每個舊 `.rollback-*` 檔案：
+     - 先以 `_inspectPathExistence(moved.rollback, lstatFn)` 檢查狀態；若初始 `lstat` 即發生非 `ENOENT` 錯誤（`state === 'UNKNOWN'`），記錄至 `cleanupWarnings`（`existenceState: 'UNKNOWN'`）並將 `cleanupComplete` 設為 `false`，但**不加入 `preservedRollbackPaths`**。
+     - 若檔案存在（`state === 'PRESENT'`）並執行 `unlink`：當 `unlink` 拋出非 `ENOENT` 錯誤後，再次以 `_inspectPathExistence(moved.rollback, lstatFn)` 確認磁碟狀態：
+       - **僅當確認檔案仍存在於磁碟（`postStat.state === 'PRESENT'`）時**，才將該路徑加入 `preservedRollbackPaths`。
+       - 若 `unlink` 報錯但檔案實際已不存在（`postStat.state === 'ABSENT'`），或因權限錯誤無法確認是否仍存在（`postStat.state === 'UNKNOWN'`），皆將該錯誤完整記錄於 `cleanupWarnings`（含 `{ path, code, message, stage: 'ROLLBACK_FILE_CLEANUP', existenceState: 'ABSENT' | 'UNKNOWN' }`）並設 `cleanupComplete = false`，**絕不將已不存在或狀態未知的路徑誤加入 `preservedRollbackPaths`**。
 
 ### 4.5 `RESTORE_STATUS` 狀態定義總表
 
@@ -201,7 +212,7 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 
 所有測試均於開發環境透過 `npm run test:database` 實際執行，並使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫檔案，測試後完整關閉連線與清除暫存檔。
 
-### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（23 項測試：Tests A – W）
+### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（25 項測試：Tests A – Y）
 
 | 測試編號與名稱 | 測試分類 | 實際驗證方式與邊界說明 |
 | :--- | :--- | :--- |
@@ -228,6 +239,8 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test U — Restore Staging Cleanup Failure Reporting (4.0.1.3 P2)** | **真實 SQLite Staging 建立與驗證 + 受控 Rename/Unlink 錯誤注入測試** | 真實執行 SQLite 備份、建立 `.restore-staging-*` 並通過 `verifyIntegrity()`；透過 `renameImpl` 注入 `EXDEV` 安裝失敗並透過 `unlinkImpl` 注入 `EPERM` 模擬 staging 刪除失敗（非真實 OS 檔案系統損毀）。驗證：原始目標仍不存在、原始 `EXDEV` 錯誤未被覆蓋、`cleanupComplete === false`、`remainingPaths` 包含該 staging 路徑、狀態歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`、同目錄無關檔案完好，並於 teardown 恢復真實刪除清理暫存檔。 |
 | **Test V — Restore Rollback Cleanup Warning (4.0.1.3 P2)** | **真實 SQLite Restore 流程 + 受控 Rollback Unlink 錯誤注入測試** | 真實執行原始目標 DB 建立、備份、staging 建立、新目標安裝與安裝後 `verifyIntegrity()`；僅在清理舊 `.rollback-*` 時透過 `unlinkImpl` 注入 `EBUSY` 失敗。驗證：`restoreStatus` 仍為 `RESTORE_COMPLETED`、`cleanupComplete === false`、`cleanupWarnings` 記錄 `{ path, code: 'EBUSY', message, stage: 'ROLLBACK_FILE_CLEANUP' }`、`preservedRollbackPaths` 包含舊 `.rollback-*` 完整路徑且檔案仍存在於磁碟、新安裝之有效 DB 不被誤刪且可正常開啟讀寫，並於 teardown 清理保留的 `.rollback-*`。 |
 | **Test W — Restore Idle WAL Connection Confirmation (4.0.1.3 P2)** | **真實 SQLite WAL 資料庫 + 獨立外部閒置連線整合測試** | 建立真實 WAL 模式目標 DB 並開啟一條不執行任何 Transaction 或讀寫的純閒置 `sqlite3.Database` 連線；實測證明此時 `BEGIN EXCLUSIVE` Lock Probe 會成功，但省略 `offlineConfirmed` 呼叫 `restoreFromBackup()` 仍必以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 阻擋且不修改目標 DB / WAL / SHM；待關閉外部閒置連線後，再以 `offlineConfirmed: true` 驗證正常還原成功。 |
+| **Test X — Cleanup State Verification & Backup Cleanup Call Sites (4.0.1.4 P2)** | **Cleanup 三態單元測試 + 真實 SQLite Backup 全 5 處清理呼叫點錯誤注入整合測試** | (X-1/X-2) 以 `lstatFn` 注入 `EACCES` 驗證初始或 `unlink` 後無法確認檔案存在狀態時，`complete === false`、寫入 `failures` 與 `unverifiablePaths` 且絕不誤判為 `alreadyAbsent`；(X-3) 驗證真實 `ENOENT` 歸類為 `alreadyAbsent` 且 `complete === true`；(X-4) 針對 `performBackup()` 全部 5 個清理呼叫點（`VACUUM INTO` 失敗、`retainFailedStaging` 改名失敗、`verifyIntegrity` 失敗、安裝 `rename` 失敗、安裝成功後殘留 `-wal` 清理失敗）逐一驗證原始錯誤保留且 `cleanupComplete` / `cleanupResult` / `cleanupFailures` / `remainingPaths` / `unverifiablePaths` 完整記錄。 |
+| **Test Y — Rollback Path Verification (4.0.1.4 P2)** | **真實 SQLite Restore + 受控 Rollback Unlink/Lstat 狀態注入測試** | 在真實 SQLite 資料庫還原成功後清理舊 `.rollback-*` 階段，驗證三種狀態：(Y-1) `unlink` 拋錯但檔案已不存在（`ABSENT`）時記錄 `cleanupWarnings` (`existenceState: 'ABSENT'`)、`cleanupComplete === false`，且**不加入 `preservedRollbackPaths`**；(Y-2) `unlink` 拋錯且檔案仍存在（`PRESENT`）時加入 `preservedRollbackPaths`；(Y-3) `unlink` 拋錯且後續 `lstat` 拋出 `EACCES`（`UNKNOWN`）時記錄 `cleanupWarnings` (`existenceState: 'UNKNOWN'`)、`cleanupComplete === false`，且**不加入 `preservedRollbackPaths`**。 |
 
 ### 5.2 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線測試）
 - 完整保留 v2.7.7 結案之 46 項測試（包含真实 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。

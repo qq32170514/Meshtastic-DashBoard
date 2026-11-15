@@ -345,6 +345,14 @@ class BackupManager {
         const renameFn = (options && typeof options.renameImpl === 'function')
             ? options.renameImpl
             : fs.renameSync;
+        const unlinkFn = (options && typeof options.unlinkImpl === 'function')
+            ? options.unlinkImpl
+            : fs.unlinkSync;
+        const lstatFn = (options && typeof options.lstatImpl === 'function')
+            ? options.lstatImpl
+            : fs.lstatSync;
+        const cleanupOpts = { unlinkImpl: unlinkFn, lstatImpl: lstatFn };
+        let lastStagingCleanup = null;
 
         this.#backupInProgress = true;
         this.#inProgressBackupPaths.add(targetPath);
@@ -355,19 +363,19 @@ class BackupManager {
             await this.#adapter.maintenanceTask('ONLINE_BACKUP', async (rawContext) => {
                 console.log(`📦 [BACKUP] 開始建立線上一致性快照 (staging): ${stagingPath}`);
 
-                if (fs.existsSync(stagingPath)) {
-                    try { fs.unlinkSync(stagingPath); } catch (_) {}
-                }
+                this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
 
                 try {
                     const escapedSqlPath = stagingPath.replace(/\\/g, '/').replace(/'/g, "''");
                     await rawContext.execute(`VACUUM INTO '${escapedSqlPath}'`);
-                    if (!fs.existsSync(stagingPath)) {
+                    if (this._inspectPathExistence(stagingPath, lstatFn).state !== 'PRESENT') {
                         throw new Error('[BACKUP_VACUUM_MISSING_OUTPUT] VACUUM INTO 完成後未產生目標快照檔案');
                     }
                 } catch (vErr) {
                     console.warn(`⚠️ [BACKUP] VACUUM INTO 失敗 (${vErr.message})，正在清理不完整 staging 檔案...`);
-                    this._cleanupFileAndSidecars(stagingPath);
+                    const stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                    lastStagingCleanup = stagingCleanup;
+                    this._attachBackupCleanupDiagnostics(vErr, stagingCleanup);
                     this.lastBackupError = vErr;
                     this.lastBackupResult = {
                         success: false,
@@ -376,6 +384,11 @@ class BackupManager {
                         stagingPath,
                         stage: 'VACUUM_INTO',
                         error: vErr.message,
+                        cleanupComplete: stagingCleanup.complete,
+                        cleanupResult: stagingCleanup,
+                        cleanupFailures: stagingCleanup.failures,
+                        remainingPaths: [...stagingCleanup.remainingPaths],
+                        unverifiablePaths: [...stagingCleanup.unverifiablePaths],
                         timestamp: new Date().toISOString()
                     };
                     throw vErr;
@@ -394,23 +407,36 @@ class BackupManager {
                 console.error(`❌ [BACKUP_VERIFY_FAILED] 備份驗證未通過 (狀態: ${verify.status}):`, verify.details);
 
                 let retainedInvalidPath = null;
-                if (options && options.retainFailedStaging === true && fs.existsSync(stagingPath)) {
+                let retainRenameError = null;
+                let stagingCleanup = null;
+                if (
+                    options &&
+                    options.retainFailedStaging === true &&
+                    this._inspectPathExistence(stagingPath, lstatFn).state === 'PRESENT'
+                ) {
                     const invalidPath = path.resolve(resolvedTargetDir, `${filename}.failed-${uniqueSuffix}.invalid`);
                     try {
-                        fs.renameSync(stagingPath, invalidPath);
+                        renameFn(stagingPath, invalidPath);
                         retainedInvalidPath = invalidPath;
-                    } catch (_) {
-                        this._cleanupFileAndSidecars(stagingPath);
+                        stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                    } catch (retainErr) {
+                        retainRenameError = retainErr;
+                        stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
                     }
                 } else {
-                    this._cleanupFileAndSidecars(stagingPath);
+                    stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
                 }
+                lastStagingCleanup = stagingCleanup;
 
                 const verifyErr = new Error(
                     `[BACKUP_VERIFY_FAILED] 備份完整性檢查失敗 (${verify.status}): ${verify.details}`
                 );
                 verifyErr.verify = verify;
                 verifyErr.retainedInvalidPath = retainedInvalidPath;
+                if (retainRenameError) {
+                    verifyErr.retainRenameError = retainRenameError;
+                }
+                this._attachBackupCleanupDiagnostics(verifyErr, stagingCleanup);
                 this.lastBackupError = verifyErr;
                 this.lastBackupResult = {
                     success: false,
@@ -421,13 +447,18 @@ class BackupManager {
                     stage: 'VERIFY_INTEGRITY',
                     verify,
                     error: verifyErr.message,
+                    cleanupComplete: stagingCleanup.complete,
+                    cleanupResult: stagingCleanup,
+                    cleanupFailures: stagingCleanup.failures,
+                    remainingPaths: [...stagingCleanup.remainingPaths],
+                    unverifiablePaths: [...stagingCleanup.unverifiablePaths],
                     timestamp: new Date().toISOString()
                 };
                 throw verifyErr;
             }
 
             // 階段 3: 將通過驗證的 staging 檔案安全安裝至正式備份路徑 (保護既有同名有效備份不被破壞)
-            const existedBefore = fs.existsSync(targetPath);
+            const existedBefore = this._inspectPathExistence(targetPath, lstatFn).state === 'PRESENT';
             const rollbackPrevPath = existedBefore
                 ? path.resolve(resolvedTargetDir, `.prev-${filename}-${uniqueSuffix}`)
                 : null;
@@ -437,25 +468,35 @@ class BackupManager {
                     fs.renameSync(targetPath, rollbackPrevPath);
                 }
                 renameFn(stagingPath, targetPath);
-                if (rollbackPrevPath && fs.existsSync(rollbackPrevPath)) {
-                    try { fs.unlinkSync(rollbackPrevPath); } catch (_) {}
+                if (rollbackPrevPath && this._inspectPathExistence(rollbackPrevPath, lstatFn).state === 'PRESENT') {
+                    try { unlinkFn(rollbackPrevPath); } catch (_) {}
                 }
             } catch (renameErr) {
                 // 若 rename 失敗且先前移開了舊的有效備份，立即將舊有效備份還原回 targetPath
                 let previousBackupRestored = false;
-                if (rollbackPrevPath && fs.existsSync(rollbackPrevPath) && !fs.existsSync(targetPath)) {
+                if (
+                    rollbackPrevPath &&
+                    this._inspectPathExistence(rollbackPrevPath, lstatFn).state === 'PRESENT' &&
+                    this._inspectPathExistence(targetPath, lstatFn).state === 'ABSENT'
+                ) {
                     try {
                         fs.renameSync(rollbackPrevPath, targetPath);
                         previousBackupRestored = true;
                     } catch (_) {}
                 }
-                this._cleanupFileAndSidecars(stagingPath);
+                const stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                lastStagingCleanup = stagingCleanup;
 
                 const installErr = new Error(
                     `[BACKUP_INSTALL_FAILED] 將已驗證之 staging 備份安裝至目標路徑失敗: ${renameErr.message}`
                 );
                 installErr.cause = renameErr;
+                installErr.originalError = renameErr;
+                if (renameErr && renameErr.code) {
+                    installErr.originalCode = renameErr.code;
+                }
                 installErr.previousBackupRestored = previousBackupRestored;
+                this._attachBackupCleanupDiagnostics(installErr, stagingCleanup);
                 this.lastBackupError = installErr;
                 this.lastBackupResult = {
                     success: false,
@@ -465,6 +506,11 @@ class BackupManager {
                     previousBackupRestored,
                     stage: 'RENAME_INSTALL',
                     error: installErr.message,
+                    cleanupComplete: stagingCleanup.complete,
+                    cleanupResult: stagingCleanup,
+                    cleanupFailures: stagingCleanup.failures,
+                    remainingPaths: [...stagingCleanup.remainingPaths],
+                    unverifiablePaths: [...stagingCleanup.unverifiablePaths],
                     timestamp: new Date().toISOString()
                 };
                 throw installErr;
@@ -472,6 +518,10 @@ class BackupManager {
 
             this._markBackupVerified(targetPath);
             this.#inProgressBackupPaths.delete(stagingPath);
+
+            // 確認成功安裝後 stagingPath 及其 sidecars 已無殘留並保存結構化清理結果
+            const postInstallStagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+            lastStagingCleanup = postInstallStagingCleanup;
 
             if (options && typeof options.beforeRotation === 'function') {
                 await options.beforeRotation({ targetPath });
@@ -489,19 +539,34 @@ class BackupManager {
                 targetPath,
                 verify,
                 rotation,
+                cleanupComplete: postInstallStagingCleanup.complete,
+                cleanupResult: postInstallStagingCleanup,
+                cleanupFailures: postInstallStagingCleanup.failures,
+                remainingPaths: [...postInstallStagingCleanup.remainingPaths],
+                unverifiablePaths: [...postInstallStagingCleanup.unverifiablePaths],
                 timestamp: new Date().toISOString()
             };
             this.lastBackupError = null;
             this.lastBackupResult = result;
             return result;
         } finally {
-            if (fs.existsSync(stagingPath)) {
-                const finalStagingCleanup = this._cleanupFileAndSidecars(stagingPath);
-                if (!finalStagingCleanup.complete) {
-                    console.warn(
-                        `⚠️ [BACKUP_STAGING_CLEANUP_WARN] 備份 staging 清理未完全成功，殘留路徑: ${finalStagingCleanup.remainingPaths.join(', ')}`
-                    );
+            if (!lastStagingCleanup) {
+                lastStagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                if (this.lastBackupError && !this.lastBackupError.cleanupResult) {
+                    this._attachBackupCleanupDiagnostics(this.lastBackupError, lastStagingCleanup);
                 }
+                if (this.lastBackupResult && !this.lastBackupResult.cleanupResult) {
+                    this.lastBackupResult.cleanupComplete = lastStagingCleanup.complete;
+                    this.lastBackupResult.cleanupResult = lastStagingCleanup;
+                    this.lastBackupResult.cleanupFailures = lastStagingCleanup.failures;
+                    this.lastBackupResult.remainingPaths = [...lastStagingCleanup.remainingPaths];
+                    this.lastBackupResult.unverifiablePaths = [...lastStagingCleanup.unverifiablePaths];
+                }
+            }
+            if (!lastStagingCleanup.complete) {
+                console.warn(
+                    `⚠️ [BACKUP_STAGING_CLEANUP_WARN] 備份 staging 清理未完全確認成功 (remaining: ${lastStagingCleanup.remainingPaths.join(', ') || 'none'}, unverifiable: ${lastStagingCleanup.unverifiablePaths.join(', ') || 'none'})`
+                );
             }
             this.#inProgressBackupPaths.delete(stagingPath);
             this.#inProgressBackupPaths.delete(targetPath);
@@ -510,10 +575,70 @@ class BackupManager {
     }
 
     /**
-     * 安全清理指定資料庫檔案及其 `-wal` / `-shm` sidecars，並回傳可觀測之結構化清理結果 (4.0.1.3 P2 — Restore Staging Cleanup Assurance):
-     * - 僅針對傳入之單一基底路徑及其 `-wal`、`-shm` 操作，絕不使用 wildcard 掃描或誤刪同目錄其他檔案。
-     * - 嚴格區分 `alreadyAbsent` (含 `ENOENT` 競態) 與真正的刪除失敗 (`failures`)。
-     * - 刪除後重新檢查磁碟實際殘留狀態 (`remainingPaths`)，且不拋出例外以免覆蓋呼叫端原始錯誤。
+     * 將結構化 Cleanup Result 附加至 Backup/Restore 錯誤物件，且不覆蓋原始錯誤之 message/code/stack/cause
+     */
+    _attachBackupCleanupDiagnostics(targetErr, cleanupResult) {
+        if (!targetErr || !cleanupResult) return;
+        targetErr.cleanupComplete = cleanupResult.complete;
+        targetErr.cleanupResult = cleanupResult;
+        targetErr.cleanupFailures = cleanupResult.failures;
+        targetErr.remainingPaths = [...cleanupResult.remainingPaths];
+        targetErr.unverifiablePaths = [...(cleanupResult.unverifiablePaths || [])];
+    }
+
+    /**
+     * 使用 lstatSync 精確檢查檔案存在性與狀態 (4.0.1.4 P2 — Cleanup State Verification):
+     * 明確區分三種狀態：
+     * - 'PRESENT': 成功取得檔案資訊，檔案確實存在於磁碟
+     * - 'ABSENT': lstat 拋出 ENOENT，確認檔案確實不存在
+     * - 'UNKNOWN': lstat 拋出 EPERM / EACCES / EIO 等其他錯誤，無法確認檔案是否存在
+     */
+    _inspectPathExistence(filePath, lstatFn = fs.lstatSync) {
+        try {
+            const stats = lstatFn(filePath);
+            return {
+                state: 'PRESENT',
+                exists: true,
+                confirmedAbsent: false,
+                unverifiable: false,
+                stats,
+                error: null
+            };
+        } catch (err) {
+            if (err && err.code === 'ENOENT') {
+                return {
+                    state: 'ABSENT',
+                    exists: false,
+                    confirmedAbsent: true,
+                    unverifiable: false,
+                    stats: null,
+                    error: null
+                };
+            }
+            return {
+                state: 'UNKNOWN',
+                exists: false,
+                confirmedAbsent: false,
+                unverifiable: true,
+                stats: null,
+                error: {
+                    path: filePath,
+                    code: (err && err.code) ? String(err.code) : 'CLEANUP_STAT_FAILED',
+                    message: (err && err.message) ? String(err.message) : String(err)
+                }
+            };
+        }
+    }
+
+    /**
+     * 安全清理指定資料庫檔案及其 `-wal` / `-shm` sidecars，並回傳可觀測之結構化清理結果
+     * (4.0.1.3 P2 & 4.0.1.4 P2 — Cleanup State Verification):
+     * - 改用 `lstatSync` (`_inspectPathExistence`) 取代 `fs.existsSync()`，嚴格區分：
+     *   1. `ENOENT` -> 歸類為 `alreadyAbsent`
+     *   2. 成功取得檔案資訊 -> 執行 `unlink`，並在 `unlink` 後再次以 `lstat` 驗證是否確實不存在
+     *   3. `EPERM`、`EACCES` 等非 `ENOENT` 錯誤 -> 記錄至 `failures` 與 `unverifiablePaths`，絕不誤判為 `alreadyAbsent`
+     * - 只有當所有候選檔案均確認已不存在 (`alreadyAbsent.length + removed.length === candidatePaths.length`)，
+     *   且 `failures`、`remainingPaths`、`unverifiablePaths` 皆為空時，才回報 `complete: true`。
      */
     _cleanupFileAndSidecars(filePath, options = {}) {
         const result = {
@@ -522,7 +647,8 @@ class BackupManager {
             removed: [],
             alreadyAbsent: [],
             failures: [],
-            remainingPaths: []
+            remainingPaths: [],
+            unverifiablePaths: []
         };
         if (!filePath || typeof filePath !== 'string') {
             return result;
@@ -532,6 +658,9 @@ class BackupManager {
         const unlinkFn = (options && typeof options.unlinkImpl === 'function')
             ? options.unlinkImpl
             : fs.unlinkSync;
+        const lstatFn = (options && typeof options.lstatImpl === 'function')
+            ? options.lstatImpl
+            : fs.lstatSync;
         const candidatePaths = [
             resolvedBase,
             `${resolvedBase}-wal`,
@@ -540,40 +669,84 @@ class BackupManager {
 
         for (const p of candidatePaths) {
             result.attempted.push(p);
-            if (!fs.existsSync(p)) {
+            const preCheck = this._inspectPathExistence(p, lstatFn);
+
+            if (preCheck.state === 'ABSENT') {
                 result.alreadyAbsent.push(p);
                 continue;
             }
+
+            if (preCheck.state === 'UNKNOWN') {
+                result.failures.push({
+                    path: p,
+                    code: preCheck.error.code,
+                    message: preCheck.error.message,
+                    stage: 'PRE_UNLINK_STAT'
+                });
+                if (!result.unverifiablePaths.includes(p)) {
+                    result.unverifiablePaths.push(p);
+                }
+                continue;
+            }
+
+            // preCheck.state === 'PRESENT' -> 執行 unlink 並再次確認檔案狀態
             try {
                 unlinkFn(p);
-                if (!fs.existsSync(p)) {
+                const postCheck = this._inspectPathExistence(p, lstatFn);
+                if (postCheck.state === 'ABSENT') {
                     result.removed.push(p);
-                } else {
+                } else if (postCheck.state === 'PRESENT') {
                     result.failures.push({
                         path: p,
                         code: 'CLEANUP_STILL_EXISTS',
-                        message: `檔案於執行 unlink 後仍殘留於磁碟: ${p}`
+                        message: `檔案於執行 unlink 後仍殘留於磁碟: ${p}`,
+                        stage: 'POST_UNLINK_STAT'
                     });
+                    if (!result.remainingPaths.includes(p)) {
+                        result.remainingPaths.push(p);
+                    }
+                } else {
+                    result.failures.push({
+                        path: p,
+                        code: postCheck.error.code,
+                        message: `檔案於執行 unlink 後無法確認是否存在: ${postCheck.error.message}`,
+                        stage: 'POST_UNLINK_STAT'
+                    });
+                    if (!result.unverifiablePaths.includes(p)) {
+                        result.unverifiablePaths.push(p);
+                    }
                 }
             } catch (err) {
-                if (err && err.code === 'ENOENT' && !fs.existsSync(p)) {
+                const postCheck = this._inspectPathExistence(p, lstatFn);
+                if (err && err.code === 'ENOENT' && postCheck.state === 'ABSENT') {
                     result.alreadyAbsent.push(p);
                 } else {
                     result.failures.push({
                         path: p,
                         code: (err && err.code) ? String(err.code) : 'CLEANUP_UNLINK_FAILED',
-                        message: (err && err.message) ? String(err.message) : String(err)
+                        message: (err && err.message) ? String(err.message) : String(err),
+                        stage: 'UNLINK'
                     });
+                    if (postCheck.state === 'PRESENT') {
+                        if (!result.remainingPaths.includes(p)) {
+                            result.remainingPaths.push(p);
+                        }
+                    } else if (postCheck.state === 'UNKNOWN') {
+                        if (!result.unverifiablePaths.includes(p)) {
+                            result.unverifiablePaths.push(p);
+                        }
+                    }
                 }
             }
         }
 
-        for (const p of candidatePaths) {
-            if (fs.existsSync(p)) {
-                result.remainingPaths.push(p);
-            }
-        }
-        result.complete = result.failures.length === 0 && result.remainingPaths.length === 0;
+        const allConfirmedAbsent =
+            (result.alreadyAbsent.length + result.removed.length) === candidatePaths.length;
+        result.complete =
+            allConfirmedAbsent &&
+            result.failures.length === 0 &&
+            result.remainingPaths.length === 0 &&
+            result.unverifiablePaths.length === 0;
         return result;
     }
 
@@ -798,6 +971,10 @@ class BackupManager {
         const unlinkFn = (options && typeof options.unlinkImpl === 'function')
             ? options.unlinkImpl
             : fs.unlinkSync;
+        const lstatFn = (options && typeof options.lstatImpl === 'function')
+            ? options.lstatImpl
+            : fs.lstatSync;
+        const cleanupOpts = { unlinkImpl: unlinkFn, lstatImpl: lstatFn };
         const postInstallVerifyFn = (options && typeof options.postInstallVerifyImpl === 'function')
             ? options.postInstallVerifyImpl
             : (filePath) => this.verifyIntegrity(filePath);
@@ -805,7 +982,7 @@ class BackupManager {
         // Step 1: 在目標 DB 同一目錄 (同一檔案系統) 建立唯一 staging DB
         const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
         const stagingRestorePath = path.resolve(targetDir, `.restore-staging-${path.basename(resolvedTarget)}-${uniqueSuffix}`);
-        this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+        this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
 
         try {
             await new Promise((resolve, reject) => {
@@ -829,12 +1006,13 @@ class BackupManager {
             });
             lifecycle.stagingCreated = fs.existsSync(stagingRestorePath);
         } catch (stageErr) {
-            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             stageErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
             stageErr.cleanupComplete = stagingCleanup.complete;
             stageErr.cleanupResult = stagingCleanup;
             stageErr.cleanupFailures = stagingCleanup.failures;
             stageErr.remainingPaths = [...stagingCleanup.remainingPaths];
+            stageErr.unverifiablePaths = [...stagingCleanup.unverifiablePaths];
             stageErr.lifecycle = { ...lifecycle };
             this.lastRestoreError = stageErr;
             this.lastRestoreResult = {
@@ -844,6 +1022,7 @@ class BackupManager {
                 cleanupResult: stagingCleanup,
                 cleanupFailures: stagingCleanup.failures,
                 remainingPaths: stageErr.remainingPaths,
+                unverifiablePaths: stageErr.unverifiablePaths,
                 lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
@@ -856,7 +1035,7 @@ class BackupManager {
         // Step 2: 驗證 staging DB 完整性
         const stagingVerify = await this.verifyIntegrity(stagingRestorePath);
         if (stagingVerify.status !== BACKUP_VERIFY_STATUS.VALID) {
-            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             const err = new Error(
                 `[BACKUP_RESTORE_VERIFY_FAILED] 還原 staging DB 未通過完整性檢驗 (${stagingVerify.status}): ${stagingVerify.details}`
             );
@@ -865,6 +1044,7 @@ class BackupManager {
             err.cleanupResult = stagingCleanup;
             err.cleanupFailures = stagingCleanup.failures;
             err.remainingPaths = [...stagingCleanup.remainingPaths];
+            err.unverifiablePaths = [...stagingCleanup.unverifiablePaths];
             err.lifecycle = { ...lifecycle };
             this.lastRestoreError = err;
             this.lastRestoreResult = {
@@ -874,6 +1054,7 @@ class BackupManager {
                 cleanupResult: stagingCleanup,
                 cleanupFailures: stagingCleanup.failures,
                 remainingPaths: err.remainingPaths,
+                unverifiablePaths: err.unverifiablePaths,
                 lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
@@ -888,11 +1069,12 @@ class BackupManager {
         try {
             await this._assertTargetDbOffline(resolvedTarget, options);
         } catch (recheckErr) {
-            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             recheckErr.cleanupComplete = stagingCleanup.complete;
             recheckErr.cleanupResult = stagingCleanup;
             recheckErr.cleanupFailures = stagingCleanup.failures;
             recheckErr.remainingPaths = [...stagingCleanup.remainingPaths];
+            recheckErr.unverifiablePaths = [...stagingCleanup.unverifiablePaths];
             recheckErr.lifecycle = { ...lifecycle };
             this.lastRestoreError = recheckErr;
             this.lastRestoreResult = {
@@ -902,6 +1084,7 @@ class BackupManager {
                 cleanupResult: stagingCleanup,
                 cleanupFailures: stagingCleanup.failures,
                 remainingPaths: recheckErr.remainingPaths,
+                unverifiablePaths: recheckErr.unverifiablePaths,
                 lifecycle: { ...lifecycle },
                 backupFilePath: resolvedSource,
                 restoredPath: resolvedTarget,
@@ -942,7 +1125,7 @@ class BackupManager {
                     rollbackErrors.push(`${moved.rollback} -> ${moved.original}: ${rbErr.message}`);
                 }
             }
-            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             if (!stagingCleanup.complete) {
                 for (const failure of stagingCleanup.failures) {
                     rollbackErrors.push(`無法清理還原 staging 檔案 ${failure.path} (${failure.code}): ${failure.message}`);
@@ -956,6 +1139,9 @@ class BackupManager {
                 ? RESTORE_STATUS.FAILED_ROLLED_BACK
                 : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
             const remainingPaths = [...stagingCleanup.remainingPaths];
+            const confirmedRollbackFiles = movedRollbacks
+                .map(m => m.rollback)
+                .filter(p => this._inspectPathExistence(p, lstatFn).state === 'PRESENT');
             const err = new Error(
                 `[BACKUP_RESTORE_PREPARE_FAILED] 備份原始目標檔案至 rollback 路徑時失敗 (${moveOriginalErr.message}) | 狀態: ${status}`
             );
@@ -966,10 +1152,11 @@ class BackupManager {
             err.cleanupResult = stagingCleanup;
             err.cleanupFailures = stagingCleanup.failures;
             err.remainingPaths = remainingPaths;
+            err.unverifiablePaths = [...stagingCleanup.unverifiablePaths];
             err.rollbackErrors = rollbackErrors;
             err.preservedRollbackPaths = rollbackSucceeded
                 ? []
-                : Array.from(new Set([...movedRollbacks.map(m => m.rollback).filter(p => fs.existsSync(p)), ...remainingPaths]));
+                : Array.from(new Set([...confirmedRollbackFiles, ...remainingPaths]));
             err.lifecycle = { ...lifecycle };
             this.lastRestoreError = err;
             this.lastRestoreResult = {
@@ -980,6 +1167,7 @@ class BackupManager {
                 cleanupResult: stagingCleanup,
                 cleanupFailures: stagingCleanup.failures,
                 remainingPaths,
+                unverifiablePaths: err.unverifiablePaths,
                 rollbackErrors,
                 preservedRollbackPaths: err.preservedRollbackPaths,
                 lifecycle: { ...lifecycle },
@@ -1010,42 +1198,72 @@ class BackupManager {
             }
             lifecycle.postInstallVerified = true;
 
-            // Step 6: 確認替換與驗證完全成功後，才清理舊 .rollback-* 檔案 (4.0.1.3 P2 — Restore Rollback Cleanup Diagnostics)
+            // Step 6: 確認替換與驗證完全成功後，才清理舊 .rollback-* 檔案
+            // (4.0.1.3 P2 & 4.0.1.4 P2 — Restore Rollback Cleanup Diagnostics & Rollback Path Verification)
             const cleanupWarnings = [];
             const preservedRollbackPaths = [];
             for (const moved of movedRollbacks) {
-                if (!fs.existsSync(moved.rollback)) {
+                const preStat = this._inspectPathExistence(moved.rollback, lstatFn);
+                if (preStat.state === 'ABSENT') {
                     continue;
                 }
+                if (preStat.state === 'UNKNOWN') {
+                    cleanupWarnings.push({
+                        path: moved.rollback,
+                        code: preStat.error.code,
+                        message: preStat.error.message,
+                        stage: 'ROLLBACK_FILE_CLEANUP',
+                        existenceState: 'UNKNOWN'
+                    });
+                    // 無法確認檔案是否存在時，只記錄 warning，不得直接宣稱檔案仍保留於 preservedRollbackPaths
+                    continue;
+                }
+
+                // preStat.state === 'PRESENT' -> 執行 unlink 並再次以 lstat 確認檔案狀態
                 try {
                     unlinkFn(moved.rollback);
-                    if (fs.existsSync(moved.rollback)) {
+                    const postStat = this._inspectPathExistence(moved.rollback, lstatFn);
+                    if (postStat.state === 'PRESENT') {
                         cleanupWarnings.push({
                             path: moved.rollback,
                             code: 'ROLLBACK_CLEANUP_STILL_EXISTS',
                             message: `舊 rollback 檔案於 unlink 後仍存在於磁碟: ${moved.rollback}`,
-                            stage: 'ROLLBACK_FILE_CLEANUP'
+                            stage: 'ROLLBACK_FILE_CLEANUP',
+                            existenceState: 'PRESENT'
                         });
-                        preservedRollbackPaths.push(moved.rollback);
+                        if (!preservedRollbackPaths.includes(moved.rollback)) {
+                            preservedRollbackPaths.push(moved.rollback);
+                        }
+                    } else if (postStat.state === 'UNKNOWN') {
+                        cleanupWarnings.push({
+                            path: moved.rollback,
+                            code: postStat.error.code,
+                            message: `舊 rollback 檔案於 unlink 後無法確認是否存在: ${postStat.error.message}`,
+                            stage: 'ROLLBACK_FILE_CLEANUP',
+                            existenceState: 'UNKNOWN'
+                        });
                     }
                 } catch (unlinkErr) {
-                    if (unlinkErr && unlinkErr.code === 'ENOENT' && !fs.existsSync(moved.rollback)) {
+                    const postStat = this._inspectPathExistence(moved.rollback, lstatFn);
+                    if (unlinkErr && unlinkErr.code === 'ENOENT' && postStat.state === 'ABSENT') {
                         continue;
                     }
                     cleanupWarnings.push({
                         path: moved.rollback,
                         code: (unlinkErr && unlinkErr.code) ? String(unlinkErr.code) : 'ROLLBACK_CLEANUP_FAILED',
                         message: (unlinkErr && unlinkErr.message) ? String(unlinkErr.message) : String(unlinkErr),
-                        stage: 'ROLLBACK_FILE_CLEANUP'
+                        stage: 'ROLLBACK_FILE_CLEANUP',
+                        existenceState: postStat.state
                     });
-                    if (fs.existsSync(moved.rollback) || !preservedRollbackPaths.includes(moved.rollback)) {
+                    // 只有確認檔案仍然存在於磁碟 (postStat.state === 'PRESENT')，才加入 preservedRollbackPaths
+                    if (postStat.state === 'PRESENT' && !preservedRollbackPaths.includes(moved.rollback)) {
                         preservedRollbackPaths.push(moved.rollback);
                     }
                 }
             }
 
             // 同時確認 stagingRestorePath 及其 sidecars 已無殘留
-            const postInstallStagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            const postInstallStagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             if (!postInstallStagingCleanup.complete) {
                 for (const failure of postInstallStagingCleanup.failures) {
                     cleanupWarnings.push({
@@ -1085,22 +1303,34 @@ class BackupManager {
             // 檢查新目標檔案或本次新產生的 sidecars 是否已存在於目標路徑 (不依賴 movedRollbacks.length！)
             const targetOrSidecarPresent =
                 lifecycle.newTargetInstalled ||
-                fs.existsSync(resolvedTarget) ||
-                fs.existsSync(`${resolvedTarget}-wal`) ||
-                fs.existsSync(`${resolvedTarget}-shm`);
+                this._inspectPathExistence(resolvedTarget, lstatFn).state !== 'ABSENT' ||
+                this._inspectPathExistence(`${resolvedTarget}-wal`, lstatFn).state !== 'ABSENT' ||
+                this._inspectPathExistence(`${resolvedTarget}-shm`, lstatFn).state !== 'ABSENT';
 
             if (targetOrSidecarPresent) {
                 for (const newFile of [resolvedTarget, `${resolvedTarget}-wal`, `${resolvedTarget}-shm`]) {
-                    if (fs.existsSync(newFile)) {
-                        try {
-                            unlinkFn(newFile);
-                            if (fs.existsSync(newFile)) {
-                                rollbackErrors.push(`新目標檔案於 unlink 後仍殘留於磁碟 ${newFile}`);
-                                uncleanedTargetPaths.push(newFile);
-                            }
-                        } catch (unlinkErr) {
-                            if (!(unlinkErr && unlinkErr.code === 'ENOENT' && !fs.existsSync(newFile))) {
-                                rollbackErrors.push(`無法移除安裝失敗之新目標檔案 ${newFile}: ${unlinkErr.message}`);
+                    const preNewStat = this._inspectPathExistence(newFile, lstatFn);
+                    if (preNewStat.state === 'ABSENT') {
+                        continue;
+                    }
+                    if (preNewStat.state === 'UNKNOWN') {
+                        rollbackErrors.push(`無法確認新目標檔案狀態 ${newFile} (${preNewStat.error.code}): ${preNewStat.error.message}`);
+                        continue;
+                    }
+                    try {
+                        unlinkFn(newFile);
+                        const postNewStat = this._inspectPathExistence(newFile, lstatFn);
+                        if (postNewStat.state === 'PRESENT') {
+                            rollbackErrors.push(`新目標檔案於 unlink 後仍殘留於磁碟 ${newFile}`);
+                            uncleanedTargetPaths.push(newFile);
+                        } else if (postNewStat.state === 'UNKNOWN') {
+                            rollbackErrors.push(`新目標檔案於 unlink 後無法確認狀態 ${newFile} (${postNewStat.error.code}): ${postNewStat.error.message}`);
+                        }
+                    } catch (unlinkErr) {
+                        const postNewStat = this._inspectPathExistence(newFile, lstatFn);
+                        if (!(unlinkErr && unlinkErr.code === 'ENOENT' && postNewStat.state === 'ABSENT')) {
+                            rollbackErrors.push(`無法移除安裝失敗之新目標檔案 ${newFile}: ${unlinkErr.message}`);
+                            if (postNewStat.state === 'PRESENT') {
                                 uncleanedTargetPaths.push(newFile);
                             }
                         }
@@ -1108,9 +1338,10 @@ class BackupManager {
                 }
                 lifecycle.newTargetCleanedUp =
                     uncleanedTargetPaths.length === 0 &&
-                    !fs.existsSync(resolvedTarget) &&
-                    !fs.existsSync(`${resolvedTarget}-wal`) &&
-                    !fs.existsSync(`${resolvedTarget}-shm`);
+                    rollbackErrors.length === 0 &&
+                    this._inspectPathExistence(resolvedTarget, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-wal`, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-shm`, lstatFn).state === 'ABSENT';
             }
 
             // 若原始目標存在且已移至 rollback 路徑，按反序將 rollback 檔案復原回原始路徑
@@ -1118,7 +1349,7 @@ class BackupManager {
                 for (let i = movedRollbacks.length - 1; i >= 0; i--) {
                     const moved = movedRollbacks[i];
                     try {
-                        if (fs.existsSync(moved.rollback)) {
+                        if (this._inspectPathExistence(moved.rollback, lstatFn).state === 'PRESENT') {
                             fs.renameSync(moved.rollback, moved.original);
                         }
                     } catch (rbErr) {
@@ -1127,11 +1358,11 @@ class BackupManager {
                 }
                 lifecycle.originalRestored =
                     rollbackErrors.length === 0 &&
-                    (!lifecycle.hadExistingTargetDb || fs.existsSync(resolvedTarget));
+                    (!lifecycle.hadExistingTargetDb || this._inspectPathExistence(resolvedTarget, lstatFn).state === 'PRESENT');
             }
 
-            // 清理殘留之 staging 檔案並取得結構化清理結果 (4.0.1.3 P2 — Restore Staging Cleanup Assurance)
-            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, { unlinkImpl: unlinkFn });
+            // 清理殘留之 staging 檔案並取得結構化清理結果 (4.0.1.3 P2 & 4.0.1.4 P2)
+            const stagingCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
             if (!stagingCleanup.complete) {
                 for (const failure of stagingCleanup.failures) {
                     rollbackErrors.push(`無法清理還原 staging 檔案 ${failure.path} (${failure.code}): ${failure.message}`);
@@ -1154,10 +1385,14 @@ class BackupManager {
             if (!hadAnyExistingTargetFiles && !targetOrSidecarPresent) {
                 // Case B: 原始目標不存在且 Rename 階段即失敗 (未安裝新檔)
                 const targetStillAbsent =
-                    !fs.existsSync(resolvedTarget) &&
-                    !fs.existsSync(`${resolvedTarget}-wal`) &&
-                    !fs.existsSync(`${resolvedTarget}-shm`);
-                cleanupComplete = targetStillAbsent && stagingCleanup.complete && remainingPaths.length === 0;
+                    this._inspectPathExistence(resolvedTarget, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-wal`, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-shm`, lstatFn).state === 'ABSENT';
+                cleanupComplete =
+                    targetStillAbsent &&
+                    stagingCleanup.complete &&
+                    remainingPaths.length === 0 &&
+                    stagingCleanup.unverifiablePaths.length === 0;
                 rollbackSucceeded = false;
                 status = cleanupComplete
                     ? RESTORE_STATUS.FAILED_INSTALL_ABORTED
@@ -1171,10 +1406,13 @@ class BackupManager {
                     lifecycle.newTargetCleanedUp &&
                     rollbackErrors.length === 0 &&
                     stagingCleanup.complete &&
-                    !fs.existsSync(resolvedTarget) &&
-                    !fs.existsSync(`${resolvedTarget}-wal`) &&
-                    !fs.existsSync(`${resolvedTarget}-shm`);
-                cleanupComplete = targetRestoredToAbsent && remainingPaths.length === 0;
+                    this._inspectPathExistence(resolvedTarget, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-wal`, lstatFn).state === 'ABSENT' &&
+                    this._inspectPathExistence(`${resolvedTarget}-shm`, lstatFn).state === 'ABSENT';
+                cleanupComplete =
+                    targetRestoredToAbsent &&
+                    remainingPaths.length === 0 &&
+                    stagingCleanup.unverifiablePaths.length === 0;
                 rollbackSucceeded = cleanupComplete;
                 status = cleanupComplete
                     ? RESTORE_STATUS.FAILED_ROLLED_BACK
@@ -1188,15 +1426,19 @@ class BackupManager {
                     rollbackErrors.length === 0 &&
                     lifecycle.originalRestored &&
                     stagingCleanup.complete &&
-                    remainingPaths.length === 0;
+                    remainingPaths.length === 0 &&
+                    stagingCleanup.unverifiablePaths.length === 0;
                 rollbackSucceeded = cleanupComplete;
                 status = cleanupComplete
                     ? RESTORE_STATUS.FAILED_ROLLED_BACK
                     : RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE;
                 if (!cleanupComplete) {
+                    const confirmedRemainingRollbacks = movedRollbacks
+                        .map(m => m.rollback)
+                        .filter(p => this._inspectPathExistence(p, lstatFn).state === 'PRESENT');
                     preservedRollbackPaths = Array.from(
                         new Set([
-                            ...movedRollbacks.map(m => m.rollback).filter(p => fs.existsSync(p)),
+                            ...confirmedRemainingRollbacks,
                             ...remainingPaths
                         ])
                     );
@@ -1216,6 +1458,7 @@ class BackupManager {
             finalErr.cleanupResult = stagingCleanup;
             finalErr.cleanupFailures = stagingCleanup.failures;
             finalErr.remainingPaths = remainingPaths;
+            finalErr.unverifiablePaths = [...stagingCleanup.unverifiablePaths];
             finalErr.rollbackSucceeded = rollbackSucceeded;
             finalErr.rollbackErrors = rollbackErrors;
             finalErr.uncleanedTargetPaths = uncleanedTargetPaths;
@@ -1230,6 +1473,7 @@ class BackupManager {
                 cleanupResult: stagingCleanup,
                 cleanupFailures: stagingCleanup.failures,
                 remainingPaths,
+                unverifiablePaths: finalErr.unverifiablePaths,
                 rollbackSucceeded,
                 rollbackErrors,
                 uncleanedTargetPaths,
