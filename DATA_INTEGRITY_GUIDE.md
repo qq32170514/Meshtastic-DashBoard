@@ -177,8 +177,15 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
          unverifiablePaths: []    // 因 EACCES / EPERM 等非 ENOENT lstat 錯誤而無法確認存在狀態 (UNKNOWN) 之完整路徑
      }
      ```
-2. **Backup 清理呼叫點結構化結果完整保存（4.0.1.4 P2）**：
-   - `performBackup()` 中全部 5 處呼叫 `_cleanupFileAndSidecars()` 的位置皆透過 `_attachBackupCleanupDiagnostics()` 接收並保存結構化清理結果（`cleanupComplete`、`cleanupResult`、`cleanupFailures`、`remainingPaths`、`unverifiablePaths`）至拋出的錯誤物件（`this.lastBackupError`）與 `this.lastBackupResult`，且**絕不覆蓋原始 Backup 錯誤**：
+2. **Backup 清理呼叫點結構化結果完整保存與 `.prev-*` 替換診斷（4.0.1.4 P2）**：
+   - **前置 Cleanup 強制驗證（`performBackup` & `restoreFromBackup`）**：
+     - 在 `performBackup()` 執行 `VACUUM INTO` 前，以及在 `restoreFromBackup()` 建立還原 staging DB 前，皆必須先呼叫 `_cleanupFileAndSidecars()` 並檢查 `cleanupResult.complete === true`。
+     - 若清理失敗（`remainingPaths.length > 0`）或檔案狀態無法確認（`unverifiablePaths.length > 0`、`state === 'UNKNOWN'`），**立即中止並拋出 `BACKUP_PRE_CLEANUP_FAILED` / `BACKUP_RESTORE_PRE_CLEANUP_FAILED`**，絕不在 staging 路徑狀態不明時執行 `VACUUM INTO` 或還原，並完整保留 `cleanupResult`、`remainingPaths`、`unverifiablePaths` 及原始錯誤（`cause`、`originalError`、`originalCode`）。
+   - **Backup 替換過程 `.prev-*` 清理與還原錯誤追蹤**：
+     - 新備份安裝成功後，清理舊 `.prev-*` 檔案若發生 `unlink` 或 `lstat` 錯誤，**絕不吞掉錯誤，亦絕不破壞已安裝驗證的新備份**（仍回傳 `COMPLETED`，但標記 `cleanupComplete: false`、記錄完整 `{ path, code, message, stage: 'PREV_BACKUP_CLEANUP', existenceState }` 於 `cleanupWarnings` 與 `cleanupFailures`，且當確認檔案仍存在 `'PRESENT'` 時列入 `preservedPrevBackupPaths` 與 `remainingPaths`，狀態為 `'UNKNOWN'` 時列入 `unverifiablePaths`）。
+     - 新備份安裝失敗後，若將舊 `.prev-*` 還原回 `targetPath` 時發生 `rename` 失敗，完整保留原始安裝錯誤（`err.cause`、`err.originalError`、`err.originalCode`），同時將還原失敗之完整路徑、錯誤碼、錯誤訊息與存在狀態記錄於 `err.previousBackupRestoreError`、`err.rollbackErrors` 與 `err.cleanupFailures`，並保留 `.prev-*` 舊有效備份於 `err.preservedPrevBackupPaths` / `err.remainingPaths` 絕不遺失。
+   - `performBackup()` 中全部 `_cleanupFileAndSidecars()` 呼叫點皆透過 `_attachBackupCleanupDiagnostics()` 接收並保存結構化清理結果至拋出的錯誤物件（`this.lastBackupError`）與 `this.lastBackupResult`：
+     0. `VACUUM INTO` 開始前之前置 staging 清理檢查（`FAILED_PRE_CLEANUP`）。
      1. `VACUUM INTO` 失敗後清理 `stagingPath`（`FAILED_VACUUM_INTO`）。
      2. `verifyIntegrity()` 失敗且 `retainFailedStaging` 改名失敗後 fallback 清理 `stagingPath`（`FAILED_VERIFICATION`）。
      3. `verifyIntegrity()` 失敗後清理 `stagingPath`（`FAILED_VERIFICATION`）。
@@ -212,7 +219,7 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 
 所有測試均於開發環境透過 `npm run test:database` 實際執行，並使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫檔案，測試後完整關閉連線與清除暫存檔。
 
-### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（25 項測試：Tests A – Y）
+### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（27 項測試：Tests A – AA）
 
 | 測試編號與名稱 | 測試分類 | 實際驗證方式與邊界說明 |
 | :--- | :--- | :--- |
@@ -241,6 +248,8 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test W — Restore Idle WAL Connection Confirmation (4.0.1.3 P2)** | **真實 SQLite WAL 資料庫 + 獨立外部閒置連線整合測試** | 建立真實 WAL 模式目標 DB 並開啟一條不執行任何 Transaction 或讀寫的純閒置 `sqlite3.Database` 連線；實測證明此時 `BEGIN EXCLUSIVE` Lock Probe 會成功，但省略 `offlineConfirmed` 呼叫 `restoreFromBackup()` 仍必以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 阻擋且不修改目標 DB / WAL / SHM；待關閉外部閒置連線後，再以 `offlineConfirmed: true` 驗證正常還原成功。 |
 | **Test X — Cleanup State Verification & Backup Cleanup Call Sites (4.0.1.4 P2)** | **Cleanup 三態單元測試 + 真實 SQLite Backup 全 5 處清理呼叫點錯誤注入整合測試** | (X-1/X-2) 以 `lstatFn` 注入 `EACCES` 驗證初始或 `unlink` 後無法確認檔案存在狀態時，`complete === false`、寫入 `failures` 與 `unverifiablePaths` 且絕不誤判為 `alreadyAbsent`；(X-3) 驗證真實 `ENOENT` 歸類為 `alreadyAbsent` 且 `complete === true`；(X-4) 針對 `performBackup()` 全部 5 個清理呼叫點（`VACUUM INTO` 失敗、`retainFailedStaging` 改名失敗、`verifyIntegrity` 失敗、安裝 `rename` 失敗、安裝成功後殘留 `-wal` 清理失敗）逐一驗證原始錯誤保留且 `cleanupComplete` / `cleanupResult` / `cleanupFailures` / `remainingPaths` / `unverifiablePaths` 完整記錄。 |
 | **Test Y — Rollback Path Verification (4.0.1.4 P2)** | **真實 SQLite Restore + 受控 Rollback Unlink/Lstat 狀態注入測試** | 在真實 SQLite 資料庫還原成功後清理舊 `.rollback-*` 階段，驗證三種狀態：(Y-1) `unlink` 拋錯但檔案已不存在（`ABSENT`）時記錄 `cleanupWarnings` (`existenceState: 'ABSENT'`)、`cleanupComplete === false`，且**不加入 `preservedRollbackPaths`**；(Y-2) `unlink` 拋錯且檔案仍存在（`PRESENT`）時加入 `preservedRollbackPaths`；(Y-3) `unlink` 拋錯且後續 `lstat` 拋出 `EACCES`（`UNKNOWN`）時記錄 `cleanupWarnings` (`existenceState: 'UNKNOWN'`)、`cleanupComplete === false`，且**不加入 `preservedRollbackPaths`**。 |
+| **Test Z — Backup Replacement `.prev-*` Cleanup & Rollback Error Diagnostics (4.0.1.4 P2)** | **真實 SQLite Backup 替換 + `.prev-*` Unlink/Lstat/Rename 錯誤注入測試** | (Z-1/Z-2) 新備份安裝成功後刪除舊 `.prev-*` 失敗時，驗證新備份維持有效且回傳 `COMPLETED`、`cleanupComplete === false`、`cleanupWarnings` / `cleanupFailures` 記錄完整路徑與錯誤碼，並依 `PRESENT` / `ABSENT` / `UNKNOWN` 精確更新 `preservedPrevBackupPaths`、`remainingPaths` 與 `unverifiablePaths`；(Z-3) 新備份安裝 `rename` 失敗且舊 `.prev-*` 還原 `rename` 亦失敗時，驗證保留原始安裝錯誤、記錄 `previousBackupRestoreError` 與 `rollbackErrors`、並將舊有效備份安全保留於 `preservedPrevBackupPaths`。 |
+| **Test AA — Pre-Cleanup Verification Before VACUUM INTO & Restore Staging (4.0.1.4 P2)** | **真實 SQLite Backup & Restore 前置 Cleanup 阻斷與通過整合測試** | 驗證 `performBackup()`（`VACUUM INTO` 前）與 `restoreFromBackup()`（建立還原 staging 前）在前置 `_cleanupFileAndSidecars()` 回傳 `complete === false`（含 `unlink` 失敗殘留檔案與 `lstat` `EACCES` 狀態 `UNKNOWN`）時立即中止，絕不執行 `VACUUM INTO` 或建立還原 staging，且完整保留 `cleanupResult`、`remainingPaths`、`unverifiablePaths` 與原始錯誤；並在前置清理成功（`complete === true`）時正常完成備份與還原。 |
 
 ### 5.2 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線測試）
 - 完整保留 v2.7.7 結案之 46 項測試（包含真实 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。

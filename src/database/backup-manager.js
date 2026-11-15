@@ -345,6 +345,16 @@ class BackupManager {
         const renameFn = (options && typeof options.renameImpl === 'function')
             ? options.renameImpl
             : fs.renameSync;
+        const preparePrevRenameFn = (options && typeof options.preparePrevRenameImpl === 'function')
+            ? options.preparePrevRenameImpl
+            : (options && typeof options.renameImpl === 'function' && options.renameImpl.length >= 1)
+                ? options.renameImpl
+                : fs.renameSync;
+        const rollbackRenameFn = (options && typeof options.rollbackRenameImpl === 'function')
+            ? options.rollbackRenameImpl
+            : (options && typeof options.renameImpl === 'function' && options.renameImpl.length >= 1)
+                ? options.renameImpl
+                : fs.renameSync;
         const unlinkFn = (options && typeof options.unlinkImpl === 'function')
             ? options.unlinkImpl
             : fs.unlinkSync;
@@ -363,7 +373,55 @@ class BackupManager {
             await this.#adapter.maintenanceTask('ONLINE_BACKUP', async (rawContext) => {
                 console.log(`📦 [BACKUP] 開始建立線上一致性快照 (staging): ${stagingPath}`);
 
-                this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                if (options && typeof options.beforePreCleanup === 'function') {
+                    await options.beforePreCleanup({ stagingPath, targetPath });
+                }
+
+                // 前置 Cleanup 檢查：必須確認 stagingPath 與其 sidecars 已確認不存在 (complete === true) 才允許執行 VACUUM INTO
+                const preVacuumCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
+                if (!preVacuumCleanup.complete) {
+                    lastStagingCleanup = preVacuumCleanup;
+                    const firstFailure = preVacuumCleanup.failures[0] || null;
+                    const origCode = firstFailure && firstFailure.code
+                        ? firstFailure.code
+                        : 'BACKUP_PRE_CLEANUP_FAILED';
+                    const origMsg = firstFailure && firstFailure.message
+                        ? `${firstFailure.path} (${origCode}): ${firstFailure.message}`
+                        : '備份開始前無法清理或確認 staging 路徑狀態';
+                    const preCleanupErr = new Error(
+                        `[BACKUP_PRE_CLEANUP_FAILED] 備份開始前清理或確認 staging 路徑狀態失敗，中止 VACUUM INTO: ${origMsg}`
+                    );
+                    preCleanupErr.code = 'BACKUP_PRE_CLEANUP_FAILED';
+                    preCleanupErr.originalCode = origCode;
+                    if (firstFailure && firstFailure.rawError) {
+                        preCleanupErr.cause = firstFailure.rawError;
+                        preCleanupErr.originalError = firstFailure.rawError;
+                    } else if (firstFailure) {
+                        const rawCause = new Error(firstFailure.message);
+                        rawCause.code = firstFailure.code;
+                        rawCause.path = firstFailure.path;
+                        preCleanupErr.cause = rawCause;
+                        preCleanupErr.originalError = rawCause;
+                    }
+                    this._attachBackupCleanupDiagnostics(preCleanupErr, preVacuumCleanup);
+                    this.lastBackupError = preCleanupErr;
+                    this.lastBackupResult = {
+                        success: false,
+                        status: 'FAILED_PRE_CLEANUP',
+                        targetPath,
+                        stagingPath,
+                        stage: 'PRE_VACUUM_CLEANUP',
+                        error: preCleanupErr.message,
+                        originalCode: origCode,
+                        cleanupComplete: preVacuumCleanup.complete,
+                        cleanupResult: preVacuumCleanup,
+                        cleanupFailures: preVacuumCleanup.failures,
+                        remainingPaths: [...preVacuumCleanup.remainingPaths],
+                        unverifiablePaths: [...preVacuumCleanup.unverifiablePaths],
+                        timestamp: new Date().toISOString()
+                    };
+                    throw preCleanupErr;
+                }
 
                 try {
                     const escapedSqlPath = stagingPath.replace(/\\/g, '/').replace(/'/g, "''");
@@ -458,34 +516,135 @@ class BackupManager {
             }
 
             // 階段 3: 將通過驗證的 staging 檔案安全安裝至正式備份路徑 (保護既有同名有效備份不被破壞)
-            const existedBefore = this._inspectPathExistence(targetPath, lstatFn).state === 'PRESENT';
+            const preTargetStat = this._inspectPathExistence(targetPath, lstatFn);
+            const existedBefore = preTargetStat.state === 'PRESENT';
             const rollbackPrevPath = existedBefore
                 ? path.resolve(resolvedTargetDir, `.prev-${filename}-${uniqueSuffix}`)
                 : null;
+            let movedOriginalToPrev = false;
 
             try {
+                if (preTargetStat.state === 'UNKNOWN') {
+                    const statErr = new Error(
+                        `無法確認目標備份檔狀態 (${targetPath}, ${preTargetStat.error.code}): ${preTargetStat.error.message}`
+                    );
+                    statErr.code = preTargetStat.error.code;
+                    throw statErr;
+                }
                 if (existedBefore && rollbackPrevPath) {
-                    fs.renameSync(targetPath, rollbackPrevPath);
+                    preparePrevRenameFn(targetPath, rollbackPrevPath);
+                    movedOriginalToPrev = true;
                 }
                 renameFn(stagingPath, targetPath);
-                if (rollbackPrevPath && this._inspectPathExistence(rollbackPrevPath, lstatFn).state === 'PRESENT') {
-                    try { unlinkFn(rollbackPrevPath); } catch (_) {}
-                }
             } catch (renameErr) {
-                // 若 rename 失敗且先前移開了舊的有效備份，立即將舊有效備份還原回 targetPath
+                // 若 rename 失敗且先前移開了舊的有效備份，立即將舊有效備份還原回 targetPath，並完整記錄還原狀態與錯誤
                 let previousBackupRestored = false;
-                if (
-                    rollbackPrevPath &&
-                    this._inspectPathExistence(rollbackPrevPath, lstatFn).state === 'PRESENT' &&
-                    this._inspectPathExistence(targetPath, lstatFn).state === 'ABSENT'
-                ) {
-                    try {
-                        fs.renameSync(rollbackPrevPath, targetPath);
-                        previousBackupRestored = true;
-                    } catch (_) {}
+                let previousBackupRestoreError = null;
+                const rollbackErrors = [];
+                const preservedPrevBackupPaths = [];
+                const prevUnverifiablePaths = [];
+
+                if (movedOriginalToPrev && rollbackPrevPath) {
+                    const prevStatBeforeRestore = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                    const targetStatBeforeRestore = this._inspectPathExistence(targetPath, lstatFn);
+
+                    if (prevStatBeforeRestore.state === 'PRESENT' && targetStatBeforeRestore.state === 'ABSENT') {
+                        try {
+                            rollbackRenameFn(rollbackPrevPath, targetPath);
+                            const postPrevStat = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                            const postTargetStat = this._inspectPathExistence(targetPath, lstatFn);
+                            if (postTargetStat.state === 'PRESENT' && postPrevStat.state === 'ABSENT') {
+                                previousBackupRestored = true;
+                            } else {
+                                const rbErrObj = {
+                                    path: rollbackPrevPath,
+                                    targetPath,
+                                    code: (postPrevStat.state === 'UNKNOWN' && postPrevStat.error)
+                                        ? postPrevStat.error.code
+                                        : (postTargetStat.state === 'UNKNOWN' && postTargetStat.error)
+                                            ? postTargetStat.error.code
+                                            : 'PREV_BACKUP_RESTORE_INCOMPLETE',
+                                    message: `將舊備份 ${rollbackPrevPath} 還原至 ${targetPath} 後狀態異常 (prevState: ${postPrevStat.state}, targetState: ${postTargetStat.state})`,
+                                    stage: 'PREV_BACKUP_RESTORE',
+                                    existenceState: postPrevStat.state,
+                                    targetExistenceState: postTargetStat.state
+                                };
+                                previousBackupRestoreError = rbErrObj;
+                                rollbackErrors.push(rbErrObj);
+                                if (postPrevStat.state === 'PRESENT') {
+                                    preservedPrevBackupPaths.push(rollbackPrevPath);
+                                } else if (postPrevStat.state === 'UNKNOWN') {
+                                    prevUnverifiablePaths.push(rollbackPrevPath);
+                                }
+                            }
+                        } catch (rbErr) {
+                            const postPrevStat = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                            const postTargetStat = this._inspectPathExistence(targetPath, lstatFn);
+                            const rbErrObj = {
+                                path: rollbackPrevPath,
+                                targetPath,
+                                code: (rbErr && rbErr.code) ? String(rbErr.code) : 'PREV_BACKUP_RESTORE_FAILED',
+                                message: (rbErr && rbErr.message) ? String(rbErr.message) : String(rbErr),
+                                stage: 'PREV_BACKUP_RESTORE',
+                                existenceState: postPrevStat.state,
+                                targetExistenceState: postTargetStat.state
+                            };
+                            previousBackupRestoreError = rbErrObj;
+                            rollbackErrors.push(rbErrObj);
+                            if (postPrevStat.state === 'PRESENT') {
+                                preservedPrevBackupPaths.push(rollbackPrevPath);
+                            } else if (postPrevStat.state === 'UNKNOWN') {
+                                prevUnverifiablePaths.push(rollbackPrevPath);
+                            }
+                        }
+                    } else {
+                        const rbErrObj = {
+                            path: rollbackPrevPath,
+                            targetPath,
+                            code: (prevStatBeforeRestore.state === 'UNKNOWN' && prevStatBeforeRestore.error)
+                                ? prevStatBeforeRestore.error.code
+                                : (targetStatBeforeRestore.state === 'UNKNOWN' && targetStatBeforeRestore.error)
+                                    ? targetStatBeforeRestore.error.code
+                                    : 'PREV_BACKUP_RESTORE_PRECONDITION_FAILED',
+                            message: `無法將舊備份 ${rollbackPrevPath} 還原至 ${targetPath} (prevState: ${prevStatBeforeRestore.state}, targetState: ${targetStatBeforeRestore.state})`,
+                            stage: 'PREV_BACKUP_RESTORE',
+                            existenceState: prevStatBeforeRestore.state,
+                            targetExistenceState: targetStatBeforeRestore.state
+                        };
+                        previousBackupRestoreError = rbErrObj;
+                        rollbackErrors.push(rbErrObj);
+                        if (prevStatBeforeRestore.state === 'PRESENT') {
+                            preservedPrevBackupPaths.push(rollbackPrevPath);
+                        } else if (prevStatBeforeRestore.state === 'UNKNOWN') {
+                            prevUnverifiablePaths.push(rollbackPrevPath);
+                        }
+                    }
                 }
+
                 const stagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
                 lastStagingCleanup = stagingCleanup;
+
+                const combinedCleanupFailures = [
+                    ...rollbackErrors,
+                    ...stagingCleanup.failures
+                ];
+                const combinedRemainingPaths = Array.from(
+                    new Set([
+                        ...preservedPrevBackupPaths,
+                        ...stagingCleanup.remainingPaths
+                    ])
+                );
+                const combinedUnverifiablePaths = Array.from(
+                    new Set([
+                        ...prevUnverifiablePaths,
+                        ...stagingCleanup.unverifiablePaths
+                    ])
+                );
+                const combinedCleanupComplete =
+                    stagingCleanup.complete &&
+                    rollbackErrors.length === 0 &&
+                    preservedPrevBackupPaths.length === 0 &&
+                    prevUnverifiablePaths.length === 0;
 
                 const installErr = new Error(
                     `[BACKUP_INSTALL_FAILED] 將已驗證之 staging 備份安裝至目標路徑失敗: ${renameErr.message}`
@@ -496,7 +655,16 @@ class BackupManager {
                     installErr.originalCode = renameErr.code;
                 }
                 installErr.previousBackupRestored = previousBackupRestored;
+                installErr.previousBackupRestoreError = previousBackupRestoreError;
+                installErr.rollbackErrors = rollbackErrors;
+                installErr.preservedPrevBackupPaths = preservedPrevBackupPaths;
+                installErr.preservedRollbackPaths = [...preservedPrevBackupPaths];
                 this._attachBackupCleanupDiagnostics(installErr, stagingCleanup);
+                installErr.cleanupComplete = combinedCleanupComplete;
+                installErr.cleanupFailures = combinedCleanupFailures;
+                installErr.remainingPaths = combinedRemainingPaths;
+                installErr.unverifiablePaths = combinedUnverifiablePaths;
+
                 this.lastBackupError = installErr;
                 this.lastBackupResult = {
                     success: false,
@@ -504,16 +672,91 @@ class BackupManager {
                     targetPath,
                     stagingPath,
                     previousBackupRestored,
+                    previousBackupRestoreError,
+                    rollbackErrors,
+                    preservedPrevBackupPaths,
+                    preservedRollbackPaths: [...preservedPrevBackupPaths],
                     stage: 'RENAME_INSTALL',
                     error: installErr.message,
-                    cleanupComplete: stagingCleanup.complete,
+                    cleanupComplete: combinedCleanupComplete,
                     cleanupResult: stagingCleanup,
-                    cleanupFailures: stagingCleanup.failures,
-                    remainingPaths: [...stagingCleanup.remainingPaths],
-                    unverifiablePaths: [...stagingCleanup.unverifiablePaths],
+                    cleanupFailures: combinedCleanupFailures,
+                    remainingPaths: combinedRemainingPaths,
+                    unverifiablePaths: combinedUnverifiablePaths,
                     timestamp: new Date().toISOString()
                 };
                 throw installErr;
+            }
+
+            // 新備份已成功安裝至 targetPath：現在清理舊 .prev-* 暫存檔，絕不吞掉錯誤且絕不因清理失敗而破壞新備份
+            const cleanupWarnings = [];
+            const prevCleanupFailures = [];
+            const preservedPrevBackupPaths = [];
+            const prevRemainingPaths = [];
+            const prevUnverifiablePaths = [];
+
+            if (movedOriginalToPrev && rollbackPrevPath) {
+                const prePrevStat = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                if (prePrevStat.state === 'UNKNOWN') {
+                    const warnEntry = {
+                        path: rollbackPrevPath,
+                        code: prePrevStat.error.code,
+                        message: prePrevStat.error.message,
+                        stage: 'PREV_BACKUP_CLEANUP',
+                        existenceState: 'UNKNOWN'
+                    };
+                    cleanupWarnings.push(warnEntry);
+                    prevCleanupFailures.push(warnEntry);
+                    prevUnverifiablePaths.push(rollbackPrevPath);
+                } else if (prePrevStat.state === 'PRESENT') {
+                    try {
+                        unlinkFn(rollbackPrevPath);
+                        const postPrevStat = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                        if (postPrevStat.state === 'PRESENT') {
+                            const warnEntry = {
+                                path: rollbackPrevPath,
+                                code: 'PREV_BACKUP_CLEANUP_STILL_EXISTS',
+                                message: `舊備份暫存檔 (.prev-*) 於 unlink 後仍存在於磁碟: ${rollbackPrevPath}`,
+                                stage: 'PREV_BACKUP_CLEANUP',
+                                existenceState: 'PRESENT'
+                            };
+                            cleanupWarnings.push(warnEntry);
+                            prevCleanupFailures.push(warnEntry);
+                            preservedPrevBackupPaths.push(rollbackPrevPath);
+                            prevRemainingPaths.push(rollbackPrevPath);
+                        } else if (postPrevStat.state === 'UNKNOWN') {
+                            const warnEntry = {
+                                path: rollbackPrevPath,
+                                code: postPrevStat.error.code,
+                                message: `舊備份暫存檔 (.prev-*) 於 unlink 後無法確認是否存在: ${postPrevStat.error.message}`,
+                                stage: 'PREV_BACKUP_CLEANUP',
+                                existenceState: 'UNKNOWN'
+                            };
+                            cleanupWarnings.push(warnEntry);
+                            prevCleanupFailures.push(warnEntry);
+                            prevUnverifiablePaths.push(rollbackPrevPath);
+                        }
+                    } catch (prevUnlinkErr) {
+                        const postPrevStat = this._inspectPathExistence(rollbackPrevPath, lstatFn);
+                        if (!(prevUnlinkErr && prevUnlinkErr.code === 'ENOENT' && postPrevStat.state === 'ABSENT')) {
+                            const warnEntry = {
+                                path: rollbackPrevPath,
+                                code: (prevUnlinkErr && prevUnlinkErr.code) ? String(prevUnlinkErr.code) : 'PREV_BACKUP_CLEANUP_FAILED',
+                                message: (prevUnlinkErr && prevUnlinkErr.message) ? String(prevUnlinkErr.message) : String(prevUnlinkErr),
+                                stage: 'PREV_BACKUP_CLEANUP',
+                                existenceState: postPrevStat.state
+                            };
+                            cleanupWarnings.push(warnEntry);
+                            prevCleanupFailures.push(warnEntry);
+                            if (postPrevStat.state === 'PRESENT') {
+                                preservedPrevBackupPaths.push(rollbackPrevPath);
+                                prevRemainingPaths.push(rollbackPrevPath);
+                            } else if (postPrevStat.state === 'UNKNOWN') {
+                                prevUnverifiablePaths.push(rollbackPrevPath);
+                            }
+                        }
+                    }
+                }
             }
 
             this._markBackupVerified(targetPath);
@@ -522,6 +765,16 @@ class BackupManager {
             // 確認成功安裝後 stagingPath 及其 sidecars 已無殘留並保存結構化清理結果
             const postInstallStagingCleanup = this._cleanupFileAndSidecars(stagingPath, cleanupOpts);
             lastStagingCleanup = postInstallStagingCleanup;
+            if (!postInstallStagingCleanup.complete) {
+                for (const failure of postInstallStagingCleanup.failures) {
+                    cleanupWarnings.push({
+                        path: failure.path,
+                        code: failure.code,
+                        message: failure.message,
+                        stage: 'STAGING_FILE_CLEANUP'
+                    });
+                }
+            }
 
             if (options && typeof options.beforeRotation === 'function') {
                 await options.beforeRotation({ targetPath });
@@ -533,17 +786,43 @@ class BackupManager {
             console.log(`✅ [BACKUP] 備份成功並通過完整性檢驗: ${targetPath}`);
             const rotation = await this._rotateOldBackups(resolvedTargetDir, targetPath);
 
+            const combinedCleanupFailures = [
+                ...prevCleanupFailures,
+                ...postInstallStagingCleanup.failures
+            ];
+            const combinedRemainingPaths = Array.from(
+                new Set([
+                    ...prevRemainingPaths,
+                    ...postInstallStagingCleanup.remainingPaths
+                ])
+            );
+            const combinedUnverifiablePaths = Array.from(
+                new Set([
+                    ...prevUnverifiablePaths,
+                    ...postInstallStagingCleanup.unverifiablePaths
+                ])
+            );
+            const cleanupComplete =
+                postInstallStagingCleanup.complete &&
+                prevCleanupFailures.length === 0 &&
+                preservedPrevBackupPaths.length === 0 &&
+                prevRemainingPaths.length === 0 &&
+                prevUnverifiablePaths.length === 0;
+
             const result = {
                 success: true,
                 status: 'COMPLETED',
                 targetPath,
                 verify,
                 rotation,
-                cleanupComplete: postInstallStagingCleanup.complete,
+                cleanupComplete,
+                cleanupWarnings,
                 cleanupResult: postInstallStagingCleanup,
-                cleanupFailures: postInstallStagingCleanup.failures,
-                remainingPaths: [...postInstallStagingCleanup.remainingPaths],
-                unverifiablePaths: [...postInstallStagingCleanup.unverifiablePaths],
+                cleanupFailures: combinedCleanupFailures,
+                preservedPrevBackupPaths,
+                preservedRollbackPaths: [...preservedPrevBackupPaths],
+                remainingPaths: combinedRemainingPaths,
+                unverifiablePaths: combinedUnverifiablePaths,
                 timestamp: new Date().toISOString()
             };
             this.lastBackupError = null;
@@ -615,17 +894,19 @@ class BackupManager {
                     error: null
                 };
             }
+            const errInfo = {
+                path: filePath,
+                code: (err && err.code) ? String(err.code) : 'CLEANUP_STAT_FAILED',
+                message: (err && err.message) ? String(err.message) : String(err)
+            };
+            Object.defineProperty(errInfo, 'rawError', { value: err, enumerable: false });
             return {
                 state: 'UNKNOWN',
                 exists: false,
                 confirmedAbsent: false,
                 unverifiable: true,
                 stats: null,
-                error: {
-                    path: filePath,
-                    code: (err && err.code) ? String(err.code) : 'CLEANUP_STAT_FAILED',
-                    message: (err && err.message) ? String(err.message) : String(err)
-                }
+                error: errInfo
             };
         }
     }
@@ -677,12 +958,16 @@ class BackupManager {
             }
 
             if (preCheck.state === 'UNKNOWN') {
-                result.failures.push({
+                const fItem = {
                     path: p,
                     code: preCheck.error.code,
                     message: preCheck.error.message,
                     stage: 'PRE_UNLINK_STAT'
-                });
+                };
+                if (preCheck.error.rawError) {
+                    Object.defineProperty(fItem, 'rawError', { value: preCheck.error.rawError, enumerable: false });
+                }
+                result.failures.push(fItem);
                 if (!result.unverifiablePaths.includes(p)) {
                     result.unverifiablePaths.push(p);
                 }
@@ -706,12 +991,16 @@ class BackupManager {
                         result.remainingPaths.push(p);
                     }
                 } else {
-                    result.failures.push({
+                    const fItem = {
                         path: p,
                         code: postCheck.error.code,
                         message: `檔案於執行 unlink 後無法確認是否存在: ${postCheck.error.message}`,
                         stage: 'POST_UNLINK_STAT'
-                    });
+                    };
+                    if (postCheck.error.rawError) {
+                        Object.defineProperty(fItem, 'rawError', { value: postCheck.error.rawError, enumerable: false });
+                    }
+                    result.failures.push(fItem);
                     if (!result.unverifiablePaths.includes(p)) {
                         result.unverifiablePaths.push(p);
                     }
@@ -721,12 +1010,14 @@ class BackupManager {
                 if (err && err.code === 'ENOENT' && postCheck.state === 'ABSENT') {
                     result.alreadyAbsent.push(p);
                 } else {
-                    result.failures.push({
+                    const fItem = {
                         path: p,
                         code: (err && err.code) ? String(err.code) : 'CLEANUP_UNLINK_FAILED',
                         message: (err && err.message) ? String(err.message) : String(err),
                         stage: 'UNLINK'
-                    });
+                    };
+                    Object.defineProperty(fItem, 'rawError', { value: err, enumerable: false });
+                    result.failures.push(fItem);
                     if (postCheck.state === 'PRESENT') {
                         if (!result.remainingPaths.includes(p)) {
                             result.remainingPaths.push(p);
@@ -982,7 +1273,61 @@ class BackupManager {
         // Step 1: 在目標 DB 同一目錄 (同一檔案系統) 建立唯一 staging DB
         const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
         const stagingRestorePath = path.resolve(targetDir, `.restore-staging-${path.basename(resolvedTarget)}-${uniqueSuffix}`);
-        this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
+        if (options && typeof options.beforePreCleanup === 'function') {
+            await options.beforePreCleanup({ stagingRestorePath, resolvedTarget });
+        }
+
+        // 前置 Cleanup 檢查：必須確認 stagingRestorePath 與其 sidecars 已確認不存在 (complete === true) 才允許建立還原 staging DB
+        const preRestoreCleanup = this._cleanupFileAndSidecars(stagingRestorePath, cleanupOpts);
+        if (!preRestoreCleanup.complete) {
+            const firstFailure = preRestoreCleanup.failures[0] || null;
+            const origCode = firstFailure && firstFailure.code
+                ? firstFailure.code
+                : 'BACKUP_RESTORE_PRE_CLEANUP_FAILED';
+            const origMsg = firstFailure && firstFailure.message
+                ? `${firstFailure.path} (${origCode}): ${firstFailure.message}`
+                : '建立還原 staging DB 前無法清理或確認 staging 路徑狀態';
+            const preCleanupErr = new Error(
+                `[BACKUP_RESTORE_PRE_CLEANUP_FAILED] 建立還原 staging DB 前清理或確認路徑狀態失敗，中止還原: ${origMsg}`
+            );
+            preCleanupErr.code = 'BACKUP_RESTORE_PRE_CLEANUP_FAILED';
+            preCleanupErr.originalCode = origCode;
+            if (firstFailure && firstFailure.rawError) {
+                preCleanupErr.cause = firstFailure.rawError;
+                preCleanupErr.originalError = firstFailure.rawError;
+            } else if (firstFailure) {
+                const rawCause = new Error(firstFailure.message);
+                rawCause.code = firstFailure.code;
+                rawCause.path = firstFailure.path;
+                preCleanupErr.cause = rawCause;
+                preCleanupErr.originalError = rawCause;
+            }
+            preCleanupErr.restoreStatus = RESTORE_STATUS.REJECTED_PRECONDITION;
+            preCleanupErr.cleanupComplete = preRestoreCleanup.complete;
+            preCleanupErr.cleanupResult = preRestoreCleanup;
+            preCleanupErr.cleanupFailures = preRestoreCleanup.failures;
+            preCleanupErr.remainingPaths = [...preRestoreCleanup.remainingPaths];
+            preCleanupErr.unverifiablePaths = [...preRestoreCleanup.unverifiablePaths];
+            preCleanupErr.lifecycle = { ...lifecycle };
+            this.lastRestoreError = preCleanupErr;
+            this.lastRestoreResult = {
+                success: false,
+                restoreStatus: RESTORE_STATUS.REJECTED_PRECONDITION,
+                stage: 'PRE_STAGING_CLEANUP',
+                originalCode: origCode,
+                cleanupComplete: preRestoreCleanup.complete,
+                cleanupResult: preRestoreCleanup,
+                cleanupFailures: preRestoreCleanup.failures,
+                remainingPaths: preCleanupErr.remainingPaths,
+                unverifiablePaths: preCleanupErr.unverifiablePaths,
+                lifecycle: { ...lifecycle },
+                backupFilePath: resolvedSource,
+                restoredPath: resolvedTarget,
+                error: preCleanupErr.message,
+                timestamp: new Date().toISOString()
+            };
+            throw preCleanupErr;
+        }
 
         try {
             await new Promise((resolve, reject) => {

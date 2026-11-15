@@ -2841,4 +2841,412 @@ describe('Meshtastic-DashBoard 4.0.1.4 — Database Bootstrap & Backup Integrity
             cleanupTempDir(backupDir);
         }
     });
+
+    it('Test Z — Backup Replacement .prev-* Cleanup & Rollback Error Diagnostics: 驗證新備份安裝後 .prev-* 清理失敗與安裝失敗後 .prev-* 還原失敗皆完整記錄且不覆蓋原始錯誤或遺失有效備份', async () => {
+        const dbPath = getTempDbPath('test_z_source');
+        const backupDir = getTempDir('test_z_backups');
+        const prevFilesToClean = [];
+        let db = null;
+
+        try {
+            db = await createDatabaseSubsystem({
+                dbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_z1', 'NodeZ_Initial']);
+
+            // 先建立第 1 份有效備份 (同名目標 backup_z.db)
+            const firstBackup = await db.backupManager.performBackup('backup_z.db');
+            assert.equal(firstBackup.success, true);
+            assert.equal(firstBackup.cleanupComplete, true);
+
+            // =========================================================================
+            // 情境 Z-1: 新備份安裝成功後，刪除舊 .prev-* 檔案失敗且檔案仍存在於磁碟 (PRESENT)
+            // =========================================================================
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_z2', 'NodeZ_Second']);
+            const resZ1 = await db.backupManager.performBackup('backup_z.db', {
+                unlinkImpl: (p) => {
+                    if (String(p).includes('.prev-backup_z.db-')) {
+                        prevFilesToClean.push(p);
+                        const err = new Error('EBUSY: simulated lock on old .prev backup file');
+                        err.code = 'EBUSY';
+                        throw err;
+                    }
+                    return fs.unlinkSync(p);
+                }
+            });
+
+            assert.equal(resZ1.success, true, '新備份已安裝驗證成功，不得因舊 .prev-* 清理失敗而判定備份失敗');
+            assert.equal(resZ1.status, 'COMPLETED');
+            assert.equal(resZ1.cleanupComplete, false, '.prev-* 刪除失敗時 cleanupComplete 必須為 false');
+            assert.ok(Array.isArray(resZ1.cleanupWarnings) && resZ1.cleanupWarnings.length === 1);
+            assert.equal(resZ1.cleanupWarnings[0].code, 'EBUSY');
+            assert.equal(resZ1.cleanupWarnings[0].stage, 'PREV_BACKUP_CLEANUP');
+            assert.equal(resZ1.cleanupWarnings[0].existenceState, 'PRESENT');
+            assert.ok(resZ1.preservedPrevBackupPaths.includes(resZ1.cleanupWarnings[0].path));
+            assert.ok(resZ1.remainingPaths.includes(resZ1.cleanupWarnings[0].path));
+            assert.equal(fs.existsSync(resZ1.cleanupWarnings[0].path), true, '殘留的 .prev-* 檔案確實仍在磁碟上');
+
+            // 確認新備份本身完好無損且包含最新資料
+            const verifyNewZ1 = await db.backupManager.verifyIntegrity(resZ1.targetPath);
+            assert.equal(verifyNewZ1.status, BACKUP_VERIFY_STATUS.VALID);
+
+            // 清理 Z-1 留下的 .prev-* 檔案
+            for (const f of prevFilesToClean.splice(0)) {
+                if (fs.existsSync(f)) fs.unlinkSync(f);
+            }
+
+            // =========================================================================
+            // 情境 Z-2: 新備份安裝成功後，刪除舊 .prev-* 時拋錯但檔案已不存在 (ABSENT)，或狀態無法確認 (UNKNOWN)
+            // =========================================================================
+            const resZ2Absent = await db.backupManager.performBackup('backup_z.db', {
+                unlinkImpl: (p) => {
+                    if (String(p).includes('.prev-backup_z.db-')) {
+                        if (fs.existsSync(p)) fs.unlinkSync(p);
+                        const err = new Error('EIO: post-unlink error after .prev file removed');
+                        err.code = 'EIO';
+                        throw err;
+                    }
+                    return fs.unlinkSync(p);
+                }
+            });
+            assert.equal(resZ2Absent.success, true);
+            assert.equal(resZ2Absent.cleanupComplete, false);
+            assert.equal(resZ2Absent.cleanupWarnings.length, 1);
+            assert.equal(resZ2Absent.cleanupWarnings[0].code, 'EIO');
+            assert.equal(resZ2Absent.cleanupWarnings[0].existenceState, 'ABSENT');
+            assert.equal(resZ2Absent.preservedPrevBackupPaths.length, 0, '已不存在的 .prev-* 不得加入 preservedPrevBackupPaths');
+            assert.equal(resZ2Absent.remainingPaths.length, 0);
+
+            const resZ2Unknown = await db.backupManager.performBackup('backup_z.db', {
+                unlinkImpl: (p) => {
+                    if (String(p).includes('.prev-backup_z.db-')) {
+                        prevFilesToClean.push(p);
+                        const err = new Error('EPERM: cannot unlink .prev file');
+                        err.code = 'EPERM';
+                        throw err;
+                    }
+                    return fs.unlinkSync(p);
+                },
+                lstatImpl: (p) => {
+                    if (String(p).includes('.prev-backup_z.db-') && prevFilesToClean.includes(p)) {
+                        const statErr = new Error('EACCES: cannot stat .prev file after unlink error');
+                        statErr.code = 'EACCES';
+                        throw statErr;
+                    }
+                    return fs.lstatSync(p);
+                }
+            });
+            assert.equal(resZ2Unknown.success, true);
+            assert.equal(resZ2Unknown.cleanupComplete, false);
+            assert.equal(resZ2Unknown.cleanupWarnings.length, 1);
+            assert.equal(resZ2Unknown.cleanupWarnings[0].code, 'EPERM');
+            assert.equal(resZ2Unknown.cleanupWarnings[0].existenceState, 'UNKNOWN');
+            assert.equal(resZ2Unknown.preservedPrevBackupPaths.length, 0, '狀態為 UNKNOWN 時不得謊報於 preservedPrevBackupPaths');
+            assert.equal(resZ2Unknown.unverifiablePaths.length, 1);
+
+            for (const f of prevFilesToClean.splice(0)) {
+                if (fs.existsSync(f)) fs.unlinkSync(f);
+            }
+
+            // =========================================================================
+            // 情境 Z-3: 新備份安裝失敗 (staging -> target rename 失敗)，且將舊 .prev-* 還原回 target 時也發生 rename 失敗
+            // =========================================================================
+            let capturedPrevPath = null;
+            await assert.rejects(
+                async () => {
+                    await db.backupManager.performBackup('backup_z.db', {
+                        renameImpl: (src, dest) => {
+                            if (String(src).includes('.staging-')) {
+                                const installErr = new Error('EXDEV: simulated staging install rename failure');
+                                installErr.code = 'EXDEV';
+                                throw installErr;
+                            }
+                            if (String(src).includes('.prev-')) {
+                                capturedPrevPath = src;
+                                prevFilesToClean.push(src);
+                                const rbErr = new Error('EACCES: simulated rollback rename failure from .prev to target');
+                                rbErr.code = 'EACCES';
+                                throw rbErr;
+                            }
+                            return fs.renameSync(src, dest);
+                        }
+                    });
+                },
+                (err) => {
+                    // 1. 原始 Backup 安裝錯誤必須完整保留，不得被後續還原或清理錯誤覆蓋
+                    assert.match(err.message, /BACKUP_INSTALL_FAILED/);
+                    assert.match(err.message, /EXDEV: simulated staging install rename failure/);
+                    assert.ok(err.cause);
+                    assert.equal(err.cause.code, 'EXDEV');
+                    assert.equal(err.originalCode, 'EXDEV');
+
+                    // 2. 舊 .prev-* 還原失敗必須完整記錄檔案路徑、錯誤碼、錯誤訊息與存在狀態
+                    assert.equal(err.previousBackupRestored, false);
+                    assert.ok(err.previousBackupRestoreError, '必須記錄 previousBackupRestoreError');
+                    assert.equal(err.previousBackupRestoreError.path, capturedPrevPath);
+                    assert.equal(err.previousBackupRestoreError.targetPath, firstBackup.targetPath);
+                    assert.equal(err.previousBackupRestoreError.code, 'EACCES');
+                    assert.match(err.previousBackupRestoreError.message, /simulated rollback rename failure/);
+                    assert.equal(err.previousBackupRestoreError.stage, 'PREV_BACKUP_RESTORE');
+                    assert.equal(err.previousBackupRestoreError.existenceState, 'PRESENT');
+                    assert.equal(err.previousBackupRestoreError.targetExistenceState, 'ABSENT');
+
+                    assert.ok(Array.isArray(err.rollbackErrors) && err.rollbackErrors.length === 1);
+                    assert.equal(err.rollbackErrors[0].code, 'EACCES');
+
+                    // 3. 殘留檔案診斷資訊完整且 cleanupComplete 為 false
+                    assert.equal(err.cleanupComplete, false);
+                    assert.ok(err.preservedPrevBackupPaths.includes(capturedPrevPath));
+                    assert.ok(err.remainingPaths.includes(capturedPrevPath));
+                    return true;
+                }
+            );
+
+            // 4. 確認舊的有效備份仍安全保留在 capturedPrevPath，未遺失且通過完整性驗證
+            assert.ok(capturedPrevPath && fs.existsSync(capturedPrevPath), '舊的有效備份必須保留在 .prev-* 路徑不得遺失');
+            const verifyPreservedPrev = await db.backupManager.verifyIntegrity(capturedPrevPath);
+            assert.equal(verifyPreservedPrev.status, BACKUP_VERIFY_STATUS.VALID, '保留在 .prev-* 的舊備份必須完整有效');
+
+            await db.close();
+            db = null;
+        } finally {
+            if (db) {
+                try { await db.close(); } catch (_) {}
+            }
+            for (const f of prevFilesToClean) {
+                try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch (_) {}
+            }
+            cleanupTempDb(dbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test AA — Pre-Cleanup Verification Before VACUUM INTO & Restore Staging: 驗證前置 Cleanup 失敗或狀態為 UNKNOWN 時立即中止，絕不執行後續 VACUUM INTO 或 Restore', async () => {
+        const dbPath = getTempDbPath('test_aa_source');
+        const targetDbPath = getTempDbPath('test_aa_target');
+        const backupDir = getTempDir('test_aa_backups');
+        const residualFilesToClean = [];
+        let db = null;
+
+        try {
+            db = await createDatabaseSubsystem({
+                dbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await db.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_aa', 'NodeAA']);
+
+            // =========================================================================
+            // 情境 AA-1: performBackup() 前置 staging cleanup 因刪除失敗 (EPERM) -> 立即中止，不執行 VACUUM INTO
+            // =========================================================================
+            let vacuumExecutedAA1 = false;
+            const origExecute = db.adapter.execute.bind(db.adapter);
+            db.adapter.execute = async (sql, params) => {
+                if (String(sql).toUpperCase().includes('VACUUM INTO')) {
+                    vacuumExecutedAA1 = true;
+                }
+                return origExecute(sql, params);
+            };
+
+            try {
+                let preStagingPathAA1 = null;
+                await assert.rejects(
+                    async () => {
+                        await db.backupManager.performBackup('pre_cleanup_fail_unlink.db', {
+                            beforePreCleanup: ({ stagingPath }) => {
+                                preStagingPathAA1 = stagingPath;
+                                fs.writeFileSync(stagingPath, 'RESIDUAL_STAGING_DATA');
+                                residualFilesToClean.push(stagingPath);
+                            },
+                            unlinkImpl: (p) => {
+                                if (preStagingPathAA1 && path.resolve(p) === path.resolve(preStagingPathAA1)) {
+                                    const err = new Error('EPERM: residual staging file locked before backup');
+                                    err.code = 'EPERM';
+                                    throw err;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        });
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_PRE_CLEANUP_FAILED/);
+                        assert.equal(err.code, 'BACKUP_PRE_CLEANUP_FAILED');
+                        assert.equal(err.originalCode, 'EPERM');
+                        assert.ok(err.cause);
+                        assert.equal(err.cause.code, 'EPERM');
+                        assert.equal(err.cleanupComplete, false);
+                        assert.ok(err.cleanupResult);
+                        assert.equal(err.cleanupResult.complete, false);
+                        assert.ok(err.remainingPaths.includes(path.resolve(preStagingPathAA1)));
+                        assert.equal(err.unverifiablePaths.length, 0);
+                        return true;
+                    }
+                );
+                assert.equal(vacuumExecutedAA1, false, '前置 cleanup 失敗時絕不可執行 VACUUM INTO');
+                assert.equal(db.backupManager.lastBackupResult.status, 'FAILED_PRE_CLEANUP');
+
+                // =========================================================================
+                // 情境 AA-2: performBackup() 前置 staging cleanup 因 lstat 權限錯誤狀態為 UNKNOWN (EACCES) -> 立即中止
+                // =========================================================================
+                let vacuumExecutedAA2 = false;
+                db.adapter.execute = async (sql, params) => {
+                    if (String(sql).toUpperCase().includes('VACUUM INTO')) {
+                        vacuumExecutedAA2 = true;
+                    }
+                    return origExecute(sql, params);
+                };
+
+                await assert.rejects(
+                    async () => {
+                        await db.backupManager.performBackup('pre_cleanup_unknown.db', {
+                            lstatImpl: (p) => {
+                                if (String(p).includes('.staging-pre_cleanup_unknown.db') && !String(p).endsWith('-wal') && !String(p).endsWith('-shm')) {
+                                    const err = new Error('EACCES: cannot stat staging path before backup');
+                                    err.code = 'EACCES';
+                                    throw err;
+                                }
+                                return fs.lstatSync(p);
+                            }
+                        });
+                    },
+                    (err) => {
+                        assert.match(err.message, /BACKUP_PRE_CLEANUP_FAILED/);
+                        assert.equal(err.code, 'BACKUP_PRE_CLEANUP_FAILED');
+                        assert.equal(err.originalCode, 'EACCES');
+                        assert.ok(err.cause);
+                        assert.equal(err.cause.code, 'EACCES');
+                        assert.equal(err.cleanupComplete, false);
+                        assert.equal(err.cleanupResult.complete, false);
+                        assert.equal(err.remainingPaths.length, 0);
+                        assert.equal(err.unverifiablePaths.length, 1);
+                        return true;
+                    }
+                );
+                assert.equal(vacuumExecutedAA2, false, 'staging 狀態為 UNKNOWN 時絕不可執行 VACUUM INTO');
+            } finally {
+                db.adapter.execute = origExecute;
+            }
+
+            // =========================================================================
+            // 情境 AA-3: performBackup() 前置 cleanup 成功清除殘留檔時，可正常繼續完成備份
+            // =========================================================================
+            const validBackupAA = await db.backupManager.performBackup('valid_aa_backup.db', {
+                beforePreCleanup: ({ stagingPath }) => {
+                    fs.writeFileSync(stagingPath, 'STALE_STAGING_TO_BE_CLEANED');
+                }
+            });
+            assert.equal(validBackupAA.success, true);
+            assert.equal(validBackupAA.cleanupComplete, true);
+
+            // =========================================================================
+            // 情境 AA-4: restoreFromBackup() 前置 staging cleanup 失敗 (EBUSY) 或狀態為 UNKNOWN (EACCES) -> 立即中止
+            // =========================================================================
+            let preRestoreStagingAA4 = null;
+            await assert.rejects(
+                async () => {
+                    await db.backupManager.restoreFromBackup(
+                        validBackupAA.targetPath,
+                        targetDbPath,
+                        {
+                            offlineConfirmed: true,
+                            beforePreCleanup: ({ stagingRestorePath }) => {
+                                preRestoreStagingAA4 = stagingRestorePath;
+                                fs.writeFileSync(stagingRestorePath, 'RESIDUAL_RESTORE_STAGING');
+                                residualFilesToClean.push(stagingRestorePath);
+                            },
+                            unlinkImpl: (p) => {
+                                if (preRestoreStagingAA4 && path.resolve(p) === path.resolve(preRestoreStagingAA4)) {
+                                    const err = new Error('EBUSY: restore staging file locked before restore');
+                                    err.code = 'EBUSY';
+                                    throw err;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_PRE_CLEANUP_FAILED/);
+                    assert.equal(err.code, 'BACKUP_RESTORE_PRE_CLEANUP_FAILED');
+                    assert.equal(err.originalCode, 'EBUSY');
+                    assert.ok(err.cause);
+                    assert.equal(err.cause.code, 'EBUSY');
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                    assert.equal(err.cleanupComplete, false);
+                    assert.ok(err.cleanupResult);
+                    assert.equal(err.cleanupResult.complete, false);
+                    assert.ok(err.remainingPaths.includes(path.resolve(preRestoreStagingAA4)));
+                    assert.equal(err.lifecycle.stagingCreated, false, '前置 cleanup 失敗時不得建立還原 staging DB');
+                    return true;
+                }
+            );
+            assert.equal(fs.existsSync(targetDbPath), false, '目標資料庫路徑必須維持未建立狀態');
+
+            // 測試 restoreFromBackup() 前置 staging 路徑狀態為 UNKNOWN (EACCES)
+            await assert.rejects(
+                async () => {
+                    await db.backupManager.restoreFromBackup(
+                        validBackupAA.targetPath,
+                        targetDbPath,
+                        {
+                            offlineConfirmed: true,
+                            lstatImpl: (p) => {
+                                if (String(p).includes('.restore-staging-') && String(p).endsWith('-wal')) {
+                                    const err = new Error('EACCES: cannot stat restore staging -wal sidecar');
+                                    err.code = 'EACCES';
+                                    throw err;
+                                }
+                                return fs.lstatSync(p);
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_PRE_CLEANUP_FAILED/);
+                    assert.equal(err.code, 'BACKUP_RESTORE_PRE_CLEANUP_FAILED');
+                    assert.equal(err.originalCode, 'EACCES');
+                    assert.ok(err.cause);
+                    assert.equal(err.cause.code, 'EACCES');
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                    assert.equal(err.cleanupComplete, false);
+                    assert.equal(err.remainingPaths.length, 0);
+                    assert.equal(err.unverifiablePaths.length, 1);
+                    assert.equal(err.lifecycle.stagingCreated, false);
+                    return true;
+                }
+            );
+
+            // =========================================================================
+            // 情境 AA-5: restoreFromBackup() 前置 cleanup 成功清除殘留檔時，可正常繼續完成還原
+            // =========================================================================
+            const resRestoreAA = await db.backupManager.restoreFromBackup(
+                validBackupAA.targetPath,
+                targetDbPath,
+                {
+                    offlineConfirmed: true,
+                    beforePreCleanup: ({ stagingRestorePath }) => {
+                        fs.writeFileSync(`${stagingRestorePath}-wal`, 'STALE_WAL_TO_BE_CLEANED');
+                    }
+                }
+            );
+            assert.equal(resRestoreAA.success, true);
+            assert.equal(resRestoreAA.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(resRestoreAA.cleanupComplete, true);
+
+            await db.close();
+            db = null;
+        } finally {
+            if (db) {
+                try { await db.close(); } catch (_) {}
+            }
+            for (const f of residualFilesToClean) {
+                cleanupTempDb(f);
+            }
+            cleanupTempDb(dbPath);
+            cleanupTempDb(targetDbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
 });

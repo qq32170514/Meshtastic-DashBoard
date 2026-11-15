@@ -122,8 +122,8 @@
     - 移除 `index.js` 中 WAL 模式下不安全的 `fs.copyFileSync(sourceDbPath, targetBackupPath)`，正式串接 `db.backupManager.startSchedule('0 0 * * 0', ...)`，並於 `handleShutdown()` 停止備份排程。
 - **4.0.1.4 修改檔案與測試結果**：
   - 修改檔案：`src/database/backup-manager.js`、`tests/database/data_integrity_4_0_1.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
-  - 新增測試：2 項（Test X — Cleanup State Verification & Backup Cleanup Call Sites、Test Y — Rollback Path Verification）。
-  - 實際測試結果：於 [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Tests A – Y 共 25 項）加上 [sqlite_reliability.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項），實際執行 `npm run test:database` 共 **71 項測試全數通過（71 passed, 0 failed, 0 skipped, 0 cancelled）**。
+  - 新增測試：4 項（Test X — Cleanup State Verification & Backup Cleanup Call Sites、Test Y — Rollback Path Verification、Test Z — Backup Replacement `.prev-*` Cleanup & Rollback Error Diagnostics、Test AA — Pre-Cleanup Verification Before VACUUM INTO & Restore Staging）。
+  - 實際測試結果：於 [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Tests A – AA 共 27 項）加上 [sqlite_reliability.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項），實際執行 `npm run test:database` 共 **73 項測試全數通過（73 passed, 0 failed, 0 skipped, 0 cancelled）**。
   - 尚未完成/未涵蓋項目：4.0.2 Packet Transaction Boundary 尚未開始；`TURSO_URL` 分支與既有備份排程政策（`BACKUP_PATH` / `'0 0 * * 0'`）依規範維持未變動；跨程序實體斷電 / OS 檔案系統損毀未以實體硬體故障測試（採用受控錯誤注入測試）。
   - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
 
