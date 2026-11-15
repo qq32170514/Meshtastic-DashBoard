@@ -103,8 +103,8 @@
 
 ---
 
-### 7. Meshtastic-DashBoard 4.0.1 / 4.0.1.1 / 4.0.1.2 — Database Bootstrap, Backup Isolation, Restore Offline Assurance & Retention Fix
-- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成啟動階段 Schema Initialization Barrier（P0）、WAL 模式線上備份完整性整合（P1）、Backup Scheduler 隔離（4.0.1.1 P1）、Restore 活躍 DB 防護與可回復 Rollback（4.0.1.1 P1）、Schema Index 完整定義驗證（4.0.1.1 P2）、Backup Path Containment（4.0.1.1 P2）、Restore 離線保證三層契約（4.0.1.2 P1）、Restore 無既有目標時之安裝後失敗清理與 Rollback 狀態（4.0.1.2 P1），以及 Backup Rotation `maxBackups` 最新備份精確計數修正（4.0.1.2 P2）。
+### 7. Meshtastic-DashBoard 4.0.1 / 4.0.1.1 / 4.0.1.2 / 4.0.1.3 — Database Bootstrap, Backup Isolation, Restore Offline & Cleanup Assurance (READY FOR REVIEW)
+- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成啟動階段 Schema Initialization Barrier（P0）、WAL 模式線上備份完整性整合（P1）、Backup Scheduler 隔離（4.0.1.1 P1）、Restore 活躍 DB 防護與可回復 Rollback（4.0.1.1 P1）、Schema Index 完整定義驗證（4.0.1.1 P2）、Backup Path Containment（4.0.1.1 P2）、Restore 離線保證三層契約（4.0.1.2 P1）、Restore 無既有目標時之安裝後失敗清理與 Rollback 狀態（4.0.1.2 P1）、Backup Rotation `maxBackups` 最新備份精確計數修正（4.0.1.2 P2），以及 **4.0.1.3 Restore Cleanup Assurance**（P2：Restore Staging Cleanup 結構化回報、Restore 成功後舊 `.rollback-*` 清理失敗診斷、WAL 純閒置連線測試）。
 - **新增與修改模組**：
   - [schema-bootstrap.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/schema-bootstrap.js)（新增與強化）：
     - 嚴格定義並依序執行：**Step 1 核心資料表建立（8 張表）** $\rightarrow$ **Step 2 欄位擴充 Migration（26 個欄位，`PRAGMA table_info` 預檢 + 型別相容性檢查 + 錯誤分類，禁止以空回呼吞錯）** $\rightarrow$ **Step 3 清理廢棄索引（5 個）** $\rightarrow$ **Step 4 建立必要索引（11 個，位於 Migration 後確保 `gateway_id` 與 `hops_away` 已存在）** $\rightarrow$ **Step 5 最終 Schema & Index Definition Verification（`verifyDatabaseSchema` + `verifySingleIndexDefinition`，透過 `PRAGMA index_list`、`PRAGMA index_xinfo` 與 `sqlite_master.sql` 檢驗索引所屬表、欄位順序、ASC/DESC、UNIQUE 與 Partial WHERE 條件）**。
@@ -112,15 +112,20 @@
     - **Backup Scheduler Isolation (4.0.1.1 P1)**：`performBackup()` 僅將 `VACUUM INTO`（寫入唯一 `.staging-*` 暫存檔）放入 `adapter.maintenanceTask()`，完成後立即釋放 Scheduler；後續 `verifyIntegrity()`、可回復式 `.prev-*` rename 安裝與 `_rotateOldBackups()` 均於 Scheduler 外以獨立唯讀連線執行，且全流程受 `#backupInProgress` 與 `#inProgressBackupPaths` 保護。
     - **Restore Offline Assurance & Safety Hardening (4.0.1.1 P1 / 4.0.1.2 P1)**：`restoreFromBackup()` 實施三層離線保護：(1) **Adapter Path Protection**（`_findActiveAdapterUsingPath` 拒絕覆蓋程序內活躍或等待 native close 之 Adapter DB）；(2) **Offline Confirmation**（預設強制要求 `options.offlineConfirmed === true`，未提供或為 `false` 時立即以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 拒絕，防止 WAL 模式下外部閒置或唯讀連線繞過鎖探測）；(3) **Lock Contention Probe**（`BEGIN EXCLUSIVE` with `busy_timeout=0` 輔助偵測外部寫入鎖競爭）。
     - **Restore Rollback for Existing & New Target (4.0.1.1 P1 / 4.0.1.2 P1)**：完整追蹤還原 `lifecycle` 狀態；若原始目標已存在，替換前移至 `.rollback-*` 並於失敗時自動還原；若原始目標不存在且已安裝新目標後驗證失敗，自動清除剛安裝之無效目標 DB 與新產生的 `-wal`/`-shm` sidecars 回到不存在狀態，並精確區分 `RESTORE_COMPLETED`、`RESTORE_REJECTED_PRECONDITION`、`RESTORE_FAILED_INSTALL_ABORTED`、`RESTORE_FAILED_ROLLED_BACK` 與 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`。
+    - **Restore Staging Cleanup Assurance (4.0.1.3 P2)**：修正 `_cleanupFileAndSidecars(filePath, options)` 不再靜默吞掉刪除錯誤，回傳結構化 `{ complete, attempted, removed, alreadyAbsent, failures, remainingPaths }`，區分 `ENOENT` 與真正清理失敗；當 Restore 安裝失敗且 staging 清理亦失敗時，保留原始錯誤並附加 `cleanupComplete = false`、`cleanupResult`、`remainingPaths`，且將狀態歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（不誤報為 `RESTORE_FAILED_INSTALL_ABORTED`）。
+    - **Restore Rollback Cleanup Diagnostics (4.0.1.3 P2)**：當新目標 DB 安裝並驗證成功後清理舊 `.rollback-*` 失敗時，維持 `RESTORE_COMPLETED` 不破壞新 DB，但將 `cleanupComplete` 設為 `false`，並於 `cleanupWarnings`（含 `{ path, code, message, stage: 'ROLLBACK_FILE_CLEANUP' }`）與 `preservedRollbackPaths` 提供完整救援資訊；同時 `_rotateOldBackups()` 明確忽略 `.rollback-*` 救援檔案。
     - **Backup Rotation `maxBackups` Exact Count (4.0.1.2 P2)**：修正 `_rotateOldBackups(targetDir, latestVerifiedPath)`，將本輪剛通過驗證並安裝完成的 `latestVerifiedPath` 明確納入 `verifiedCandidates` 計數一次並標記 `protectedFromDeletion: true`，同時保留 `#inProgressBackupPaths` 對其他進行中/暫存路徑的保護，消除最新備份被漏算導致保留 `maxBackups + 1` 份的問題。
     - **Backup Path Containment (4.0.1.1 P2)**：`validateBackupFilePath()` 嚴格拒絕 NUL 字元、`../`、POSIX/Windows 絕對路徑、磁碟機路徑、UNC 路徑與子目錄斜線。
   - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
     - 新增 `isSchemaReady`、`bootstrapError`、`schemaReport`、`isBootstrapReady()` 與 `executeWithStartupBarrier()`，並註冊 `adapter.dbPath` 至 `BackupManager.registerAdapter()`。
     - 移除 `index.js` 頂層未等待的 `db.serialize()` DDL 與 `(err) => {}` 空回呼，以及頂層過早執行的 `cleanupOldData()`；統一由 `startServer()` 等待 `db.readyPromise` 與 `db.isBootstrapReady()` 後才啟動 HTTP/API、Socket.IO、MQTT 與背景清理工作者。
     - 移除 `index.js` 中 WAL 模式下不安全的 `fs.copyFileSync(sourceDbPath, targetBackupPath)`，正式串接 `db.backupManager.startSchedule('0 0 * * 0', ...)`，並於 `handleShutdown()` 停止備份排程。
-- **測試與文件**：
-  - [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Test A 至 Test T 共 20 項測試），連同既有 46 項測試共 **66 項測試全數通過（66 passed, 0 failed, 0 skipped）**。
-  - 技術文件 [DATA_INTEGRITY_GUIDE.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/DATA_INTEGRITY_GUIDE.md)（更新至 `4.0.1.2 — Restore Offline Assurance & Retention Fix`）。
+- **4.0.1.3 修改檔案與測試結果**：
+  - 修改檔案：`src/database/backup-manager.js`、`tests/database/data_integrity_4_0_1.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
+  - 新增測試：3 項（Test U — Restore Staging Cleanup Failure Reporting、Test V — Restore Rollback Cleanup Warning、Test W — Restore Idle WAL Connection Confirmation）。
+  - 實際測試結果：於 [data_integrity_4_0_1.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（Tests A – W 共 23 項）加上 [sqlite_reliability.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項），實際執行 `npm run test:database` 共 **69 項測試全數通過（69 passed, 0 failed, 0 skipped, 0 cancelled）**。
+  - 尚未完成/未涵蓋項目：4.0.2 Packet Transaction Boundary 尚未開始；`TURSO_URL` 分支與既有備份排程政策（`BACKUP_PATH` / `'0 0 * * 0'`）依規範維持未變動；跨程序實體斷電 / OS 檔案系統損毀未以實體硬體故障測試（採用受控錯誤注入測試）。
+  - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
 
 ---
 

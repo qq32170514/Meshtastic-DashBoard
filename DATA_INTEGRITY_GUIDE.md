@@ -1,7 +1,7 @@
-# Meshtastic-DashBoard 4.0.1.2 — Restore Offline Assurance & Retention Fix
+# Meshtastic-DashBoard 4.0.1.3 — Restore Cleanup Assurance
 
-> **版本定位**：4.0.1.2 Restore Offline Assurance & Retention Fix（在 4.0.1.1 Backup Isolation & Verification Hardening 基礎上，強化 Restore 離線保證三層契約、補齊目標資料庫原先不存在時之安裝後失敗清理與 Rollback 狀態分類，以及修正 Backup Rotation 中最新已驗證備份未計入 `maxBackups` 之問題）
-> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7、4.0.1 與 4.0.1.1 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
+> **版本定位**：4.0.1.3 Restore Cleanup Assurance（在 4.0.1.2 Restore Offline Assurance & Retention Fix 基礎上，強化 Restore Staging Cleanup 結構化診斷與殘留追蹤、補齊 Restore 成功後舊 `.rollback-*` 清理失敗之結構化警告與救援資訊，以及補上 WAL 模式下外部純閒置連線之獨立驗證測試）
+> **基線依賴**：建立於已結案之 SQLite Reliability v2.7.7、4.0.1、4.0.1.1 與 4.0.1.2 基線之上（保留 `sqlite3 ^5.1.6`、Adapter Scheduler、WriteQueue、Transaction、Retry Backoff、Checkpoint、Graceful/Emergency Shutdown 與 Native Close Deadline 不變）。
 
 ---
 
@@ -156,15 +156,44 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
      - 若原始資料庫與 sidecars 全數復原成功：`originalRestored = true`，標記為 `RESTORE_FAILED_ROLLED_BACK`（`rollbackSucceeded: true`）。
      - 若復原失敗：保留 `.rollback-*` 檔案並標記為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`rollbackSucceeded: false`）。
 
-### 4.4 `RESTORE_STATUS` 狀態定義總表
+### 4.4 Restore Staging Cleanup Assurance 與舊 `.rollback-*` 清理診斷（4.0.1.3 P2）
+
+1. **Cleanup Helper 結構化回傳（[`_cleanupFileAndSidecars(filePath, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L514-L573)）**：
+   - 僅針對傳入之單一基底路徑及其 `-wal`、`-shm`（共 3 個明確路徑）執行清理，**絕不使用 wildcard 掃描**，保證不誤刪同目錄其他資料庫或無關檔案。
+   - 回傳完整可檢查的結構化物件：
+     ```js
+     {
+         complete: true,      // boolean: failures.length === 0 && remainingPaths.length === 0
+         attempted: [],       // 嘗試檢查與清理之完整路徑清單 [base, `${base}-wal`, `${base}-shm`]
+         removed: [],         // 實際透過 unlink 移除成功且確認已不存在之路徑
+         alreadyAbsent: [],   // 初始即不存在，或於 existsSync 與 unlink 之間發生 ENOENT 競態而已不存在之路徑
+         failures: [],        // 每個失敗項目包含 { path, code, message }
+         remainingPaths: []   // 清理流程結束後，再次檢查磁碟確認仍殘留之完整檔案路徑
+     }
+     ```
+2. **`ENOENT` 與真正清理失敗的區分**：
+   - 若檔案初始即不存在，或於 `fs.existsSync(p)` 與 `unlinkFn(p)` 之間被移除而拋出 `ENOENT`（且確認磁碟上已不存在），歸類為 `alreadyAbsent`，不視為錯誤。
+   - 若發生 `EPERM`、`EBUSY`、Windows 檔案鎖定或其他非 `ENOENT` 錯誤，或 `unlinkFn(p)` 返回後檔案仍殘留於磁碟，一律記錄至 `failures`（含 `{ path, code, message }`）與 `remainingPaths`，並將 `complete` 標記為 `false`。
+3. **Cleanup Failure 與原始 Restore Error 共存（不覆蓋原始錯誤）**：
+   - `_cleanupFileAndSidecars()` 內部捕獲檔案系統例外並轉為結構化 `failures`，**絕不拋出例外覆蓋原始 Restore 錯誤**。
+   - 當 Restore 在安裝階段（如 `rename` 失敗）與 staging cleanup 同時失敗時，拋出的錯誤完整保留原始錯誤（`err.cause`、`err.originalError`、`err.originalCode` 及原始錯誤訊息），並附加 `err.cleanupComplete = false`、`err.cleanupResult`、`err.cleanupFailures` 與 `err.remainingPaths`。
+   - 若原始目標資料庫不存在、安裝 `rename` 失敗且 staging 清理亦失敗（磁碟仍有殘留 staging 檔案），狀態將誠實歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`（`cleanupComplete: false`），**絕不謊稱 `RESTORE_FAILED_INSTALL_ABORTED` 或宣稱清理完成**。
+4. **Restore 成功後舊 `.rollback-*` 清理失敗之處理與欄位語意**：
+   - 只要新目標 DB 已完成安裝並通過安裝後 `verifyIntegrity()`，Restore 本身即判定為成功（`restoreStatus: RESTORE_STATUS.COMPLETED`），**絕不因舊 `.rollback-*` 刪除失敗而反向刪除或破壞已驗證成功的新資料庫**。
+   - 若舊 `.rollback-*` 檔案刪除失敗，系統保留該救援檔案（且 `_rotateOldBackups()` 明確忽略 `.rollback-*`，不會將其當作新備份或誤刪），並在回傳結果中提供：
+     - `cleanupComplete`：`boolean`，當有任何 `.rollback-*` 或 staging 檔案清理失敗時為 `false`；全部清理乾淨時為 `true`。
+     - `cleanupWarnings`：結構化警告陣列，每筆包含 `{ path, code, message, stage: 'ROLLBACK_FILE_CLEANUP' }`（或 `'STAGING_FILE_CLEANUP'`）。
+     - `preservedRollbackPaths`：所有尚未刪除、仍保留於磁碟上的舊 `.rollback-*` 完整檔案路徑陣列，供維護人員於確認新 DB 正常後手動清理。
+
+### 4.5 `RESTORE_STATUS` 狀態定義總表
 
 | 狀態常數 (`RESTORE_STATUS`) | 狀態值 | 意義與觸發條件 |
 | :--- | :--- | :--- |
-| `COMPLETED` | `'RESTORE_COMPLETED'` | 還原替換完成且安裝後目標資料庫通過 `verifyIntegrity()`，所有暫存與 `.rollback-*` 已清理。 |
+| `COMPLETED` | `'RESTORE_COMPLETED'` | 新目標 DB 已成功安裝並通過安裝後 Integrity Verification。舊 `.rollback-*` 檔案可能因檔案系統錯誤而暫時保留，相關情況會透過 `cleanupComplete`、`cleanupWarnings` 與 `preservedRollbackPaths` 回報。 |
 | `REJECTED_PRECONDITION` | `'RESTORE_REJECTED_PRECONDITION'` | 於觸碰目標檔案前因前置條件（未傳 `offlineConfirmed: true`、目標為活躍 Adapter DB、外部鎖競爭、來源備份無效或 staging 驗證失敗）被安全拒絕，目標 DB / WAL / SHM 毫髮無損。 |
-| `FAILED_INSTALL_ABORTED` | `'RESTORE_FAILED_INSTALL_ABORTED'` | 原始目標資料庫不存在（`hadExistingTargetDb === false`），且在將 staging 安裝至目標路徑前即失敗（`newTargetInstalled === false`）；staging 已清理，目標維持不存在（`rollbackSucceeded: false`）。 |
-| `FAILED_ROLLED_BACK` | `'RESTORE_FAILED_ROLLED_BACK'` | 安裝或安裝後驗證失敗，但系統已成功回退至還原前狀態：(1) 既有目標 DB 已從 `.rollback-*` 完整復原，或 (2) 原先不存在之目標路徑已將新安裝之無效目標檔與 sidecars 徹底清除回不存在狀態（`rollbackSucceeded: true`）。 |
-| `FAILED_ROLLBACK_INCOMPLETE` | `'RESTORE_FAILED_ROLLBACK_INCOMPLETE'` | 安裝或安裝後驗證失敗，且在還原 `.rollback-*` 或清除無效新目標檔時發生檔案系統錯誤（`rollbackSucceeded: false`），保留現場檔案路徑於 `err.preservedRollbackPaths` / `err.uncleanedTargetPaths`。 |
+| `FAILED_INSTALL_ABORTED` | `'RESTORE_FAILED_INSTALL_ABORTED'` | 原始目標資料庫不存在（`hadExistingTargetDb === false`），在將 staging 安裝至目標路徑前即失敗（`newTargetInstalled === false`），且 staging 暫存檔與 sidecars 已完全清理乾淨（`cleanupComplete === true`、`remainingPaths.length === 0`），目標維持不存在（`rollbackSucceeded: false`）。 |
+| `FAILED_ROLLED_BACK` | `'RESTORE_FAILED_ROLLED_BACK'` | 安裝或安裝後驗證失敗，但系統已成功回退至還原前狀態且無殘留 staging 檔案（`cleanupComplete === true`、`rollbackSucceeded: true`）：(1) 既有目標 DB 已從 `.rollback-*` 完整復原，或 (2) 原先不存在之目標路徑已將新安裝之無效目標檔與 sidecars 徹底清除回不存在狀態。 |
+| `FAILED_ROLLBACK_INCOMPLETE` | `'RESTORE_FAILED_ROLLBACK_INCOMPLETE'` | 安裝或安裝後驗證失敗，且在還原 `.rollback-*`、清除無效新目標檔或清理 `.restore-staging-*` 時發生檔案系統錯誤（`cleanupComplete === false`、`rollbackSucceeded: false`），保留現場檔案路徑於 `err.remainingPaths` / `err.preservedRollbackPaths` / `err.uncleanedTargetPaths`。 |
 
 ---
 
@@ -172,7 +201,7 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 
 所有測試均於開發環境透過 `npm run test:database` 實際執行，並使用 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫檔案，測試後完整關閉連線與清除暫存檔。
 
-### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（20 項測試：Tests A – T）
+### 5.1 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（23 項測試：Tests A – W）
 
 | 測試編號與名稱 | 測試分類 | 實際驗證方式與邊界說明 |
 | :--- | :--- | :--- |
@@ -196,6 +225,9 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test R — Restore Offline Confirmation (4.0.1.2 P1)** | 真實 SQLite WAL Read/Write Connection + Precondition Test | 驗證省略 `offlineConfirmed` 或傳入 `offlineConfirmed: false` 時皆以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 拒絕且不更動目標 DB / `-wal` / `-shm`；驗證外部連線持有 WAL Read Transaction 時仍受 `offlineConfirmed` 保護；驗證外部寫入鎖受 Lock Probe 攔截；並驗證離線且 `offlineConfirmed: true` 時成功還原。 |
 | **Test S — Restore Rollback Without Existing Target (4.0.1.2 P1)** | 真實 SQLite Restore + Post-Install Failure & Unlink Injection Test | 針對原始目標資料庫不存在之情境，驗證：(S-1) 安裝前 `rename` 失敗回傳 `RESTORE_FAILED_INSTALL_ABORTED` (`rollbackSucceeded: false`)；(S-2) 新目標已安裝但安裝後驗證失敗時，自動清除新目標 DB 與 `-wal`/`-shm` 回到不存在狀態且不傷及同目錄其他檔案，回傳 `RESTORE_FAILED_ROLLED_BACK` (`rollbackSucceeded: true`)；(S-3) 清除失敗時回傳 `RESTORE_FAILED_ROLLBACK_INCOMPLETE` (`rollbackSucceeded: false`)。 |
 | **Test T — Backup Rotation maxBackups Exact Count (4.0.1.2 P2)** | 真實 SQLite `VACUUM INTO` Backup Rotation Test | 設定 `maxBackups: 2` 與 `retentionDays: 365`（排除過期天數干擾），連續建立 3 份真實備份並確認輪替時 `targetPath` 仍位於 `#inProgressBackupPaths`，驗證最新備份計入總數、第 3 份完成後精確保留最新 2 份並刪除最舊第 1 份，且忽略未驗證檔與 staging 檔。 |
+| **Test U — Restore Staging Cleanup Failure Reporting (4.0.1.3 P2)** | **真實 SQLite Staging 建立與驗證 + 受控 Rename/Unlink 錯誤注入測試** | 真實執行 SQLite 備份、建立 `.restore-staging-*` 並通過 `verifyIntegrity()`；透過 `renameImpl` 注入 `EXDEV` 安裝失敗並透過 `unlinkImpl` 注入 `EPERM` 模擬 staging 刪除失敗（非真實 OS 檔案系統損毀）。驗證：原始目標仍不存在、原始 `EXDEV` 錯誤未被覆蓋、`cleanupComplete === false`、`remainingPaths` 包含該 staging 路徑、狀態歸類為 `RESTORE_FAILED_ROLLBACK_INCOMPLETE`、同目錄無關檔案完好，並於 teardown 恢復真實刪除清理暫存檔。 |
+| **Test V — Restore Rollback Cleanup Warning (4.0.1.3 P2)** | **真實 SQLite Restore 流程 + 受控 Rollback Unlink 錯誤注入測試** | 真實執行原始目標 DB 建立、備份、staging 建立、新目標安裝與安裝後 `verifyIntegrity()`；僅在清理舊 `.rollback-*` 時透過 `unlinkImpl` 注入 `EBUSY` 失敗。驗證：`restoreStatus` 仍為 `RESTORE_COMPLETED`、`cleanupComplete === false`、`cleanupWarnings` 記錄 `{ path, code: 'EBUSY', message, stage: 'ROLLBACK_FILE_CLEANUP' }`、`preservedRollbackPaths` 包含舊 `.rollback-*` 完整路徑且檔案仍存在於磁碟、新安裝之有效 DB 不被誤刪且可正常開啟讀寫，並於 teardown 清理保留的 `.rollback-*`。 |
+| **Test W — Restore Idle WAL Connection Confirmation (4.0.1.3 P2)** | **真實 SQLite WAL 資料庫 + 獨立外部閒置連線整合測試** | 建立真實 WAL 模式目標 DB 並開啟一條不執行任何 Transaction 或讀寫的純閒置 `sqlite3.Database` 連線；實測證明此時 `BEGIN EXCLUSIVE` Lock Probe 會成功，但省略 `offlineConfirmed` 呼叫 `restoreFromBackup()` 仍必以 `BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED` 阻擋且不修改目標 DB / WAL / SHM；待關閉外部閒置連線後，再以 `offlineConfirmed: true` 驗證正常還原成功。 |
 
 ### 5.2 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線測試）
 - 完整保留 v2.7.7 結案之 46 項測試（包含真实 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。

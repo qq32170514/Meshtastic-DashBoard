@@ -52,7 +52,7 @@ function cleanupTempDir(dirPath) {
     } catch (_) {}
 }
 
-describe('Meshtastic-DashBoard 4.0.1.2 — Database Bootstrap & Backup Integrity Suite', () => {
+describe('Meshtastic-DashBoard 4.0.1.3 — Database Bootstrap & Backup Integrity Suite', () => {
 
     // =========================================================================
     // Part A: Database Bootstrap & Schema Initialization Barrier (Tests A - F)
@@ -1993,6 +1993,383 @@ describe('Meshtastic-DashBoard 4.0.1.2 — Database Bootstrap & Backup Integrity
             await db.close();
         } finally {
             cleanupTempDb(dbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    // =========================================================================
+    // Part E: 4.0.1.3 Restore Cleanup Assurance Specific Tests (Tests U - W)
+    // =========================================================================
+
+    it('Test U — Restore Staging Cleanup Failure Reporting (4.0.1.3 P2): 驗證還原安裝失敗且 staging DB 清理失敗時，保留原始錯誤、誠實標記 cleanupComplete=false 並列出 remainingPaths', async () => {
+        const sourceDbPath = getTempDbPath('test_u_source');
+        const targetDir = getTempDir('test_u_target_dir');
+        const newTargetPath = path.join(targetDir, 'new_restore_target_u.db');
+        const siblingFilePath = path.join(targetDir, 'sibling_keep_u.db');
+        const backupDir = getTempDir('test_u_backups');
+        const retainedStagingFilesToClean = [];
+        let sourceDb = null;
+
+        try {
+            sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!node_u', 'NodeU']);
+            const validBackup = await sourceDb.backupManager.performBackup('test_u_backup.db');
+            assert.equal(validBackup.success, true);
+
+            // 放置同目錄無關檔案，確認清理時絕不會使用 wildcard 誤刪同目錄其他檔案
+            fs.writeFileSync(siblingFilePath, 'SIBLING_FILE_MUST_SURVIVE');
+            assert.equal(fs.existsSync(newTargetPath), false, '1. 原始目標資料庫必須不存在');
+
+            let capturedStagingPath = null;
+
+            // 注入正式安裝 rename 失敗 + staging DB unlink 失敗 (受控錯誤注入)
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(
+                        validBackup.targetPath,
+                        newTargetPath,
+                        {
+                            offlineConfirmed: true,
+                            beforeFinalInstall: ({ stagingRestorePath }) => {
+                                capturedStagingPath = stagingRestorePath;
+                                retainedStagingFilesToClean.push(stagingRestorePath);
+                                assert.equal(fs.existsSync(stagingRestorePath), true, '2. Restore staging DB 應已真實建立');
+                            },
+                            renameImpl: () => {
+                                const renameErr = new Error('EXDEV: simulated cross-device rename failure during install');
+                                renameErr.code = 'EXDEV';
+                                throw renameErr;
+                            },
+                            unlinkImpl: (p) => {
+                                if (capturedStagingPath && path.resolve(p) === path.resolve(capturedStagingPath)) {
+                                    const unlinkErr = new Error('EPERM: simulated Windows file lock on staging DB');
+                                    unlinkErr.code = 'EPERM';
+                                    throw unlinkErr;
+                                }
+                                return fs.unlinkSync(p);
+                            }
+                        }
+                    );
+                },
+                (err) => {
+                    // 驗證原始 rename 錯誤沒有被 cleanup error 覆蓋
+                    assert.match(err.message, /BACKUP_RESTORE_INSTALL_FAILED/);
+                    assert.match(err.message, /EXDEV: simulated cross-device rename failure during install/);
+                    assert.ok(err.cause, '必須保留原始錯誤於 err.cause');
+                    assert.equal(err.cause.code, 'EXDEV', '原始錯誤 code 必須完整保留');
+
+                    // 驗證生命週期狀態：staging 已建立且通過驗證，但新目標未安裝
+                    assert.equal(err.lifecycle.hadExistingTargetDb, false);
+                    assert.equal(err.lifecycle.stagingCreated, true);
+                    assert.equal(err.lifecycle.stagingVerified, true, '3. staging Integrity Check 應已通過');
+                    assert.equal(err.lifecycle.newTargetInstalled, false);
+
+                    // 驗證 cleanup result 明確標示失敗且未宣稱完成
+                    assert.equal(err.cleanupComplete, false, '7. cleanupComplete 必須為 false');
+                    assert.ok(err.cleanupResult, '必須附帶結構化 cleanupResult');
+                    assert.equal(err.cleanupResult.complete, false);
+                    assert.ok(Array.isArray(err.cleanupResult.failures));
+                    assert.equal(err.cleanupResult.failures.length, 1);
+                    assert.equal(err.cleanupResult.failures[0].path, path.resolve(capturedStagingPath));
+                    assert.equal(err.cleanupResult.failures[0].code, 'EPERM');
+
+                    // 驗證不存在的 -wal / -shm 歸類於 alreadyAbsent
+                    assert.ok(err.cleanupResult.alreadyAbsent.includes(`${path.resolve(capturedStagingPath)}-wal`));
+                    assert.ok(err.cleanupResult.alreadyAbsent.includes(`${path.resolve(capturedStagingPath)}-shm`));
+
+                    // 驗證 remainingPaths 包含殘留之 staging 檔案
+                    assert.ok(Array.isArray(err.remainingPaths));
+                    assert.ok(err.remainingPaths.includes(path.resolve(capturedStagingPath)), '8. remainingPaths 必須包含殘留 staging 檔案');
+                    assert.ok(err.cleanupResult.remainingPaths.includes(path.resolve(capturedStagingPath)));
+
+                    // 驗證錯誤狀態不宣稱清理已完成 (歸類為 RESTORE_FAILED_ROLLBACK_INCOMPLETE)
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.FAILED_ROLLBACK_INCOMPLETE, '11. staging 清理失敗時應歸類為 RESTORE_FAILED_ROLLBACK_INCOMPLETE');
+                    assert.equal(err.rollbackSucceeded, false);
+                    return true;
+                }
+            );
+
+            // 6. 確認原始目標 DB 仍不存在，且殘留之 staging DB 確實在磁碟上，同目錄無關檔案毫髮無損
+            assert.equal(fs.existsSync(newTargetPath), false, '6. 原始目標 DB 仍維持不存在');
+            assert.equal(fs.existsSync(capturedStagingPath), true, '注入 unlink 失敗之 staging 檔案應仍存在於磁碟');
+            assert.equal(fs.readFileSync(siblingFilePath, 'utf8'), 'SIBLING_FILE_MUST_SURVIVE', '10. 同目錄其他檔案絕不可被誤刪');
+
+            await sourceDb.close();
+            sourceDb = null;
+        } finally {
+            if (sourceDb) {
+                try { await sourceDb.close(); } catch (_) {}
+            }
+            // Teardown: 使用真實 fs.unlinkSync 清理故障注入所保留的 staging 暫存檔案
+            for (const f of retainedStagingFilesToClean) {
+                cleanupTempDb(f);
+            }
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(newTargetPath);
+            cleanupTempDir(targetDir);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test V — Restore Rollback Cleanup Warning (4.0.1.3 P2): 驗證新目標 DB 安裝並驗證成功後，若舊 .rollback-* 清理失敗，仍回傳 RESTORE_COMPLETED 但標記 cleanupComplete=false 與完整救援資訊', async () => {
+        const sourceDbPath = getTempDbPath('test_v_source');
+        const targetDbPath = getTempDbPath('test_v_target');
+        const backupDir = getTempDir('test_v_backups');
+        let preservedRollbackList = [];
+        let origTargetDb = null;
+        let sourceDb = null;
+        let verifyRestoredDb = null;
+
+        try {
+            // 1. 建立原始目標 SQLite DB 並寫入舊資料
+            origTargetDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await origTargetDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!orig_v', 'OriginalTargetNodeV']);
+            await origTargetDb.close();
+            origTargetDb = null;
+
+            // 2. 建立並驗證來源 Backup
+            sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!restored_v', 'RestoredNewNodeV']);
+            const validBackup = await sourceDb.backupManager.performBackup('test_v_backup.db');
+            assert.equal(validBackup.success, true);
+
+            // 3-7. 使用 offlineConfirmed: true 執行真實 Restore，但在清理舊 .rollback-* 檔案時注入 unlink 錯誤
+            const restoreRes = await sourceDb.backupManager.restoreFromBackup(
+                validBackup.targetPath,
+                targetDbPath,
+                {
+                    offlineConfirmed: true,
+                    unlinkImpl: (p) => {
+                        if (String(p).includes('.rollback-')) {
+                            const err = new Error('EBUSY: simulated lock on old rollback file during post-restore cleanup');
+                            err.code = 'EBUSY';
+                            throw err;
+                        }
+                        return fs.unlinkSync(p);
+                    }
+                }
+            );
+
+            preservedRollbackList = [...(restoreRes.preservedRollbackPaths || [])];
+
+            // 8. 確認 Restore 狀態仍然是 RESTORE_COMPLETED
+            assert.equal(restoreRes.success, true);
+            assert.equal(restoreRes.restoreStatus, RESTORE_STATUS.COMPLETED);
+
+            // 9. 確認 cleanupComplete === false
+            assert.equal(restoreRes.cleanupComplete, false, '舊 .rollback-* 刪除失敗時 cleanupComplete 必須為 false');
+
+            // 10. 確認 cleanupWarnings 有完整結構化錯誤資訊
+            assert.ok(Array.isArray(restoreRes.cleanupWarnings));
+            assert.ok(restoreRes.cleanupWarnings.length >= 1, 'cleanupWarnings 必須包含至少一筆清理失敗記錄');
+            const dbRollbackWarning = restoreRes.cleanupWarnings.find(w => w.path.includes(`${path.basename(targetDbPath)}.rollback-`));
+            assert.ok(dbRollbackWarning, '必須記錄主 DB .rollback-* 清理失敗');
+            assert.equal(dbRollbackWarning.code, 'EBUSY');
+            assert.match(dbRollbackWarning.message, /EBUSY: simulated lock on old rollback file/);
+            assert.equal(dbRollbackWarning.stage, 'ROLLBACK_FILE_CLEANUP');
+
+            // 11 & 13. 確認 preservedRollbackPaths 包含舊 DB .rollback-* 完整路徑且該檔案仍存在於磁碟
+            assert.ok(Array.isArray(restoreRes.preservedRollbackPaths));
+            assert.ok(restoreRes.preservedRollbackPaths.includes(dbRollbackWarning.path));
+            assert.equal(fs.existsSync(dbRollbackWarning.path), true, '舊 .rollback-* 救援檔案必須完好保留於磁碟');
+
+            // 12 & 14. 確認新的目標 DB 未被錯誤清理，且能正常開啟並通過 Integrity Check 與資料驗證
+            assert.equal(fs.existsSync(targetDbPath), true, '新安裝之有效目標 DB 絕不可被刪除');
+            verifyRestoredDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            const integrityRow = await verifyRestoredDb.get(`PRAGMA integrity_check`);
+            assert.equal(String(integrityRow.integrity_check).toLowerCase(), 'ok');
+
+            const newRow = await verifyRestoredDb.get(`SELECT * FROM nodes WHERE node_id = ?`, ['!restored_v']);
+            assert.ok(newRow, '新目標 DB 必須包含還原後的最新資料');
+            assert.equal(newRow.long_name, 'RestoredNewNodeV');
+
+            const oldRow = await verifyRestoredDb.get(`SELECT * FROM nodes WHERE node_id = ?`, ['!orig_v']);
+            assert.equal(oldRow, null, '新目標 DB 不應包含舊目標 DB 獨有之舊資料');
+
+            await verifyRestoredDb.close();
+            verifyRestoredDb = null;
+            await sourceDb.close();
+            sourceDb = null;
+        } finally {
+            if (verifyRestoredDb) {
+                try { await verifyRestoredDb.close(); } catch (_) {}
+            }
+            if (origTargetDb) {
+                try { await origTargetDb.close(); } catch (_) {}
+            }
+            if (sourceDb) {
+                try { await sourceDb.close(); } catch (_) {}
+            }
+            // Teardown: 使用真實 fs.unlinkSync 清理測試所保留的 .rollback-* 檔案
+            for (const rbPath of preservedRollbackList) {
+                try {
+                    if (fs.existsSync(rbPath)) fs.unlinkSync(rbPath);
+                } catch (_) {}
+            }
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(targetDbPath);
+            cleanupTempDir(backupDir);
+        }
+    });
+
+    it('Test W — Restore Idle WAL Connection Confirmation (4.0.1.3 P2): 驗證 WAL 模式下外部純閒置連線雖不阻擋 Lock Probe，省略 offlineConfirmed 仍必被阻擋且不修改目標 DB/WAL/SHM', async () => {
+        const sourceDbPath = getTempDbPath('test_w_source');
+        const targetDbPath = getTempDbPath('test_w_target');
+        const backupDir = getTempDir('test_w_backups');
+        let idleConn = null;
+        let sourceDb = null;
+        let targetPrep = null;
+        let restoredDb = null;
+
+        try {
+            // 1. 建立來源 Backup
+            sourceDb = await createDatabaseSubsystem({
+                dbPath: sourceDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            await sourceDb.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!from_backup_w', 'RestoredFromBackupW']);
+            const backupRes = await sourceDb.backupManager.performBackup('test_w_backup.db');
+            assert.equal(backupRes.success, true);
+
+            // 2 & 3. 建立獨立目標 SQLite DB 並確認使用 WAL 模式
+            targetPrep = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            const modeRow = await targetPrep.get(`PRAGMA journal_mode`);
+            assert.equal(String(modeRow.journal_mode).toLowerCase(), 'wal', '3. 目標資料庫必須為 WAL 模式');
+            await targetPrep.run(`INSERT INTO nodes (node_id, long_name) VALUES (?, ?)`, ['!orig_target_w', 'OriginalTargetNodeW']);
+            await targetPrep.close();
+            targetPrep = null;
+
+            // 4-7. 透過額外的 sqlite3.Database connection 開啟同一個目標 DB，不執行任何 SQL Transaction 或寫入，保持閒置開啟
+            idleConn = await new Promise((resolve, reject) => {
+                const conn = new sqlite3.Database(targetDbPath, sqlite3.OPEN_READWRITE, (err) => {
+                    if (err) return reject(err);
+                    resolve(conn);
+                });
+            });
+
+            // 記錄還原被拒前的目標 DB 與 WAL/SHM 狀態
+            const walPath = `${targetDbPath}-wal`;
+            const shmPath = `${targetDbPath}-shm`;
+            const dbBytesBefore = fs.readFileSync(targetDbPath);
+            const walExistedBefore = fs.existsSync(walPath);
+            const shmExistedBefore = fs.existsSync(shmPath);
+            const walBytesBefore = walExistedBefore ? fs.readFileSync(walPath) : null;
+            const shmBytesBefore = shmExistedBefore ? fs.readFileSync(shmPath) : null;
+
+            // 10 (前置確認). 驗證在 WAL 模式下，即使外部 idleConn 保持開啟，BEGIN EXCLUSIVE TRANSACTION 鎖定探測本身仍會成功
+            await new Promise((resolve, reject) => {
+                const probeConn = new sqlite3.Database(targetDbPath, sqlite3.OPEN_READWRITE, (openErr) => {
+                    if (openErr) return reject(openErr);
+                    probeConn.serialize(() => {
+                        probeConn.run('PRAGMA busy_timeout = 0');
+                        probeConn.run('BEGIN EXCLUSIVE TRANSACTION', (lockErr) => {
+                            if (lockErr) {
+                                return probeConn.close(() => reject(lockErr));
+                            }
+                            probeConn.run('ROLLBACK', () => {
+                                probeConn.close((closeErr) => closeErr ? reject(closeErr) : resolve());
+                            });
+                        });
+                    });
+                });
+            });
+
+            // 8 & 9. 在未提供 offlineConfirmed 的情況下呼叫 restoreFromBackup() -> 必須被 Offline Confirmation 阻擋
+            await assert.rejects(
+                async () => {
+                    await sourceDb.backupManager.restoreFromBackup(backupRes.targetPath, targetDbPath);
+                },
+                (err) => {
+                    assert.match(err.message, /BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED/);
+                    assert.equal(err.code, 'BACKUP_RESTORE_OFFLINE_CONFIRMATION_REQUIRED');
+                    assert.equal(err.restoreStatus, RESTORE_STATUS.REJECTED_PRECONDITION);
+                    return true;
+                }
+            );
+
+            // 11. 確認目標 DB、WAL、SHM 未受到任何修改
+            assert.equal(Buffer.compare(fs.readFileSync(targetDbPath), dbBytesBefore), 0, '目標 DB 位元組不得被修改');
+            assert.equal(fs.existsSync(walPath), walExistedBefore);
+            assert.equal(fs.existsSync(shmPath), shmExistedBefore);
+            if (walExistedBefore && walBytesBefore) {
+                assert.equal(Buffer.compare(fs.readFileSync(walPath), walBytesBefore), 0);
+            }
+            if (shmExistedBefore && shmBytesBefore) {
+                assert.equal(Buffer.compare(fs.readFileSync(shmPath), shmBytesBefore), 0);
+            }
+
+            // 12. 關閉外部閒置 SQLite connection (嚴禁在外部 Idle Connection 仍開啟時傳入 offlineConfirmed: true 強制還原)
+            await new Promise((resolve, reject) => {
+                idleConn.close((err) => {
+                    idleConn = null;
+                    if (err) return reject(err);
+                    resolve();
+                });
+            });
+
+            // 13. 確認外部連線已關閉且提供 offlineConfirmed: true 時，正常 Restore 成功
+            const okRestore = await sourceDb.backupManager.restoreFromBackup(
+                backupRes.targetPath,
+                targetDbPath,
+                { offlineConfirmed: true }
+            );
+            assert.equal(okRestore.success, true);
+            assert.equal(okRestore.restoreStatus, RESTORE_STATUS.COMPLETED);
+            assert.equal(okRestore.cleanupComplete, true);
+
+            // 14. 確認 Restore 後資料及 Integrity Check 正常
+            restoredDb = await createDatabaseSubsystem({
+                dbPath: targetDbPath,
+                backupDir,
+                bootstrapSchema: true
+            });
+            const integrityRow = await restoredDb.get(`PRAGMA integrity_check`);
+            assert.equal(String(integrityRow.integrity_check).toLowerCase(), 'ok');
+
+            const restoredNode = await restoredDb.get(`SELECT * FROM nodes WHERE node_id = ?`, ['!from_backup_w']);
+            assert.ok(restoredNode);
+            assert.equal(restoredNode.long_name, 'RestoredFromBackupW');
+
+            await restoredDb.close();
+            restoredDb = null;
+            await sourceDb.close();
+            sourceDb = null;
+        } finally {
+            if (idleConn) {
+                await new Promise((resolve) => idleConn.close(() => resolve()));
+            }
+            if (restoredDb) {
+                try { await restoredDb.close(); } catch (_) {}
+            }
+            if (targetPrep) {
+                try { await targetPrep.close(); } catch (_) {}
+            }
+            if (sourceDb) {
+                try { await sourceDb.close(); } catch (_) {}
+            }
+            cleanupTempDb(sourceDbPath);
+            cleanupTempDb(targetDbPath);
             cleanupTempDir(backupDir);
         }
     });
