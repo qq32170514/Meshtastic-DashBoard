@@ -753,6 +753,266 @@ function executeSequentialFallbackItem(targetDb, item, onItemDone = null) {
     }
 }
 
+/**
+ * 建立與 index.js TURSO_URL 分支一致之相容包裝器（支援 (sql, cb) 與 (sql, params, cb) 兩種呼叫形式）
+ */
+function createTursoDbWrapper(client) {
+    if (!client || typeof client.execute !== 'function') {
+        throw new Error('[INVALID_TURSO_CLIENT] client.execute must be a function');
+    }
+    return {
+        isTursoFallback: true,
+        run: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb.call({ lastID: Number(r?.lastInsertRowid ?? 0), changes: Number(r?.rowsAffected ?? 0) }, null))
+                .catch(err => actualCb && actualCb(err));
+        },
+        all: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb(null, r.rows))
+                .catch(err => actualCb && actualCb(err));
+        },
+        get: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb(null, r.rows ? r.rows[0] : undefined))
+                .catch(err => actualCb && actualCb(err));
+        },
+        serialize: (fn) => fn()
+    };
+}
+
+/**
+ * 建立 index.js 與測試共用的資料庫佇列與 Turso Sequential Fallback 調度器：
+ * - 當 targetDb 具備 Local SQLite `queuePacketTransaction` / `queueDbOp` / `flushDbQueue` 時直接委派。
+ * - 當處於 Turso fallback 模式時，完整執行 `queuePacketTransaction() / queueDbOp() -> dbQueue -> flushDbQueue() -> executeSequentialFallbackItem()`。
+ * - 誠實邊界：Turso fallback 為多語句依序執行，不宣稱具備 Local SQLite 的單一連線原子 ROLLBACK 保證。
+ */
+function createSequentialFallbackQueueController(options = {}) {
+    const getDb = typeof options.getDb === 'function' ? options.getDb : () => options.db || null;
+    const dbQueue = Array.isArray(options.dbQueue) ? options.dbQueue : [];
+    const dbQueueMetrics = options.dbQueueMetrics || {
+        totalQueued: 0,
+        totalCommitted: 0,
+        totalErrors: 0,
+        lastBatchSize: 0,
+        lastDurationMs: 0,
+        maxQueueLengthSeen: 0
+    };
+    const maxQueueCapacity = typeof options.maxQueueCapacity === 'number' && options.maxQueueCapacity > 0
+        ? options.maxQueueCapacity
+        : 5000;
+    const batchChunkSize = typeof options.batchChunkSize === 'number' && options.batchChunkSize > 0
+        ? options.batchChunkSize
+        : 100;
+    const flushIntervalMs = typeof options.flushIntervalMs === 'number' && options.flushIntervalMs >= 0
+        ? options.flushIntervalMs
+        : 200;
+    const logger = options.logger || console;
+
+    let dbQueueTimer = null;
+    let isFlushingDbQueue = false;
+    let activeFlushPromise = null;
+
+    function scheduleOrTriggerFlush() {
+        if (dbQueue.length >= batchChunkSize && !isFlushingDbQueue) {
+            if (dbQueueTimer) {
+                clearTimeout(dbQueueTimer);
+                dbQueueTimer = null;
+            }
+            flushDbQueue();
+        } else if (!dbQueueTimer && !isFlushingDbQueue) {
+            dbQueueTimer = setTimeout(flushDbQueue, flushIntervalMs);
+        }
+    }
+
+    function queueDbOp(sql, params, callback) {
+        const currentDb = getDb();
+        if (currentDb && typeof currentDb.queueDbOp === 'function') {
+            return currentDb.queueDbOp(sql, params, callback);
+        }
+
+        const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+        const actualCallback = typeof params === 'function' ? params : callback;
+
+        if (dbQueue.length >= maxQueueCapacity) {
+            if (logger && typeof logger.warn === 'function') {
+                logger.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${maxQueueCapacity})，啟動背壓控制！`);
+            }
+            if (typeof actualCallback === 'function') {
+                try { actualCallback(new Error('DB queue backpressure limit reached')); } catch (_) {}
+            }
+            return false;
+        }
+
+        dbQueue.push({
+            isTransactionUnit: false,
+            sql,
+            params: actualParams,
+            callback: actualCallback,
+            callbackInvoked: false,
+            queuedAt: Date.now()
+        });
+        dbQueueMetrics.totalQueued++;
+        if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
+            dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
+        }
+
+        scheduleOrTriggerFlush();
+        return true;
+    }
+
+    function queuePacketTransaction(statements, callback = null, txOptions = {}) {
+        const currentDb = getDb();
+        if (currentDb && typeof currentDb.queuePacketTransaction === 'function') {
+            return currentDb.queuePacketTransaction(statements, callback, txOptions);
+        }
+        if (currentDb && typeof currentDb.queueDbOp === 'function') {
+            return currentDb.queueDbOp({
+                statements,
+                callback,
+                label: txOptions && txOptions.label ? txOptions.label : undefined,
+                packetMeta: txOptions && txOptions.packetMeta ? txOptions.packetMeta : undefined
+            });
+        }
+
+        if (
+            !Array.isArray(statements) ||
+            statements.length === 0 ||
+            !statements.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
+        ) {
+            const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
+            if (typeof callback === 'function') {
+                try { callback(err); } catch (_) {}
+            }
+            return false;
+        }
+
+        if (dbQueue.length >= maxQueueCapacity) {
+            if (logger && typeof logger.warn === 'function') {
+                logger.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${maxQueueCapacity})，啟動背壓控制！`);
+            }
+            if (typeof callback === 'function') {
+                try { callback(new Error('DB queue backpressure limit reached')); } catch (_) {}
+            }
+            return false;
+        }
+
+        const normalizedStatements = statements.map((s) => ({
+            sql: s.sql,
+            params: Array.isArray(s.params) ? s.params : []
+        }));
+
+        dbQueue.push({
+            isTransactionUnit: true,
+            statements: normalizedStatements,
+            label: (txOptions && typeof txOptions.label === 'string' && txOptions.label.trim().length > 0)
+                ? txOptions.label.trim()
+                : `[PACKET_TX:${normalizedStatements.length}]`,
+            packetMeta: (txOptions && txOptions.packetMeta) || null,
+            sql: normalizedStatements[0].sql,
+            params: normalizedStatements[0].params,
+            callback,
+            callbackInvoked: false,
+            queuedAt: Date.now()
+        });
+        dbQueueMetrics.totalQueued++;
+        if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
+            dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
+        }
+
+        scheduleOrTriggerFlush();
+        return true;
+    }
+
+    function flushDbQueue() {
+        const currentDb = getDb();
+        if (currentDb && typeof currentDb.flushDbQueue === 'function') {
+            return currentDb.flushDbQueue();
+        }
+        if (dbQueueTimer) {
+            clearTimeout(dbQueueTimer);
+            dbQueueTimer = null;
+        }
+        if (isFlushingDbQueue && activeFlushPromise) {
+            return activeFlushPromise;
+        }
+        if (dbQueue.length === 0) {
+            return Promise.resolve();
+        }
+
+        const batch = dbQueue.splice(0, batchChunkSize);
+        isFlushingDbQueue = true;
+
+        const startTime = Date.now();
+        activeFlushPromise = new Promise((resolve) => {
+            let itemIdx = 0;
+
+            const runNextBatchItem = () => {
+                if (itemIdx >= batch.length) {
+                    const duration = Date.now() - startTime;
+                    dbQueueMetrics.lastBatchSize = batch.length;
+                    dbQueueMetrics.lastDurationMs = duration;
+                    isFlushingDbQueue = false;
+                    activeFlushPromise = null;
+
+                    if (dbQueue.length > 0) {
+                        setImmediate(() => {
+                            flushDbQueue().then(resolve);
+                        });
+                    } else {
+                        resolve();
+                    }
+                    return;
+                }
+
+                const item = batch[itemIdx++];
+                executeSequentialFallbackItem(currentDb, item, (itemErr) => {
+                    if (itemErr) {
+                        dbQueueMetrics.totalErrors++;
+                        if (logger && typeof logger.error === 'function') {
+                            logger.error(`⚠️ [DB_QUEUE] 佇列項目執行異常 (${item.label || item.sql}):`, itemErr.message);
+                        }
+                    } else {
+                        dbQueueMetrics.totalCommitted++;
+                    }
+                    runNextBatchItem();
+                });
+            };
+
+            if (currentDb && typeof currentDb.serialize === 'function') {
+                currentDb.serialize(runNextBatchItem);
+            } else {
+                runNextBatchItem();
+            }
+        });
+
+        return activeFlushPromise;
+    }
+
+    function stopTimer() {
+        if (dbQueueTimer) {
+            clearTimeout(dbQueueTimer);
+            dbQueueTimer = null;
+        }
+    }
+
+    return {
+        dbQueue,
+        dbQueueMetrics,
+        queueDbOp,
+        queuePacketTransaction,
+        flushDbQueue,
+        stopTimer,
+        isFlushing: () => isFlushingDbQueue
+    };
+}
+
 module.exports = {
     NODE_DISCOVERY_UPSERT_SQL,
     ENCRYPTED_PACKET_LOG_INSERT_SQL,
@@ -769,6 +1029,8 @@ module.exports = {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
-    executeSequentialFallbackItem
+    executeSequentialFallbackItem,
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController
 };
 

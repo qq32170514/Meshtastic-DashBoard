@@ -480,8 +480,6 @@ function invalidatePacketCache() {
 // 具備背壓 (Backpressure)、自適應批次 (Chunking) 與可觀測性指標
 // ==========================================
 const dbQueue = [];
-let dbQueueTimer = null;
-let isFlushingDbQueue = false;
 
 const MAX_QUEUE_CAPACITY = 5000;
 const BATCH_CHUNK_SIZE = 100;
@@ -500,178 +498,37 @@ const {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
-    executeSequentialFallbackItem
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController
 } = require('./src/database/packet-transaction');
+const {
+    registerAppBackupSchedule
+} = require('./src/database/backup-manager');
+
+// 🛡️ 4.0.2 Packet Transaction Boundary & Turso Sequential Fallback Queue Orchestrator
+// - 本地 SQLite 分支：直接委派 db.queuePacketTransaction / db.queueDbOp / db.flushDbQueue
+// - Turso fallback 分支：透過共用調度器執行 queuePacketTransaction() -> dbQueue -> flushDbQueue() -> executeSequentialFallbackItem()
+//   （誠實限制：Turso fallback 為多語句依序執行，不宣稱具備 Local SQLite Adapter 的單連線原子交易回滾保證）
+const fallbackQueueController = createSequentialFallbackQueueController({
+    getDb: () => db,
+    dbQueue,
+    dbQueueMetrics,
+    maxQueueCapacity: MAX_QUEUE_CAPACITY,
+    batchChunkSize: BATCH_CHUNK_SIZE,
+    flushIntervalMs: FLUSH_INTERVAL_MS,
+    logger: console
+});
 
 function queueDbOp(sql, params, callback) {
-    if (db && typeof db.queueDbOp === 'function') {
-        return db.queueDbOp(sql, params, callback);
-    }
-
-    const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
-    const actualCallback = typeof params === 'function' ? params : callback;
-
-    // 🛡️ 背壓防護 (Backpressure): 超過上限時記錄警示，避免記憶體溢位 (OOM)
-    if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
-        console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
-        if (typeof actualCallback === 'function') {
-            try { actualCallback(new Error('DB queue backpressure limit reached')); } catch (_) {}
-        }
-        return false;
-    }
-
-    dbQueue.push({
-        isTransactionUnit: false,
-        sql,
-        params: actualParams,
-        callback: actualCallback,
-        callbackInvoked: false,
-        queuedAt: Date.now()
-    });
-    dbQueueMetrics.totalQueued++;
-    if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
-        dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
-    }
-
-    // 🚀 自適應觸發：若積累達 BATCH_CHUNK_SIZE 立即執行，否則等待防抖計時
-    if (dbQueue.length >= BATCH_CHUNK_SIZE && !isFlushingDbQueue) {
-        if (dbQueueTimer) {
-            clearTimeout(dbQueueTimer);
-            dbQueueTimer = null;
-        }
-        flushDbQueue();
-    } else if (!dbQueueTimer) {
-        dbQueueTimer = setTimeout(flushDbQueue, FLUSH_INTERVAL_MS);
-    }
-    return true;
+    return fallbackQueueController.queueDbOp(sql, params, callback);
 }
 
-/**
- * 🛡️ 4.0.2 Packet Transaction Boundary:
- * - 本地 SQLite 分支：將單一邏輯封包的多筆 SQL 寫入作為不可拆分的原子交易單位送入 WriteQueue
- * - Turso fallback 分支：將多筆 SQL 排入 dbQueue 並按原始順序逐一執行（誠實限制：Turso fallback 為順序執行，不宣稱具備 Local SQLite Adapter 的單連線原子交易保證）
- */
 function queuePacketTransaction(statements, callback = null, options = {}) {
-    if (db && typeof db.queuePacketTransaction === 'function') {
-        return db.queuePacketTransaction(statements, callback, options);
-    }
-    if (db && typeof db.queueDbOp === 'function') {
-        return db.queueDbOp({
-            statements,
-            callback,
-            label: options && options.label ? options.label : undefined,
-            packetMeta: options && options.packetMeta ? options.packetMeta : undefined
-        });
-    }
-
-    if (
-        !Array.isArray(statements) ||
-        statements.length === 0 ||
-        !statements.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
-    ) {
-        const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
-        if (typeof callback === 'function') {
-            try { callback(err); } catch (_) {}
-        }
-        return false;
-    }
-
-    if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
-        console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
-        if (typeof callback === 'function') {
-            try { callback(new Error('DB queue backpressure limit reached')); } catch (_) {}
-        }
-        return false;
-    }
-
-    const normalizedStatements = statements.map((s) => ({
-        sql: s.sql,
-        params: Array.isArray(s.params) ? s.params : []
-    }));
-
-    dbQueue.push({
-        isTransactionUnit: true,
-        statements: normalizedStatements,
-        label: (options && typeof options.label === 'string' && options.label.trim().length > 0)
-            ? options.label.trim()
-            : `[PACKET_TX:${normalizedStatements.length}]`,
-        packetMeta: (options && options.packetMeta) || null,
-        sql: normalizedStatements[0].sql,
-        params: normalizedStatements[0].params,
-        callback,
-        callbackInvoked: false,
-        queuedAt: Date.now()
-    });
-    dbQueueMetrics.totalQueued++;
-    if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
-        dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
-    }
-
-    if (dbQueue.length >= BATCH_CHUNK_SIZE && !isFlushingDbQueue) {
-        if (dbQueueTimer) {
-            clearTimeout(dbQueueTimer);
-            dbQueueTimer = null;
-        }
-        flushDbQueue();
-    } else if (!dbQueueTimer) {
-        dbQueueTimer = setTimeout(flushDbQueue, FLUSH_INTERVAL_MS);
-    }
-    return true;
+    return fallbackQueueController.queuePacketTransaction(statements, callback, options);
 }
 
 function flushDbQueue() {
-    if (db && typeof db.flushDbQueue === 'function') {
-        return db.flushDbQueue();
-    }
-    if (dbQueueTimer) {
-        clearTimeout(dbQueueTimer);
-        dbQueueTimer = null;
-    }
-    if (dbQueue.length === 0 || isFlushingDbQueue) return Promise.resolve();
-
-    // 🚀 分批切片 (Chunking)，每次最多處理 BATCH_CHUNK_SIZE 筆
-    const batch = dbQueue.splice(0, BATCH_CHUNK_SIZE);
-    isFlushingDbQueue = true;
-
-    const startTime = Date.now();
-    return new Promise((resolve) => {
-        let itemIdx = 0;
-
-        const runNextBatchItem = () => {
-            if (itemIdx >= batch.length) {
-                const duration = Date.now() - startTime;
-                dbQueueMetrics.lastBatchSize = batch.length;
-                dbQueueMetrics.lastDurationMs = duration;
-                isFlushingDbQueue = false;
-
-                if (dbQueue.length > 0) {
-                    setImmediate(() => {
-                        flushDbQueue().then(resolve);
-                    });
-                } else {
-                    resolve();
-                }
-                return;
-            }
-
-            const item = batch[itemIdx++];
-            executeSequentialFallbackItem(db, item, (itemErr) => {
-                if (itemErr) {
-                    dbQueueMetrics.totalErrors++;
-                    console.error(`⚠️ [DB_QUEUE] 佇列項目執行異常 (${item.label || item.sql}):`, itemErr.message);
-                } else {
-                    dbQueueMetrics.totalCommitted++;
-                }
-                runNextBatchItem();
-            });
-        };
-
-        if (db && typeof db.serialize === 'function') {
-            db.serialize(runNextBatchItem);
-        } else {
-            runNextBatchItem();
-        }
-    });
+    return fallbackQueueController.flushDbQueue();
 }
 
 // ==========================================
@@ -754,31 +611,7 @@ if (process.env.TURSO_URL) {
         authToken: process.env.TURSO_TOKEN,
     });
     // 建立一個相容 sqlite3 語法的包裝器（支援 (sql, cb) 與 (sql, params, cb) 兩種呼叫形式）
-    db = {
-        isTursoFallback: true,
-        run: (sql, params, cb) => {
-            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
-            const actualCb = typeof params === 'function' ? params : cb;
-            return client.execute({ sql, args: actualParams })
-                .then(r => actualCb && actualCb.call({ lastID: Number(r?.lastInsertRowid ?? 0), changes: Number(r?.rowsAffected ?? 0) }, null))
-                .catch(err => actualCb && actualCb(err));
-        },
-        all: (sql, params, cb) => {
-            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
-            const actualCb = typeof params === 'function' ? params : cb;
-            return client.execute({ sql, args: actualParams })
-                .then(r => actualCb && actualCb(null, r.rows))
-                .catch(err => actualCb && actualCb(err));
-        },
-        get: (sql, params, cb) => {
-            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
-            const actualCb = typeof params === 'function' ? params : cb;
-            return client.execute({ sql, args: actualParams })
-                .then(r => actualCb && actualCb(null, r.rows ? r.rows[0] : undefined))
-                .catch(err => actualCb && actualCb(err));
-        },
-        serialize: (fn) => fn()
-    };
+    db = createTursoDbWrapper(client);
     console.log(`☁️ 已連線至 Turso 雲端資料庫`);
     db.serialize(() => {
         db.run(`
@@ -4517,21 +4350,7 @@ function startMqttClient() {
 //    註：保留既有實際 Cron 表達式 '0 0 * * 0' (每週日 00:00)；舊版註解「每 12 小時」與 sqlite.config.js 之 '0 4 * * *' 差異列為待確認事項
 // ==========================================
 if (db && db.backupManager) {
-    db.backupManager.startSchedule('0 0 * * 0', cron, {
-        shouldRun: () => {
-            const googleDrivePath = process.env.BACKUP_PATH;
-            if (!googleDrivePath) return false;
-            if (typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) return false;
-            return true;
-        },
-        fileNameProvider: () => {
-            const dateStr = new Date().toISOString().slice(0, 10);
-            return `meshtastic_backup_${dateStr}.db`;
-        },
-        optionsProvider: () => ({
-            backupDir: process.env.BACKUP_PATH
-        })
-    });
+    registerAppBackupSchedule(db, cron, process.env);
 }
 
 // ==========================================

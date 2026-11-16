@@ -2038,7 +2038,11 @@ class BackupManager {
         this.#scheduledCronExpression = scheduleExpr;
         this.#scheduledTask = scheduler.schedule(scheduleExpr, () => {
             if (typeof backupTaskOptions.shouldRun === 'function' && !backupTaskOptions.shouldRun()) {
-                return;
+                return Promise.resolve({
+                    success: false,
+                    skipped: true,
+                    reason: 'SHOULD_RUN_FALSE'
+                });
             }
             const fileName = typeof backupTaskOptions.fileNameProvider === 'function'
                 ? backupTaskOptions.fileNameProvider()
@@ -2046,7 +2050,7 @@ class BackupManager {
             const runOpts = typeof backupTaskOptions.optionsProvider === 'function'
                 ? backupTaskOptions.optionsProvider()
                 : {};
-            this.triggerScheduledBackup(fileName, runOpts).catch(() => {});
+            return this.triggerScheduledBackup(fileName, runOpts).catch(() => {});
         });
 
         return this.#scheduledTask;
@@ -2065,8 +2069,57 @@ class BackupManager {
     }
 }
 
+const APP_BACKUP_CRON_EXPRESSION = '0 0 * * 0';
+
+/**
+ * 建立 index.js 與測試共用的自動備份排程政策 (4.0.2 共用政策函式，避免主程式與測試重複維護不同邏輯):
+ * - 必須已設定 `envSource.BACKUP_PATH`
+ * - 必須通過 `dbTarget.isBootstrapReady()`
+ * - 保留既有實際 Cron 表達式 `'0 0 * * 0'`
+ * - 每次排程觸發皆動態讀取當下 `BACKUP_PATH` 與 `dbTarget.isBootstrapReady()` 狀態
+ */
+function createAppBackupSchedulePolicy(dbTarget, envSource = process.env) {
+    return {
+        cronExpression: APP_BACKUP_CRON_EXPRESSION,
+        shouldRun: () => {
+            const googleDrivePath = envSource ? envSource.BACKUP_PATH : undefined;
+            if (!googleDrivePath) return false;
+            if (dbTarget && typeof dbTarget.isBootstrapReady === 'function' && !dbTarget.isBootstrapReady()) {
+                return false;
+            }
+            return true;
+        },
+        fileNameProvider: () => {
+            const dateStr = new Date().toISOString().slice(0, 10);
+            return `meshtastic_backup_${dateStr}.db`;
+        },
+        optionsProvider: () => ({
+            backupDir: envSource ? envSource.BACKUP_PATH : undefined
+        })
+    };
+}
+
+/**
+ * 以實際應用程式備份排程政策向 `dbTarget.backupManager` 註冊定時排程
+ */
+function registerAppBackupSchedule(dbTarget, cronLib = null, envSource = process.env) {
+    if (!dbTarget || !dbTarget.backupManager || typeof dbTarget.backupManager.startSchedule !== 'function') {
+        return null;
+    }
+    const policy = createAppBackupSchedulePolicy(dbTarget, envSource);
+    const task = dbTarget.backupManager.startSchedule(policy.cronExpression, cronLib, policy);
+    return {
+        cronExpression: policy.cronExpression,
+        task,
+        policy
+    };
+}
+
 module.exports = {
     BackupManager,
     BACKUP_VERIFY_STATUS,
-    RESTORE_STATUS
+    RESTORE_STATUS,
+    APP_BACKUP_CRON_EXPRESSION,
+    createAppBackupSchedulePolicy,
+    registerAppBackupSchedule
 };

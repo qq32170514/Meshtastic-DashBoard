@@ -18,6 +18,11 @@ const {
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
     executeSequentialFallbackItem,
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController,
+    APP_BACKUP_CRON_EXPRESSION,
+    createAppBackupSchedulePolicy,
+    registerAppBackupSchedule,
     QUEUE_STATES,
     ITEM_STATUS
 } = require('../../src/database');
@@ -94,6 +99,13 @@ function buildMqttPublishPacket(topic, payloadBuffer, protocolVersion = 4) {
 
 function startLocalMockMqttBroker(options = {}) {
     const usePipe = options.usePipe !== undefined ? options.usePipe : (process.platform === 'win32');
+    const maxRemainingLength = typeof options.maxRemainingLength === 'number' && options.maxRemainingLength > 0
+        ? options.maxRemainingLength
+        : 256 * 1024; // 預設單封包最大 Remaining Length 256KB
+    const maxBufferSize = typeof options.maxBufferSize === 'number' && options.maxBufferSize > 0
+        ? options.maxBufferSize
+        : maxRemainingLength + 1024;
+
     const pipePath = usePipe
         ? (process.platform === 'win32'
             ? `\\\\.\\pipe\\mesh_mqtt_broker_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
@@ -101,48 +113,265 @@ function startLocalMockMqttBroker(options = {}) {
         : null;
 
     const sockets = new Set();
+    const socketStates = new Map();
+    const receivedPublishes = [];
+    const protocolErrors = [];
+    const publishWaiters = [];
+    let nextSocketId = 1;
     let clientProtocolVersion = 4;
     let subscribedResolve = null;
     const subscribedPromise = new Promise((resolve) => {
         subscribedResolve = resolve;
     });
 
+    function notifyPublishWaiters() {
+        for (let i = publishWaiters.length - 1; i >= 0; i--) {
+            const waiter = publishWaiters[i];
+            if (receivedPublishes.length >= waiter.targetCount) {
+                publishWaiters.splice(i, 1);
+                clearTimeout(waiter.timer);
+                waiter.resolve(receivedPublishes.slice());
+            }
+        }
+    }
+
+    function recordProtocolError(socket, state, reason, details = {}) {
+        const errEntry = {
+            socketId: state ? state.socketId : null,
+            reason,
+            ...details
+        };
+        protocolErrors.push(errEntry);
+        if (state) {
+            state.receiveBuffer = Buffer.alloc(0);
+            state.aborted = true;
+        }
+        try {
+            socket.destroy();
+        } catch (_) {}
+    }
+
+    /**
+     * 解析單一完整 MQTT PUBLISH 封包內容 (支援 QoS 0/1/2 與 MQTT v3.1.1 / v5.0)
+     */
+    function parseMqttPublishBody(firstByte, bodyBuf, protoVer, socketId) {
+        if (bodyBuf.length < 2) {
+            return { error: 'PUBLISH_BODY_TOO_SHORT_FOR_TOPIC_LEN' };
+        }
+        const qos = (firstByte & 0x06) >> 1;
+        const topicLen = bodyBuf.readUInt16BE(0);
+        let cursor = 2;
+        if (bodyBuf.length < cursor + topicLen) {
+            return { error: 'PUBLISH_BODY_TOO_SHORT_FOR_TOPIC' };
+        }
+        const topic = bodyBuf.subarray(cursor, cursor + topicLen).toString('utf8');
+        cursor += topicLen;
+
+        let packetId = null;
+        if (qos > 0) {
+            if (bodyBuf.length < cursor + 2) {
+                return { error: 'PUBLISH_BODY_TOO_SHORT_FOR_PACKET_ID' };
+            }
+            packetId = bodyBuf.readUInt16BE(cursor);
+            cursor += 2;
+        }
+
+        if (protoVer === 5) {
+            // 解碼 MQTT v5 Properties Length (Variable Byte Integer)
+            let propMult = 1;
+            let propLen = 0;
+            let propByte = 0;
+            let propBytesRead = 0;
+            do {
+                if (cursor >= bodyBuf.length) {
+                    return { error: 'PUBLISH_V5_PROPS_INCOMPLETE' };
+                }
+                propByte = bodyBuf[cursor++];
+                propBytesRead++;
+                if (propBytesRead > 4) {
+                    return { error: 'PUBLISH_V5_PROPS_MALFORMED' };
+                }
+                propLen += (propByte & 0x7f) * propMult;
+                propMult *= 128;
+            } while ((propByte & 0x80) !== 0);
+
+            if (bodyBuf.length < cursor + propLen) {
+                return { error: 'PUBLISH_V5_PROPS_OVERFLOW' };
+            }
+            cursor += propLen;
+        }
+
+        const payload = Buffer.from(bodyBuf.subarray(cursor));
+        return {
+            topic,
+            payload,
+            qos,
+            packetId,
+            socketId
+        };
+    }
+
     const server = net.createServer((socket) => {
+        const state = {
+            socketId: nextSocketId++,
+            protocolVersion: 4,
+            receiveBuffer: Buffer.alloc(0),
+            aborted: false
+        };
         sockets.add(socket);
-        socket.on('close', () => sockets.delete(socket));
+        socketStates.set(socket, state);
+
+        const cleanupSocketState = () => {
+            state.receiveBuffer = Buffer.alloc(0);
+            socketStates.delete(socket);
+            sockets.delete(socket);
+        };
+
+        socket.on('close', cleanupSocketState);
         socket.on('error', () => {});
 
         socket.on('data', (chunk) => {
+            if (state.aborted || !chunk || chunk.length === 0) return;
+
+            // 10. 防止惡意或異常不完整封包造成無上限緩衝增長
+            if (state.receiveBuffer.length + chunk.length > maxBufferSize) {
+                recordProtocolError(socket, state, 'MAX_BUFFER_SIZE_EXCEEDED', {
+                    bufferedBytes: state.receiveBuffer.length,
+                    incomingBytes: chunk.length,
+                    maxBufferSize
+                });
+                return;
+            }
+
+            // 1. 將新收到的 chunk 附加至該 Socket 專屬之 receiveBuffer
+            state.receiveBuffer = state.receiveBuffer.length === 0
+                ? Buffer.from(chunk)
+                : Buffer.concat([state.receiveBuffer, chunk]);
+
             let offset = 0;
-            while (offset < chunk.length) {
-                const packetType = chunk[offset] & 0xf0;
+            const buf = state.receiveBuffer;
+
+            while (offset < buf.length) {
+                // 2. 至少需要 2 bytes (1 byte Fixed Header type/flags + 至少 1 byte Remaining Length)
+                if (buf.length - offset < 2) {
+                    break;
+                }
+
+                const firstByte = buf[offset];
+                const packetType = firstByte & 0xf0;
+
+                // 3. 解析 MQTT Variable-Byte Remaining Length (最多 4 bytes)
                 let multiplier = 1;
                 let remLen = 0;
                 let idx = offset + 1;
                 let encodedByte = 0;
-                do {
-                    if (idx >= chunk.length) return;
-                    encodedByte = chunk[idx++];
-                    remLen += (encodedByte & 127) * multiplier;
+                let remLenByteCount = 0;
+                let remLenComplete = false;
+
+                while (idx < buf.length) {
+                    encodedByte = buf[idx++];
+                    remLenByteCount++;
+
+                    if (remLenByteCount > 4) {
+                        recordProtocolError(socket, state, 'MALFORMED_REMAINING_LENGTH_VARINT', {
+                            remLenByteCount
+                        });
+                        return;
+                    }
+
+                    remLen += (encodedByte & 0x7f) * multiplier;
+                    if (remLen > maxRemainingLength) {
+                        recordProtocolError(socket, state, 'REMAINING_LENGTH_EXCEEDS_LIMIT', {
+                            remLen,
+                            maxRemainingLength
+                        });
+                        return;
+                    }
+
+                    if ((encodedByte & 0x80) === 0) {
+                        remLenComplete = true;
+                        break;
+                    }
+
+                    if (remLenByteCount === 4 && (encodedByte & 0x80) !== 0) {
+                        recordProtocolError(socket, state, 'MALFORMED_REMAINING_LENGTH_VARINT', {
+                            remLenByteCount: 5
+                        });
+                        return;
+                    }
+
                     multiplier *= 128;
-                } while ((encodedByte & 128) !== 0);
+                }
+
+                // 若 Remaining Length 本身尚未收齊 (被拆成多個 chunks)，保留剩餘資料等待下一次 data 事件
+                if (!remLenComplete) {
+                    break;
+                }
 
                 const packetEnd = idx + remLen;
-                if (packetEnd > chunk.length) return;
+                if (packetEnd - offset > maxBufferSize) {
+                    recordProtocolError(socket, state, 'PACKET_TOTAL_SIZE_EXCEEDS_LIMIT', {
+                        packetSize: packetEnd - offset,
+                        maxBufferSize
+                    });
+                    return;
+                }
+
+                // 4 & 5. 若完整封包 Payload 尚未全部到達，保留剩餘資料等待下一次 data 事件
+                if (packetEnd > buf.length) {
+                    break;
+                }
+
+                // 擷取完整封包 Body
+                const bodySlice = buf.subarray(idx, packetEnd);
 
                 if (packetType === 0x10) {
-                    const protoNameLen = chunk.readUInt16BE(idx);
-                    const protoLevel = chunk[idx + 2 + protoNameLen];
-                    clientProtocolVersion = protoLevel === 5 ? 5 : 4;
-                    if (clientProtocolVersion === 5) {
+                    // CONNECT
+                    if (bodySlice.length < 4) {
+                        recordProtocolError(socket, state, 'MALFORMED_CONNECT_PACKET');
+                        return;
+                    }
+                    const protoNameLen = bodySlice.readUInt16BE(0);
+                    if (bodySlice.length < 2 + protoNameLen + 1) {
+                        recordProtocolError(socket, state, 'MALFORMED_CONNECT_PROTO_LEVEL');
+                        return;
+                    }
+                    const protoLevel = bodySlice[2 + protoNameLen];
+                    state.protocolVersion = protoLevel === 5 ? 5 : 4;
+                    clientProtocolVersion = state.protocolVersion;
+                    if (state.protocolVersion === 5) {
                         socket.write(Buffer.from([0x20, 0x03, 0x00, 0x00, 0x00]));
                     } else {
                         socket.write(Buffer.from([0x20, 0x02, 0x00, 0x00]));
                     }
+                } else if (packetType === 0x30) {
+                    // PUBLISH
+                    const parsedPub = parseMqttPublishBody(firstByte, bodySlice, state.protocolVersion, state.socketId);
+                    if (parsedPub.error) {
+                        recordProtocolError(socket, state, parsedPub.error);
+                        return;
+                    }
+                    receivedPublishes.push(parsedPub);
+                    if (parsedPub.qos === 1 && parsedPub.packetId !== null) {
+                        const pubAck = Buffer.alloc(4);
+                        pubAck[0] = 0x40;
+                        pubAck[1] = 0x02;
+                        pubAck.writeUInt16BE(parsedPub.packetId, 2);
+                        socket.write(pubAck);
+                    }
+                    // 轉發給其他已連線的訂閱端
+                    const forwardPkt = buildMqttPublishPacket(parsedPub.topic, parsedPub.payload, clientProtocolVersion);
+                    for (const s of sockets) {
+                        if (s !== socket && !s.destroyed) {
+                            s.write(forwardPkt);
+                        }
+                    }
+                    notifyPublishWaiters();
                 } else if (packetType === 0x80) {
-                    const pktIdHi = chunk[idx];
-                    const pktIdLo = chunk[idx + 1];
-                    if (clientProtocolVersion === 5) {
+                    // SUBSCRIBE
+                    const pktIdHi = bodySlice[0] || 0;
+                    const pktIdLo = bodySlice[1] || 1;
+                    if (state.protocolVersion === 5) {
                         socket.write(Buffer.from([0x90, 0x04, pktIdHi, pktIdLo, 0x00, 0x00]));
                     } else {
                         socket.write(Buffer.from([0x90, 0x03, pktIdHi, pktIdLo, 0x00]));
@@ -152,12 +381,23 @@ function startLocalMockMqttBroker(options = {}) {
                         subscribedResolve = null;
                     }
                 } else if (packetType === 0xc0) {
+                    // PINGREQ
                     socket.write(Buffer.from([0xd0, 0x00]));
                 } else if (packetType === 0xe0) {
+                    // DISCONNECT
                     socket.end();
                 }
 
                 offset = packetEnd;
+            }
+
+            // 移除已解析完成的封包區段，保留未完成的尾端殘留 bytes
+            if (!state.aborted) {
+                if (offset === buf.length) {
+                    state.receiveBuffer = Buffer.alloc(0);
+                } else if (offset > 0) {
+                    state.receiveBuffer = Buffer.from(buf.subarray(offset));
+                }
             }
         });
     });
@@ -171,7 +411,25 @@ function startLocalMockMqttBroker(options = {}) {
                 port,
                 pipePath,
                 url: `mqtt://127.0.0.1:${port}`,
+                receivedPublishes,
+                protocolErrors,
+                getActiveSocketCount: () => socketStates.size,
+                getSocketBufferLengths: () => Array.from(socketStates.values()).map((s) => ({
+                    socketId: s.socketId,
+                    bufferedBytes: s.receiveBuffer.length
+                })),
                 waitForSubscription: () => subscribedPromise,
+                waitForPublishCount: (targetCount, timeoutMs = 3000) => {
+                    if (receivedPublishes.length >= targetCount) {
+                        return Promise.resolve(receivedPublishes.slice());
+                    }
+                    return new Promise((res, rej) => {
+                        const timer = setTimeout(() => {
+                            rej(new Error(`Timeout waiting for ${targetCount} MQTT publishes (received=${receivedPublishes.length})`));
+                        }, timeoutMs);
+                        publishWaiters.push({ targetCount, resolve: res, timer });
+                    });
+                },
                 publish(topic, payloadBuffer) {
                     const pkt = buildMqttPublishPacket(topic, payloadBuffer, clientProtocolVersion);
                     for (const s of sockets) {
@@ -179,9 +437,13 @@ function startLocalMockMqttBroker(options = {}) {
                     }
                 },
                 async close() {
+                    for (const waiter of publishWaiters.splice(0)) {
+                        clearTimeout(waiter.timer);
+                    }
                     for (const s of sockets) {
                         try { s.destroy(); } catch (_) {}
                     }
+                    socketStates.clear();
                     sockets.clear();
                     await new Promise((r) => server.close(() => r()));
                     if (pipePath && process.platform !== 'win32') {
@@ -1479,13 +1741,13 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
     });
 
     // =========================================================================
-    // 12. P1：Turso Fallback 多語句順序執行與錯誤中斷測試 (Section 三)
+    // 12. P1：Turso 實際隊列入口與 Sequential Fallback 多語句順序執行與混合佇列測試 (Section 二)
     // =========================================================================
-    it('Test 4.0.2-12 — Turso Fallback Sequential Multi-Statement Execution (P1): 驗證 Turso fallback 依序執行所有 statements、不將 label 當 SQL、中途失敗立即停止且不觸發成功副作用', async () => {
+    it('Test 4.0.2-12 — Turso Actual Queue Entry & Flush Path (queuePacketTransaction -> dbQueue -> flushDbQueue -> executeSequentialFallbackItem): 驗證透過與 index.js 共用的實際佇列調度器入列、混合單筆 queueDbOp 與多語句封包交易、中段失敗停止與 callback exactly-once', async () => {
         const executedCalls = [];
         let failAtCallIndex = -1;
 
-        // 建立模擬 Turso @libsql/client.execute 的本地隔離 Mock 包裝器（與 index.js TURSO_URL 分支完全一致）
+        // 1. 使用與 index.js TURSO_URL 分支完全共用的 createTursoDbWrapper 與 createSequentialFallbackQueueController
         const mockLibsqlClient = {
             execute: async ({ sql, args }) => {
                 const currentIdx = executedCalls.length;
@@ -1497,96 +1759,100 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
             }
         };
 
-        const mockTursoDb = {
-            isTursoFallback: true,
-            run: (sql, params, cb) => {
-                const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
-                const actualCb = typeof params === 'function' ? params : cb;
-                return mockLibsqlClient.execute({ sql, args: actualParams })
-                    .then(r => actualCb && actualCb.call({ lastID: Number(r?.lastInsertRowid ?? 0), changes: Number(r?.rowsAffected ?? 0) }, null))
-                    .catch(err => actualCb && actualCb(err));
-            },
-            serialize: (fn) => fn()
-        };
+        const mockTursoDb = createTursoDbWrapper(mockLibsqlClient);
+        assert.equal(mockTursoDb.isTursoFallback, true);
+        assert.equal(typeof mockTursoDb.queuePacketTransaction, 'undefined', 'Turso wrapper 無 Local SQLite queuePacketTransaction');
+        assert.equal(typeof mockTursoDb.queueDbOp, 'undefined', 'Turso wrapper 無 Local SQLite queueDbOp');
 
-        // 模擬 index.js 中的 fallback queuePacketTransaction -> executeSequentialFallbackItem 流程
-        const enqueueViaTursoFallback = (statements, callback, options = {}) => {
-            const item = {
-                isTransactionUnit: true,
-                statements: statements.map(s => ({ sql: s.sql, params: Array.isArray(s.params) ? s.params : [] })),
-                label: options.label || `[PACKET_TX:${statements.length}]`,
-                packetMeta: options.packetMeta || null,
-                sql: statements[0].sql,
-                params: statements[0].params || [],
-                callback,
-                callbackInvoked: false
-            };
-            executeSequentialFallbackItem(mockTursoDb, item);
-            return true;
+        const sharedDbQueue = [];
+        const sharedMetrics = {
+            totalQueued: 0,
+            totalCommitted: 0,
+            totalErrors: 0,
+            lastBatchSize: 0,
+            lastDurationMs: 0,
+            maxQueueLengthSeen: 0
         };
-
-        // --- Subcase A: 4 條 SQL 全部成功 ---
-        const telePlan = buildMqttPacketTransactionPlan({
-            fromId: '!turso001',
-            topic: 'msh/TW/2/e/MediumFast/!gw_turso',
-            resolvedChannel: 'MediumFast',
-            gatewayId: '!gw_turso',
-            packet: { id: 901, hop_limit: 2, hop_start: 3, rx_snr: 9.0, rx_rssi: -75 },
-            rawHex: 'FFEE',
-            decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
-            payloadObj: { device_metrics: { battery_level: 85 } },
-            telemetryData: { batteryLevel: 85, finalVoltage: 4.08, finalCurrent: 90, temperature: 25.0, humidity: 60.0 }
+        const queueController = createSequentialFallbackQueueController({
+            getDb: () => mockTursoDb,
+            dbQueue: sharedDbQueue,
+            dbQueueMetrics: sharedMetrics,
+            maxQueueCapacity: 5000,
+            batchChunkSize: 100,
+            flushIntervalMs: 5000, // 長防抖時間以便測試直接驗證 dbQueue 實際入列狀態後再呼叫 flushDbQueue()
+            logger: { log: () => {}, warn: () => {}, error: () => {} }
         });
-        assert.equal(telePlan.statements.length, 4);
 
-        const subcaseAOrder = [];
-        let subcaseACbCount = 0;
-        let subcaseAResult = null;
+        try {
+            // --- Subcase A: 透過 queuePacketTransaction() 入列至實際 dbQueue，再由 flushDbQueue() 執行 4 條 SQL ---
+            const telePlan = buildMqttPacketTransactionPlan({
+                fromId: '!turso001',
+                topic: 'msh/TW/2/e/MediumFast/!gw_turso',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw_turso',
+                packet: { id: 901, hop_limit: 2, hop_start: 3, rx_snr: 9.0, rx_rssi: -75 },
+                rawHex: 'FFEE',
+                decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+                payloadObj: { device_metrics: { battery_level: 85 } },
+                telemetryData: { batteryLevel: 85, finalVoltage: 4.08, finalCurrent: 90, temperature: 25.0, humidity: 60.0 }
+            });
+            assert.equal(telePlan.statements.length, 4);
 
-        await new Promise((resolve, reject) => {
-            executePacketTransactionPlan(
+            const subcaseAOrder = [];
+            let subcaseACbCount = 0;
+            let subcaseAResult = null;
+
+            const enqueuedOk = executePacketTransactionPlan(
                 telePlan,
                 {
-                    enqueuePacketTransaction: enqueueViaTursoFallback,
+                    enqueuePacketTransaction: queueController.queuePacketTransaction,
                     recordLivePacketAnalytics: () => subcaseAOrder.push('POST_ANALYTICS'),
                     batchEmit: (type) => subcaseAOrder.push(`POST_EMIT:${type}`),
                     logger: { log: () => subcaseAOrder.push('POST_LOG'), error: () => {} }
                 },
                 (err, res) => {
                     subcaseACbCount++;
-                    if (err) return reject(err);
+                    if (err) throw err;
                     subcaseAResult = res;
                     subcaseAOrder.push('CALLER_CALLBACK');
-                    resolve();
                 }
             );
-        });
+            assert.equal(enqueuedOk, true, 'queuePacketTransaction 必須回傳 true');
 
-        // 1. 驗證 4 條 SQL 皆被執行，且順序與 telePlan.statements 完全一致
-        assert.equal(executedCalls.length, 4, 'Turso fallback 必須完整執行全部 4 條 SQL，不得只執行第 1 條');
-        for (let i = 0; i < 4; i++) {
-            assert.equal(executedCalls[i].sql, telePlan.statements[i].sql, `第 ${i} 條 SQL 順序必須完全一致`);
-            assert.notEqual(executedCalls[i].sql, telePlan.label, '絕不可把 options.label 當成 SQL 執行');
-        }
-        assert.equal(subcaseACbCount, 1, '成功 callback 必須精確執行 1 次');
-        assert.equal(subcaseAResult.statementCount, 4);
-        assert.equal(subcaseAResult.isTursoSequentialFallback, true);
-        assert.ok(subcaseAOrder.includes('POST_ANALYTICS'), '所有 SQL 成功後才執行 analytics');
-        assert.ok(subcaseAOrder.includes('POST_EMIT:telemetry_update'), '所有 SQL 成功後才執行 batchEmit');
+            // 驗證 2 & 3：在 flushDbQueue() 前，交易單位確實進入實際 sharedDbQueue 且標記 isTransactionUnit: true
+            assert.equal(sharedDbQueue.length, 1, '交易單位必須進入實際 dbQueue');
+            assert.equal(sharedDbQueue[0].isTransactionUnit, true, 'dbQueue 項目必須標記 isTransactionUnit === true');
+            assert.equal(sharedDbQueue[0].statements.length, 4, 'dbQueue 項目必須保留完整 4 條 statements');
+            assert.equal(sharedDbQueue[0].label, telePlan.label, 'dbQueue 項目必須保留交易標籤');
+            assert.equal(executedCalls.length, 0, 'flushDbQueue 執行前尚未執行 SQL');
 
-        // --- Subcase B: 中途第 2 條 SQL (index=1) 失敗 ---
-        executedCalls.length = 0;
-        failAtCallIndex = 1; // 讓第 2 條 SQL 失敗
+            await queueController.flushDbQueue();
 
-        const subcaseBEffects = [];
-        let subcaseBCbCount = 0;
-        let subcaseBErr = null;
+            assert.equal(sharedDbQueue.length, 0, 'flushDbQueue 完成後 dbQueue 應排空');
+            assert.equal(executedCalls.length, 4, 'Turso fallback 必須完整執行全部 4 條 SQL，不得只執行第 1 條');
+            for (let i = 0; i < 4; i++) {
+                assert.equal(executedCalls[i].sql, telePlan.statements[i].sql, `第 ${i} 條 SQL 順序必須完全一致`);
+                assert.notEqual(executedCalls[i].sql, telePlan.label, '絕不可把 options.label 當成 SQL 執行');
+            }
+            assert.equal(subcaseACbCount, 1, '成功 callback 必須精確執行 1 次');
+            assert.equal(subcaseAResult.statementCount, 4);
+            assert.equal(subcaseAResult.isTursoSequentialFallback, true);
+            assert.ok(subcaseAOrder.includes('POST_ANALYTICS'), '所有 SQL 成功後才執行 analytics');
+            assert.ok(subcaseAOrder.includes('POST_EMIT:telemetry_update'), '所有 SQL 成功後才執行 batchEmit');
+            assert.equal(subcaseAOrder[subcaseAOrder.length - 1], 'CALLER_CALLBACK', 'caller callback 在 post-commit hooks 後執行');
 
-        await new Promise((resolve) => {
+            // --- Subcase B: 透過 queuePacketTransaction() 入列，中途第 2 條 SQL (index=1) 失敗 ---
+            executedCalls.length = 0;
+            failAtCallIndex = 1; // 讓第 2 條 SQL 失敗
+
+            const subcaseBEffects = [];
+            let subcaseBCbCount = 0;
+            let subcaseBErr = null;
+
             executePacketTransactionPlan(
                 telePlan,
                 {
-                    enqueuePacketTransaction: enqueueViaTursoFallback,
+                    enqueuePacketTransaction: queueController.queuePacketTransaction,
                     recordLivePacketAnalytics: () => subcaseBEffects.push('ANALYTICS'),
                     batchEmit: (type) => subcaseBEffects.push(`EMIT:${type}`),
                     logger: { log: () => subcaseBEffects.push('LOG'), error: () => {} }
@@ -1594,84 +1860,238 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
                 (err) => {
                     subcaseBCbCount++;
                     subcaseBErr = err;
-                    resolve();
                 }
             );
-        });
+            assert.equal(sharedDbQueue.length, 1, '失敗測試項目同樣先進入 dbQueue');
 
-        // 2. 驗證第 2 條 SQL (index=1) 失敗時，第 3 條與第 4 條 SQL 絕不會被繼續執行
-        assert.equal(executedCalls.length, 2, '第 2 條 SQL 失敗後必須立即中止，不得繼續執行第 3、4 條 SQL');
-        assert.equal(subcaseBCbCount, 1, '錯誤 callback 必須精確觸發 1 次');
-        assert.ok(subcaseBErr, '必須收到錯誤物件');
-        assert.equal(subcaseBErr.failedStatementIndex, 1, '應記錄失敗於 index=1');
-        assert.equal(subcaseBErr.failedStatementSql, telePlan.statements[1].sql);
-        assert.equal(subcaseBErr.transactionLabel, telePlan.label);
-        assert.equal(subcaseBEffects.length, 0, '中途失敗時不得執行任何成功的 post-commit effects');
+            await queueController.flushDbQueue();
 
-        // --- Subcase C: 驗證非封包交易之一般單筆 SQL 寫入相容性 ---
-        executedCalls.length = 0;
-        failAtCallIndex = -1;
-        let singleOpDone = false;
-        await new Promise((resolve, reject) => {
-            executeSequentialFallbackItem(mockTursoDb, {
-                isTransactionUnit: false,
-                sql: 'DELETE FROM chat_messages WHERE id = ?',
-                params: [42],
-                callback: function (err) {
-                    if (err) return reject(err);
-                    singleOpDone = true;
-                    resolve();
-                }
+            assert.equal(executedCalls.length, 2, '第 2 條 SQL 失敗後必須立即中止，不得繼續執行第 3、4 條 SQL');
+            assert.equal(subcaseBCbCount, 1, '錯誤 callback 必須精確觸發 1 次');
+            assert.ok(subcaseBErr, '必須收到錯誤物件');
+            assert.equal(subcaseBErr.failedStatementIndex, 1, '應記錄失敗於 index=1');
+            assert.equal(subcaseBErr.failedStatementSql, telePlan.statements[1].sql);
+            assert.equal(subcaseBErr.transactionLabel, telePlan.label);
+            assert.equal(subcaseBEffects.length, 0, '中途失敗時不得執行任何成功的 post-commit effects');
+
+            // --- Subcase C: 同一個 dbQueue 中混合一般單筆 queueDbOp() 與多語句 queuePacketTransaction() ---
+            executedCalls.length = 0;
+            failAtCallIndex = 5; // 順序為: [0] singleOp1 -> [1,2,3] chatPlan (3 條) -> [4] singleOp2 -> [5(FAIL),6] rfPlan (第 1 筆失敗) -> [6] singleOp3
+
+            const mixedTimeline = [];
+            let single1CbCount = 0;
+            let chatTxCbCount = 0;
+            let single2CbCount = 0;
+            let rfTxCbCount = 0;
+            let rfTxErr = null;
+            let single3CbCount = 0;
+
+            const chatPlan = buildMqttPacketTransactionPlan({
+                fromId: '!turso_mix_chat',
+                topic: 'msh/TW/2/e/MediumFast/!gw_turso',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw_turso',
+                packet: { id: 902, hop_limit: 3, hop_start: 3, rx_snr: 10.0, rx_rssi: -70 },
+                rawHex: 'AABB',
+                decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
+                payloadObj: { text: 'Mixed queue chat packet', channel_name: 'MediumFast' }
             });
-        });
-        assert.equal(singleOpDone, true);
-        assert.equal(executedCalls.length, 1);
-        assert.equal(executedCalls[0].sql, 'DELETE FROM chat_messages WHERE id = ?');
+            assert.equal(chatPlan.statements.length, 3);
+
+            const rfPlan = buildRfTunnelPacketTransactionPlan({
+                fromId: '!turso_mix_rf',
+                gatewayId: 'RELAY_MIX',
+                snr: 6.5,
+                rssi: -85,
+                lat: 24.0,
+                lng: 121.0,
+                hopsAway: 1,
+                sourceName: 'hualien',
+                sourceLabel: '花蓮站',
+                packetData: { from: '!turso_mix_rf', portnum: 'POSITION' }
+            });
+            assert.equal(rfPlan.statements.length, 2);
+
+            // 依序排入同一個 sharedDbQueue:
+            // Item 1: 一般 queueDbOp
+            queueController.queueDbOp('DELETE FROM chat_messages WHERE id = ?', [10], (err) => {
+                assert.equal(err, null);
+                single1CbCount++;
+                mixedTimeline.push('SINGLE_OP_1_CB');
+            });
+
+            // Item 2: 3 條 SQL 的 Packet Transaction (成功)
+            executePacketTransactionPlan(
+                chatPlan,
+                {
+                    enqueuePacketTransaction: queueController.queuePacketTransaction,
+                    batchEmit: (t) => mixedTimeline.push(`CHAT_TX_EMIT:${t}`),
+                    recordLivePacketAnalytics: () => mixedTimeline.push('CHAT_TX_ANALYTICS'),
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    assert.equal(err, null);
+                    chatTxCbCount++;
+                    mixedTimeline.push('CHAT_TX_CB');
+                }
+            );
+
+            // Item 3: 一般 queueDbOp (2 參數無 params 陣列呼叫形式)
+            queueController.queueDbOp('DELETE FROM telemetry_data WHERE id < 5', (err) => {
+                assert.equal(err, null);
+                single2CbCount++;
+                mixedTimeline.push('SINGLE_OP_2_CB');
+            });
+
+            // Item 4: 2 條 SQL 的 RF Packet Transaction (在第 1 條 SQL 即全域 call index=5 處失敗)
+            executePacketTransactionPlan(
+                rfPlan,
+                {
+                    enqueuePacketTransaction: queueController.queuePacketTransaction,
+                    batchEmit: (t) => mixedTimeline.push(`RF_TX_SHOULD_NOT_EMIT:${t}`),
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    rfTxCbCount++;
+                    rfTxErr = err;
+                    mixedTimeline.push('RF_TX_ERROR_CB');
+                }
+            );
+
+            // Item 5: 一般 queueDbOp (驗證前一個交易失敗不會破壞同佇列後續一般 SQL 的順序與 callback)
+            queueController.queueDbOp('UPDATE nodes SET is_favorite = 1 WHERE node_id = ?', ['!turso_mix_chat'], (err) => {
+                assert.equal(err, null);
+                single3CbCount++;
+                mixedTimeline.push('SINGLE_OP_3_CB');
+            });
+
+            assert.equal(sharedDbQueue.length, 5, '5 個混合項目應同時排入 sharedDbQueue');
+            assert.deepEqual(
+                sharedDbQueue.map(item => item.isTransactionUnit),
+                [false, true, false, true, false],
+                'dbQueue 中一般 SQL 與 Packet Transaction 的 isTransactionUnit 標記必須精確對應'
+            );
+
+            await queueController.flushDbQueue();
+
+            // 驗證總執行 SQL 數：1 (Single1) + 3 (ChatTx) + 1 (Single2) + 1 (RfTx 第 1 條失敗，第 2 條不執行) + 1 (Single3) = 7 條 SQL
+            assert.equal(executedCalls.length, 7, '混合佇列應精確執行 7 條 SQL（RF 交易第 2 條因第 1 條失敗而停止）');
+            assert.equal(single1CbCount, 1);
+            assert.equal(chatTxCbCount, 1);
+            assert.equal(single2CbCount, 1);
+            assert.equal(rfTxCbCount, 1);
+            assert.ok(rfTxErr, 'RF 交易失敗必須傳遞錯誤給 callback');
+            assert.equal(rfTxErr.failedStatementIndex, 0);
+            assert.equal(single3CbCount, 1, '後續一般 queueDbOp 仍須正常執行並觸發 callback 1 次');
+
+            // 驗證 Callback 與副作用嚴格保持 FIFO 順序，且失敗的 RF 交易 0 副作用
+            assert.ok(!mixedTimeline.some(e => e.startsWith('RF_TX_SHOULD_NOT_EMIT')), '失敗的交易不得觸發 emit');
+            const idxSingle1 = mixedTimeline.indexOf('SINGLE_OP_1_CB');
+            const idxChatTx = mixedTimeline.indexOf('CHAT_TX_CB');
+            const idxSingle2 = mixedTimeline.indexOf('SINGLE_OP_2_CB');
+            const idxRfErr = mixedTimeline.indexOf('RF_TX_ERROR_CB');
+            const idxSingle3 = mixedTimeline.indexOf('SINGLE_OP_3_CB');
+            assert.ok(
+                idxSingle1 < idxChatTx && idxChatTx < idxSingle2 && idxSingle2 < idxRfErr && idxRfErr < idxSingle3,
+                `混合隊列回呼順序必須嚴格符合 FIFO: ${JSON.stringify(mixedTimeline)}`
+            );
+        } finally {
+            queueController.stopTimer();
+        }
     });
 
     // =========================================================================
-    // 13. TURSO_URL 與備份排程策略確認測試
+    // 13. Backup Scheduler Policy 實際共用函式與動態狀態驗證測試 (Section 三)
     // =========================================================================
-    it('Test 4.0.2-13 — Backup Schedule & TURSO_URL Policy Verification: 驗證備份排程 shouldRun 守門條件與設定檔差異維持凍結政策', async () => {
+    it('Test 4.0.2-13 — Backup Scheduler Policy Shared Function Verification: 驗證 index.js 共用 registerAppBackupSchedule / createAppBackupSchedulePolicy 之四種情境 (A/B/C/D) 與 Cron 凍結政策', async () => {
         const dbPath = createTempPath('policy_check');
         const backupDir = createTempPath('policy_backups', '');
         fs.mkdirSync(backupDir, { recursive: true });
 
         const db = await createDatabaseSubsystem({ dbPath, backupDir, bootstrapSchema: true });
         try {
+            // 寫入一筆測試節點資料，讓排程備份觸發時可驗證備份檔內容
+            await db.run(`INSERT INTO nodes (node_id, long_name, short_name) VALUES ('!sched001', 'ScheduledNode', 'SCH1')`);
+
             assert.equal(sqliteConfig.backup.cronSchedule, '0 4 * * *', 'sqlite.config.js 預設 cronSchedule 應維持 0 4 * * *');
+            assert.equal(APP_BACKUP_CRON_EXPRESSION, '0 0 * * 0', 'index.js 實際備份排程政策應維持 0 0 * * 0');
 
             let registeredCronExpr = null;
+            let scheduledTickFn = null;
             const fakeCron = {
                 validate: (expr) => expr === '0 0 * * 0',
-                schedule: (expr) => {
+                schedule: (expr, tickCallback) => {
                     registeredCronExpr = expr;
+                    scheduledTickFn = tickCallback;
                     return { stop: () => {} };
                 }
             };
 
-            const origBackupPath = process.env.BACKUP_PATH;
-            try {
-                delete process.env.BACKUP_PATH;
-                const shouldRunFn = () => {
-                    const googleDrivePath = process.env.BACKUP_PATH;
-                    if (!googleDrivePath) return false;
-                    if (typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) return false;
-                    return true;
-                };
+            // 使用受控環境變數物件傳入與 index.js 完全共用的 registerAppBackupSchedule(db, fakeCron, mockEnv)
+            const mockEnv = {};
+            let performBackupCallCount = 0;
+            const origPerformBackup = db.backupManager.performBackup.bind(db.backupManager);
+            db.backupManager.performBackup = async (...args) => {
+                performBackupCallCount++;
+                return origPerformBackup(...args);
+            };
 
-                db.backupManager.startSchedule('0 0 * * 0', fakeCron, { shouldRun: shouldRunFn });
-                assert.equal(registeredCronExpr, '0 0 * * 0');
-                assert.equal(shouldRunFn(), false, '未設定 BACKUP_PATH 時，排程備份條件必須為 false');
+            const registration = registerAppBackupSchedule(db, fakeCron, mockEnv);
+            assert.ok(registration, 'registerAppBackupSchedule 必須成功註冊排程');
+            assert.equal(registeredCronExpr, '0 0 * * 0', '實際註冊至 cron.schedule 的表達式必須為 0 0 * * 0');
+            assert.equal(typeof scheduledTickFn, 'function', '必須註冊排程觸發回呼');
 
-                process.env.BACKUP_PATH = backupDir;
-                assert.equal(shouldRunFn(), true, '已設定 BACKUP_PATH 且 Schema Initialization Barrier 完成時，排程備份條件為 true');
-            } finally {
-                if (origBackupPath === undefined) delete process.env.BACKUP_PATH;
-                else process.env.BACKUP_PATH = origBackupPath;
-                db.backupManager.stopSchedule();
-            }
+            const { policy } = registration;
+
+            // --- 情境 A：未設定 BACKUP_PATH ---
+            delete mockEnv.BACKUP_PATH;
+            assert.equal(db.isBootstrapReady(), true);
+            assert.equal(policy.shouldRun(), false, '情境 A：未設定 BACKUP_PATH 時 shouldRun() 必須回傳 false');
+            const tickResultA = await scheduledTickFn();
+            assert.equal(tickResultA.skipped, true, '情境 A：排程觸發必須略過');
+            assert.equal(performBackupCallCount, 0, '情境 A：不得呼叫 performBackup()');
+            assert.equal(fs.readdirSync(backupDir).length, 0, '情境 A：不得意外產生本地備份檔案');
+
+            // --- 情境 B：設定 BACKUP_PATH，但 Schema 尚未 Ready ---
+            mockEnv.BACKUP_PATH = backupDir;
+            db.isSchemaReady = false;
+            assert.equal(db.isBootstrapReady(), false, 'Schema 未就緒時 db.isBootstrapReady() 為 false');
+            assert.equal(policy.shouldRun(), false, '情境 B：設定 BACKUP_PATH 但 Schema 尚未 Ready 時 shouldRun() 必須回傳 false');
+            const tickResultB = await scheduledTickFn();
+            assert.equal(tickResultB.skipped, true, '情境 B：排程觸發必須略過');
+            assert.equal(performBackupCallCount, 0, '情境 B：不得執行備份');
+            assert.equal(fs.readdirSync(backupDir).length, 0, '情境 B：不得產生備份檔案');
+
+            // --- 情境 C：設定 BACKUP_PATH，且 Bootstrap Ready ---
+            db.isSchemaReady = true;
+            assert.equal(db.isBootstrapReady(), true, 'Schema 就緒時 db.isBootstrapReady() 為 true');
+            assert.equal(policy.shouldRun(), true, '情境 C：設定 BACKUP_PATH 且 Bootstrap Ready 時 shouldRun() 必須回傳 true');
+            const tickResultC = await scheduledTickFn();
+            assert.ok(tickResultC, '情境 C：排程器應正常觸發備份流程並回傳結果');
+            assert.equal(tickResultC.status, 'COMPLETED', '情境 C：排程觸發之備份必須成功完成');
+            assert.equal(performBackupCallCount, 1, '情境 C：performBackup() 應精確執行 1 次');
+            const filesAfterC = fs.readdirSync(backupDir).filter(f => f.endsWith('.db'));
+            assert.equal(filesAfterC.length, 1, '情境 C：BACKUP_PATH 目錄下應產生 1 份 .db 備份檔');
+            assert.match(filesAfterC[0], /^meshtastic_backup_\d{4}-\d{2}-\d{2}\.db$/);
+
+            // --- 情境 D：Bootstrap Ready 狀態與 BACKUP_PATH 發生動態變化 ---
+            // 確認同一個已註冊的排程在後續觸發時動態使用當下狀態，絕不沿用初始化或上一次觸發時的舊狀態
+            db.bootstrapError = new Error('SIMULATED_RUNTIME_BOOTSTRAP_FAULT');
+            assert.equal(db.isBootstrapReady(), false, '模擬狀態變化後 isBootstrapReady() 變為 false');
+            assert.equal(policy.shouldRun(), false, '情境 D-1：Bootstrap Ready 變為 false 時 shouldRun() 必須立即反映為 false');
+            const tickResultD1 = await scheduledTickFn();
+            assert.equal(tickResultD1.skipped, true);
+            assert.equal(performBackupCallCount, 1, '情境 D-1：狀態變為不就緒後觸發排程不得再執行 performBackup()');
+
+            // 恢復 Bootstrap Ready 狀態，再次觸發應可執行
+            db.bootstrapError = null;
+            assert.equal(db.isBootstrapReady(), true);
+            assert.equal(policy.shouldRun(), true, '情境 D-2：狀態恢復為 Ready 後 shouldRun() 立即回傳 true');
+            const tickResultD2 = await scheduledTickFn();
+            assert.equal(tickResultD2.status, 'COMPLETED');
+            assert.equal(performBackupCallCount, 2, '情境 D-2：狀態恢復後排程應再次成功執行 performBackup()');
         } finally {
+            db.backupManager.stopSchedule();
             await db.close();
             cleanupDbFiles(dbPath);
             cleanupDirRecursive(backupDir);
@@ -2101,6 +2521,285 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
             await mockBroker.close();
             cleanupDbFiles(dbPath);
             cleanupDbFiles(eventLogPath);
+        }
+    });
+
+    // =========================================================================
+    // 18 ~ 24. MQTT Mock Broker Stream Parser 拆包、黏包、多連線隔離與異常保護測試 (Section 四 Tests A ~ G)
+    // =========================================================================
+    function connectRawBrokerClient(mockBroker) {
+        return new Promise((resolve, reject) => {
+            const clientSocket = mockBroker.pipePath
+                ? net.createConnection(mockBroker.pipePath)
+                : net.createConnection({ host: '127.0.0.1', port: mockBroker.port });
+            clientSocket.once('connect', () => resolve(clientSocket));
+            clientSocket.once('error', reject);
+        });
+    }
+
+    it('Test 4.0.2-18 — MQTT Mock Broker Stream Parser Test A (Complete Packet Single Arrival): 正常 MQTT PUBLISH 封包單次完整到達時正確解析', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client = null;
+        try {
+            client = await connectRawBrokerClient(mockBroker);
+            const topic = 'msh/TW/2/e/MediumFast/!gw_test_a';
+            const payload = Buffer.from('SINGLE_ARRIVAL_PAYLOAD_OK', 'utf8');
+            const pkt = buildMqttPublishPacket(topic, payload, 4);
+
+            client.write(pkt);
+            const publishes = await mockBroker.waitForPublishCount(1);
+            assert.equal(publishes.length, 1);
+            assert.equal(publishes[0].topic, topic);
+            assert.deepEqual(publishes[0].payload, payload);
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 0, '解析完成後 receiveBuffer 應清空為 0');
+        } finally {
+            if (client && !client.destroyed) client.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-19 — MQTT Mock Broker Stream Parser Test B (Split Fixed Header): 將 MQTT Fixed Header 拆成不同 chunks 傳送，確認不會提前解析且收齊後完整還原', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client = null;
+        try {
+            client = await connectRawBrokerClient(mockBroker);
+            const topic = 'msh/TW/2/e/MediumFast/!gw_test_b';
+            const payload = Buffer.from('SPLIT_FIXED_HEADER_PAYLOAD', 'utf8');
+            const pkt = buildMqttPublishPacket(topic, payload, 4);
+
+            // Chunk 1: 只送 Fixed Header 第一個 byte (0x30)，連 Remaining Length 都還沒到
+            client.write(pkt.subarray(0, 1));
+            await new Promise((r) => setTimeout(r, 25));
+            assert.equal(mockBroker.receivedPublishes.length, 0, 'Fixed Header 不完整時絕不可提前解析');
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 1, '第 1 個 byte 必須保留在該 Socket 的 receiveBuffer 中');
+
+            // Chunk 2: 送出剩餘 bytes
+            client.write(pkt.subarray(1));
+            const publishes = await mockBroker.waitForPublishCount(1);
+            assert.equal(publishes.length, 1);
+            assert.equal(publishes[0].topic, topic);
+            assert.deepEqual(publishes[0].payload, payload);
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 0);
+        } finally {
+            if (client && !client.destroyed) client.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-20 — MQTT Mock Broker Stream Parser Test C (Split Multi-Byte Remaining Length): 將多 byte (2-byte 與 3-byte) Remaining Length 編碼拆成多次傳輸，確認正確累積與解析', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client = null;
+        try {
+            client = await connectRawBrokerClient(mockBroker);
+            const topic = 'msh/TW/2/e/MediumFast/!gw_test_c';
+            // 建立 > 16384 bytes (約 18KB) 的 Payload，強制觸發 3-byte MQTT Remaining Length 編碼
+            const largePayload = Buffer.alloc(18000, 0x5a);
+            const pkt = buildMqttPublishPacket(topic, largePayload, 4);
+
+            // pkt[0] = 0x30, pkt[1..3] = 3-byte Remaining Length (pkt[1] 與 pkt[2] 的最高位 bit 7 皆為 1)
+            assert.ok((pkt[1] & 0x80) !== 0 && (pkt[2] & 0x80) !== 0 && (pkt[3] & 0x80) === 0, '必須為 3-byte Remaining Length');
+
+            // 分別逐 byte 傳送 Fixed Header + Remaining Length 的前 2 個 byte
+            client.write(pkt.subarray(0, 2)); // 0x30 + remLen byte 1
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(mockBroker.receivedPublishes.length, 0, 'Remaining Length 第 1 byte 尚未結束時不得提前解析');
+
+            client.write(pkt.subarray(2, 3)); // remLen byte 2 (仍有 continuation bit)
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(mockBroker.receivedPublishes.length, 0, 'Remaining Length 第 2 byte 尚未結束時不得提前解析');
+
+            client.write(pkt.subarray(3, 4)); // remLen byte 3 (完成 Remaining Length，但 Body 尚未到)
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(mockBroker.receivedPublishes.length, 0, 'Body 尚未到達時不得提前解析');
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 4);
+
+            // 傳送剩餘 Body
+            client.write(pkt.subarray(4));
+            const publishes = await mockBroker.waitForPublishCount(1);
+            assert.equal(publishes.length, 1);
+            assert.equal(publishes[0].topic, topic);
+            assert.equal(publishes[0].payload.length, largePayload.length);
+            assert.deepEqual(publishes[0].payload, largePayload);
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 0);
+        } finally {
+            if (client && !client.destroyed) client.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-21 — MQTT Mock Broker Stream Parser Test D (Split Payload Across Chunks): 先傳送 Header 與部分 Payload，再分批傳送剩餘 Payload，確認最終訊息正確', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client = null;
+        try {
+            client = await connectRawBrokerClient(mockBroker);
+            const topic = 'msh/TW/2/e/MediumFast/!gw_test_d';
+            const payload = Buffer.from('CHUNK_1_DATA::CHUNK_2_DATA::CHUNK_3_FINAL_PAYLOAD', 'utf8');
+            const pkt = buildMqttPublishPacket(topic, payload, 4);
+
+            const cut1 = 8; // Header + 部分 Topic
+            const cut2 = Math.floor(pkt.length * 0.5);
+            const cut3 = Math.floor(pkt.length * 0.8);
+
+            client.write(pkt.subarray(0, cut1));
+            await new Promise((r) => setTimeout(r, 15));
+            assert.equal(mockBroker.receivedPublishes.length, 0);
+
+            client.write(pkt.subarray(cut1, cut2));
+            await new Promise((r) => setTimeout(r, 15));
+            assert.equal(mockBroker.receivedPublishes.length, 0);
+
+            client.write(pkt.subarray(cut2, cut3));
+            await new Promise((r) => setTimeout(r, 15));
+            assert.equal(mockBroker.receivedPublishes.length, 0);
+
+            client.write(pkt.subarray(cut3));
+            const publishes = await mockBroker.waitForPublishCount(1);
+            assert.equal(publishes.length, 1);
+            assert.equal(publishes[0].topic, topic);
+            assert.deepEqual(publishes[0].payload, payload);
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 0);
+        } finally {
+            if (client && !client.destroyed) client.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-22 — MQTT Mock Broker Stream Parser Test E (Multiple Complete Packets Coalesced): 一次傳送三個合併到達的完整 MQTT 封包，確認依序解析全部訊息', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client = null;
+        try {
+            client = await connectRawBrokerClient(mockBroker);
+            const pkt1 = buildMqttPublishPacket('msh/TW/pkt1', Buffer.from('PAYLOAD_ONE', 'utf8'), 4);
+            const pkt2 = buildMqttPublishPacket('msh/TW/pkt2', Buffer.from('PAYLOAD_TWO', 'utf8'), 4);
+            const pkt3 = buildMqttPublishPacket('msh/TW/pkt3', Buffer.from('PAYLOAD_THREE', 'utf8'), 4);
+
+            // 將 3 個完整 MQTT PUBLISH 封包合併為單一 Buffer 一次寫入
+            client.write(Buffer.concat([pkt1, pkt2, pkt3]));
+            const publishes = await mockBroker.waitForPublishCount(3);
+            assert.equal(publishes.length, 3);
+            assert.deepEqual(publishes.map((p) => p.topic), ['msh/TW/pkt1', 'msh/TW/pkt2', 'msh/TW/pkt3']);
+            assert.deepEqual(
+                publishes.map((p) => p.payload.toString('utf8')),
+                ['PAYLOAD_ONE', 'PAYLOAD_TWO', 'PAYLOAD_THREE']
+            );
+            assert.equal(mockBroker.getSocketBufferLengths()[0].bufferedBytes, 0);
+        } finally {
+            if (client && !client.destroyed) client.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-23 — MQTT Mock Broker Stream Parser Test F (Complete Packet + Trailing Incomplete Packet, Multi-Socket Isolation & Close Cleanup): 驗證完整封包加半筆未完成封包、不同 Socket 緩衝隔離與關閉清理', async () => {
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        let client1 = null;
+        let client2 = null;
+        try {
+            client1 = await connectRawBrokerClient(mockBroker);
+            client2 = await connectRawBrokerClient(mockBroker);
+
+            const pkt1 = buildMqttPublishPacket('msh/TW/s1/first', Buffer.from('S1_FIRST_COMPLETE', 'utf8'), 4);
+            const pkt2 = buildMqttPublishPacket('msh/TW/s1/second', Buffer.from('S1_SECOND_SPLIT_ACROSS_CHUNKS', 'utf8'), 4);
+            const pkt2Half = Math.floor(pkt2.length / 2);
+
+            // Client 1 一次傳送：完整 pkt1 + 半個 pkt2
+            client1.write(Buffer.concat([pkt1, pkt2.subarray(0, pkt2Half)]));
+            await mockBroker.waitForPublishCount(1);
+
+            assert.equal(mockBroker.receivedPublishes.length, 1, '已完成的第一筆封包應立即被解析');
+            assert.equal(mockBroker.receivedPublishes[0].topic, 'msh/TW/s1/first');
+
+            // 檢查 Client 1 的 receiveBuffer 精確保留 pkt2 前半段，且 Client 2 的 receiveBuffer 為 0
+            const bufStatesMid = mockBroker.getSocketBufferLengths();
+            assert.equal(bufStatesMid.length, 2, '應有 2 個獨立的 Socket 緩衝狀態');
+            const s1State = bufStatesMid.find((s) => s.bufferedBytes > 0);
+            const s2State = bufStatesMid.find((s) => s.bufferedBytes === 0);
+            assert.ok(s1State, 'Client 1 必須保留未完成封包之剩餘 bytes');
+            assert.equal(s1State.bufferedBytes, pkt2Half);
+            assert.ok(s2State, 'Client 2 的 receiveBuffer 必須完全獨立為 0');
+
+            // 此時 Client 2 傳送自己的完整封包，不得與 Client 1 的半包混在一起
+            const pktClient2 = buildMqttPublishPacket('msh/TW/s2/independent', Buffer.from('CLIENT2_ISOLATED_MSG', 'utf8'), 4);
+            client2.write(pktClient2);
+            await mockBroker.waitForPublishCount(2);
+            assert.equal(mockBroker.receivedPublishes[1].topic, 'msh/TW/s2/independent');
+            assert.equal(mockBroker.receivedPublishes[1].payload.toString('utf8'), 'CLIENT2_ISOLATED_MSG');
+
+            // Client 1 傳送 pkt2 後半段，完成解析
+            client1.write(pkt2.subarray(pkt2Half));
+            await mockBroker.waitForPublishCount(3);
+            assert.equal(mockBroker.receivedPublishes[2].topic, 'msh/TW/s1/second');
+            assert.equal(mockBroker.receivedPublishes[2].payload.toString('utf8'), 'S1_SECOND_SPLIT_ACROSS_CHUNKS');
+
+            // 關閉 Client 1 與 Client 2，驗證連線關閉時清理對應 Socket 的緩衝狀態
+            client1.destroy();
+            client2.destroy();
+            await new Promise((r) => setTimeout(r, 30));
+            assert.equal(mockBroker.getActiveSocketCount(), 0, 'Socket 關閉後必須清理所有對應緩衝狀態');
+        } finally {
+            if (client1 && !client1.destroyed) client1.destroy();
+            if (client2 && !client2.destroyed) client2.destroy();
+            await mockBroker.close();
+        }
+    });
+
+    it('Test 4.0.2-24 — MQTT Mock Broker Stream Parser Test G (Abnormal Remaining Length & Buffer Size Limit Protection): 驗證異常 5-byte Remaining Length 與超限封包會受到保護並清理緩衝', async () => {
+        const mockBroker = await startLocalMockMqttBroker({
+            usePipe: true,
+            maxRemainingLength: 1024, // 限制最大 Remaining Length 為 1KB
+            maxBufferSize: 1536       // 限制單一 Socket 最大緩衝區為 1.5KB
+        });
+        let badClient1 = null;
+        let badClient2 = null;
+        let badClient3 = null;
+        let goodClient = null;
+        try {
+            // Case G-1: 超過 MQTT 標準 4-byte 上限的非法 Remaining Length (連續 5 個 continuation bit=1 的 bytes)
+            badClient1 = await connectRawBrokerClient(mockBroker);
+            badClient1.write(Buffer.from([0x30, 0x80, 0x80, 0x80, 0x80, 0x01]));
+            await new Promise((r) => setTimeout(r, 30));
+            assert.ok(
+                mockBroker.protocolErrors.some((e) => e.reason === 'MALFORMED_REMAINING_LENGTH_VARINT'),
+                '必須攔截並記錄超過 4 bytes 的非法 Remaining Length 編碼'
+            );
+
+            // Case G-2: 合法 varint 但宣告的 Remaining Length (例如 4096 bytes) 超出 Broker 設定上限 (1024 bytes)
+            badClient2 = await connectRawBrokerClient(mockBroker);
+            const declared4KBHeader = Buffer.concat([
+                Buffer.from([0x30]),
+                encodeMqttRemainingLength(4096),
+                Buffer.from([0x00, 0x04, 0x74, 0x65, 0x73, 0x74])
+            ]);
+            badClient2.write(declared4KBHeader);
+            await new Promise((r) => setTimeout(r, 30));
+            assert.ok(
+                mockBroker.protocolErrors.some((e) => e.reason === 'REMAINING_LENGTH_EXCEEDS_LIMIT'),
+                '必須攔截並記錄超出 maxRemainingLength 的封包'
+            );
+
+            // Case G-3: 持續傳送超出 maxBufferSize 的大量不完整資料
+            badClient3 = await connectRawBrokerClient(mockBroker);
+            badClient3.write(Buffer.alloc(2048, 0xaa));
+            await new Promise((r) => setTimeout(r, 30));
+            assert.ok(
+                mockBroker.protocolErrors.some((e) => e.reason === 'MAX_BUFFER_SIZE_EXCEEDED'),
+                '必須攔截並記錄超出 maxBufferSize 的緩衝區溢位嘗試'
+            );
+
+            // 確認異常連線皆已被關閉並釋放緩衝區，且不影響後續正常 Client 運作
+            assert.equal(mockBroker.getActiveSocketCount(), 0, '異常 Socket 關閉後緩衝狀態應全數釋放');
+
+            goodClient = await connectRawBrokerClient(mockBroker);
+            const validPkt = buildMqttPublishPacket('msh/TW/good', Buffer.from('STILL_HEALTHY', 'utf8'), 4);
+            goodClient.write(validPkt);
+            const publishes = await mockBroker.waitForPublishCount(1);
+            assert.equal(publishes.length, 1);
+            assert.equal(publishes[0].topic, 'msh/TW/good');
+            assert.equal(publishes[0].payload.toString('utf8'), 'STILL_HEALTHY');
+        } finally {
+            for (const c of [badClient1, badClient2, badClient3, goodClient]) {
+                if (c && !c.destroyed) c.destroy();
+            }
+            await mockBroker.close();
         }
     });
 });

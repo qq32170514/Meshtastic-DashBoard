@@ -285,16 +285,24 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
    - 交易進行中（`COMMIT` 完成前）僅執行 SQLite 寫入語句，**絕不**在交易內提前觸發 `batchEmit`、`recordLivePacketAnalytics` 或成功回呼。
    - 僅當該封包所屬交易 `COMMIT` 成功後，[`executePacketTransactionPlan()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js#L497-L611) 才依序執行 `logger.log`、`recordLivePacketAnalytics`、`batchEmit` 與 caller `callback`。
    - **每個 post-commit effect 皆具備獨立 `try/catch` 保護**：單一 `logger.log`、`recordLivePacketAnalytics` 或 `batchEmit` 拋出例外時，由 `reportPostCommitHookError()` 記錄 `[POST_COMMIT_HOOK_ERROR]` 並附掛於 `result.postCommitErrors`，不會阻止其他 post-commit effects 或 caller `callback` 執行；已 COMMIT 成功的交易不會被誤判為交易失敗，且 caller `callback` 透過 `invokeCallerCallbackOnce` 維持 `exactly-once`。
-4. **Turso Fallback 多語句順序執行與限制說明（P1 修正）**：
-   - 當系統處於 `TURSO_URL` 分支（無 `db.queuePacketTransaction` 與 `db.queueDbOp`）時，[`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L546-L675) 的 `queuePacketTransaction()` 與 `flushDbQueue()` 透過 [`executeSequentialFallbackItem()`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js#L623-L735) 辨識 `item.isTransactionUnit`，並按照 `item.statements` 陣列原始順序逐一執行每條 SQL（絕不把 `options.label` 當成 SQL 執行，也不會在第一條 SQL 後就回報成功）。
-   - 若中途任一條 SQL 失敗，立即停止後續 SQL、透過 callback 回報錯誤（附帶 `failedStatementIndex` 與 `failedStatementSql`），且不執行成功的 post-commit effects。
+4. **Turso Fallback 實際隊列入口、多語句順序執行與限制說明（P1 修正）**：
+   - 當系統處於 `TURSO_URL` 分支（無 Local SQLite 之 `db.queuePacketTransaction` 與 `db.queueDbOp`）時，[`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L502-L526) 與測試共同使用 [`src/database/packet-transaction.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js#L756-L993) 匯出的 `createTursoDbWrapper(client)` 與 `createSequentialFallbackQueueController(...)`。
+   - 完整調度鏈路：`queuePacketTransaction() / queueDbOp() -> dbQueue -> flushDbQueue() -> executeSequentialFallbackItem()`。
+   - `queuePacketTransaction()` 建立 `isTransactionUnit: true` 的交易單位進入實際 `dbQueue`；`flushDbQueue()` 辨識 `item.isTransactionUnit` 並按照 `item.statements` 陣列原始順序逐一執行每條 SQL（絕不把 `options.label` 當成 SQL 執行，也不會在第一條 SQL 後就提前回報成功）。
+   - 當同一個 `dbQueue` 中混合一般單筆 `queueDbOp()` 與多語句 `queuePacketTransaction()` 時，嚴格維持 FIFO 執行順序與各自獨立的 `exactly-once` callback 行為。
+   - 若中途任一條 SQL 失敗，立即停止該交易單位後續 SQL、透過 callback 回報錯誤一次（附帶 `failedStatementIndex`、`failedStatementSql`、`transactionLabel`），且不執行成功的 post-commit effects，同時不破壞佇列中後續獨立項目的執行。
    - **誠實語意限制**：Turso fallback 僅提供多語句順序執行與中斷回報，**不具備 Local SQLite Adapter 的單連線原子交易回滾保證**。
+5. **Backup Scheduler Policy 共用政策函式（4.0.2 收尾強化）**：
+   - [`src/database/backup-manager.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L2072-L2120) 匯出 `APP_BACKUP_CRON_EXPRESSION ('0 0 * * 0')`、`createAppBackupSchedulePolicy(dbTarget, envSource)` 與 `registerAppBackupSchedule(dbTarget, cronLib, envSource)`，並由 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L4352-L4354) 與測試直接共用同一份實作。
+   - 每次排程觸發皆動態評估當下 `envSource.BACKUP_PATH` 與 `dbTarget.isBootstrapReady()`，不快取初始化舊狀態，並保留既有 `'0 0 * * 0'` 排程設定。
+6. **`package.json` 與 `package-lock.json` 版本 Metadata 同步**：
+   - 根目錄 `package.json` 與 `package-lock.json`（含 `packages[""]`）統一對齊為 `3.1.0`；`frontend/package.json` 與 `frontend/package-lock.json`（含 `packages[""]`）亦統一對齊為 `3.1.0`，且保留 `sqlite3 ^5.1.6` 與既有依賴鎖定版本不變。
 
 ---
 
-## 6. 測試驗證矩陣（共 90 項 `it()` 測試案例）
+## 6. 測試驗證矩陣（共 97 項 `it()` 測試案例）
 
-### 6.1 [`tests/database/packet_transaction_4_0_2.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（17 項 4.0.2 `it()` 測試案例）
+### 6.1 [`tests/database/packet_transaction_4_0_2.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（24 項 4.0.2 `it()` 測試案例）
 
 | 測試編號與名稱 | 測試性質 | 驗證重點 |
 |---|---|---|
@@ -309,12 +317,19 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test 4.0.2-9 — Concurrent Packet Transactions, Concurrent Reads & Online Backup** | 真實 SQLite 併發寫入 + 讀取 + `VACUUM INTO` 備份測試 | 32 個跨表封包交易併發執行期間，同時進行持續讀取查詢與 `BackupManager.performBackup()`，驗證併發讀取與產出的備份 DB 檔案皆可正常開啟、`PRAGMA integrity_check === 'ok'`，且 `nodes`、`packet_logs`、`telemetry_data` 筆數完全一致（無部分交易資料）。 |
 | **Test 4.0.2-10 — Shutdown Active Packet Transaction Drain** | 真實 SQLite 交易進行中延遲 + `ShutdownHandler` 排空測試 | 讓第 1 筆封包交易在第 2 條 SQL 處延遲 120ms 保持 In-Flight 並排入第 2 筆交易，期間觸發 `ShutdownHandler.handle('SIGTERM')`，驗證系統等待進行中與排隊交易完成 `COMMIT` 與 callback 後才呼叫 `adapter.close()`，重開後兩筆交易完整存在。 |
 | **Test 4.0.2-11 — Unknown Node Pre-NODEINFO Arrival & COALESCE / RF Tunnel Semantics** | 真實 SQLite 業務相容性回歸測試 | 驗證未知節點在收到 `NODEINFO` 前先收到 `POSITION` 與兩筆互補 `TELEMETRY` 時，`COALESCE` 更新、`NODEINFO` 補齊與 RF Tunnel 更新完全相容。 |
-| **Test 4.0.2-12 — Turso Fallback Sequential Multi-Statement Execution (P1)** | 隔離 Mock Turso Fallback 單元與整合測試 | 使用隔離 Mock `@libsql/client` 驗證 Turso fallback 依序執行全部 4 條 SQL、不將 `label` 當 SQL 執行、不在第 1 條後回報成功、中途第 2 條 SQL 失敗時立即停止第 3/4 條並回報錯誤且不執行成功副作用，同時相容一般單筆 SQL 寫入。 |
-| **Test 4.0.2-13 — Backup Schedule & TURSO_URL Policy Verification** | 排程守門與設定策略驗證測試 | 驗證 `sqlite.config.js` (`'0 4 * * *'`) 與 `index.js` (`'0 0 * * 0'`) 現況，以及 `BACKUP_PATH` 未設定時 `shouldRun()` 回傳 `false`、設定且 Bootstrap 完成時回傳 `true`。 |
+| **Test 4.0.2-12 — Turso Actual Queue Entry & Flush Path (`queuePacketTransaction -> dbQueue -> flushDbQueue -> executeSequentialFallbackItem`)** | 共用 Turso 佇列調度器與混合佇列整合測試 | 直接使用與 `index.js` 共用的 `createTursoDbWrapper` 與 `createSequentialFallbackQueueController`，驗證無 Local SQLite `queuePacketTransaction` 時進入實際 `dbQueue`、`flushDbQueue()` 辨識 `isTransactionUnit`、按陣列順序執行全部 4 條 SQL、不將 `label` 當成 SQL、中段失敗立即中止後續語句且不執行成功副作用、Callback 皆為 `exactly-once`，以及同一個 `dbQueue` 混合一般 `queueDbOp` 與多語句 `queuePacketTransaction` 時嚴格保持 FIFO 順序與各自 callback 行為。 |
+| **Test 4.0.2-13 — Backup Scheduler Policy Shared Function Verification** | 共用排程政策函式 + 真實 SQLite 備份觸發測試 | 直接呼叫與 `index.js` 共用的 `registerAppBackupSchedule` / `createAppBackupSchedulePolicy`，完整驗證情境 A（無 `BACKUP_PATH` 不執行 `performBackup`）、情境 B（有 `BACKUP_PATH` 但 Schema 未就緒不執行備份）、情境 C（有 `BACKUP_PATH` 且 Bootstrap Ready 正常觸發產生 `.db` 備份檔）與情境 D（Bootstrap Ready 狀態動態變化時每次排程觸發皆使用當下最新狀態）。 |
 | **Test 4.0.2-14 — SQLite WAL Process Death Recovery Test (SIGKILL)** | **原生 SQLite WAL 引擎跨程序 `SIGKILL` 測試** | 透過 `sigkill_tx_worker.js` 原生 `sqlite3` 模式驗證 `BEFORE_TX`、`MID_TX_UNCOMMITTED`（寫入 4 表未 `COMMIT`）、`AFTER_COMMIT` 遭遇 `SIGKILL` 後之 SQLite WAL 自動回滾與恢復。 |
 | **Test 4.0.2-15 — Application Packet Transaction Process Death Test (SIGKILL)** | **專案 `WriteQueue` + `PacketTransaction` 跨程序 `SIGKILL` 測試** | 透過 `sigkill_tx_worker.js` 啟動真實 `createDatabaseSubsystem` + `WriteQueue` + `executePacketTransactionPlan`，在 `TELEMETRY_APP` 執行完前 3 條 SQL 但尚未執行第 4 條與 `COMMIT` 時發送 `SIGKILL`，驗證重開後未提交封包在 `nodes`、`packet_logs`、`telemetry_data` 皆為 0 殘留，而已 `COMMIT` 封包完整保留。 |
 | **Test 4.0.2-16 — Full index.js Startup, Real Wire-Level MQTT Broker PUBLISH & Graceful Shutdown** | **真實 `index.js` 子程序 + 本機測試 Broker Wire-Level `PUBLISH` 測試** | 啟動真實 `index.js` 子程序連入本機測試 MQTT Broker（完成真實 `CONNECT -> CONNACK -> SUBSCRIBE -> SUBACK` 握手），由 Broker 發送真實 Wire-Level MQTT `PUBLISH (0x30)` 二進位 `ServiceEnvelope` 封包，驗證啟動屏障順序、封包跨表寫入與優雅關機。 |
 | **Test 4.0.2-17 — Schema Bootstrap Failure Blocks Service Startup** | 真實 `index.js` 子程序啟動屏障失敗中止測試 | 預先植入定義錯誤的索引 `idx_packet_logs_timestamp`，驗證 `index.js` 檢出 `[FATAL_BOOTSTRAP_ERROR]` 後以 Exit Code `1` 終止，且絕不啟動 HTTP 或 MQTT 服務。 |
+| **Test 4.0.2-18 — MQTT Mock Broker Stream Parser Test A (Complete Packet Single Arrival)** | 本機 Mock MQTT Broker 串流解析測試 | 驗證正常 MQTT `PUBLISH` 封包單次完整到達時正確解析 Topic 與 Payload，且解析後該 Socket `receiveBuffer` 歸零。 |
+| **Test 4.0.2-19 — MQTT Mock Broker Stream Parser Test B (Split Fixed Header)** | 本機 Mock MQTT Broker 拆包解析測試 | 將 MQTT Fixed Header（`0x30` 與 Remaining Length）拆成不同 chunks 傳送，確認未收齊前不會提前解析，收齊後正確還原。 |
+| **Test 4.0.2-20 — MQTT Mock Broker Stream Parser Test C (Split Multi-Byte Remaining Length)** | 本機 Mock MQTT Broker 多位元組長度拆包測試 | 使用 18KB Payload 產生 3-byte Remaining Length 並逐 byte 拆開傳送，確認 `receiveBuffer` 正確累積並解碼多位元組 Remaining Length。 |
+| **Test 4.0.2-21 — MQTT Mock Broker Stream Parser Test D (Split Payload Across Chunks)** | 本機 Mock MQTT Broker Payload 分段到達測試 | 先傳送 Header 與部分 Topic/Payload，再分 3 個 chunks 傳送剩餘 Payload，確認完整到達後正確還原訊息。 |
+| **Test 4.0.2-22 — MQTT Mock Broker Stream Parser Test E (Multiple Complete Packets Coalesced)** | 本機 Mock MQTT Broker 黏包解析測試 | 將 3 個完整 MQTT `PUBLISH` 封包合併為單一 chunk 一次寫入，確認依序完整解析全部 3 筆訊息。 |
+| **Test 4.0.2-23 — MQTT Mock Broker Stream Parser Test F (Complete + Incomplete Packet, Multi-Socket Isolation & Close Cleanup)** | 本機 Mock MQTT Broker 複合緩衝與多連線隔離測試 | 一次傳送「完整第 1 包 + 未完成第 2 包前半段」，確認第 1 包立即解析、第 2 包保留於該 Socket 獨立 `receiveBuffer`、另一條並發 Socket 傳送不受干擾、補齊第 2 包後半段後正常解析，且連線關閉時徹底清除對應 Socket 緩衝狀態。 |
+| **Test 4.0.2-24 — MQTT Mock Broker Stream Parser Test G (Abnormal Remaining Length & Buffer Size Limit Protection)** | 本機 Mock MQTT Broker 異常長度與記憶體上限保護測試 | 驗證 5-byte 非法 Remaining Length varint、超過 `maxRemainingLength` 的封包宣告，以及超過 `maxBufferSize` 的資料湧入均被立即攔截記錄於 `protocolErrors`、清空該 Socket 緩衝並關閉異常連線，不影響其他正常連線。 |
 
 ### 6.2 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（27 項 4.0.1 – 4.0.1.4 `it()` 測試案例，Tests A – AA）
 | **Test L — Backup Restore Verification** | 真實 SQLite End-to-End Backup & Restore Test | 對真實臨時 DB 備份後，呼叫 `restoreFromBackup(..., { offlineConfirmed: true })` 還原至第二個獨立臨時 DB，並以新 `createDatabaseSubsystem` 開啟驗證資料一致性與後續讀寫。 |
@@ -339,5 +354,5 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 
 ### 6.4 測試邊界與環境限制誠實聲明
 - **SQLite WAL Process Death Test (`Test 4.0.2-14`) vs. Application Packet Transaction Process Death Test (`Test 4.0.2-15`)**：`Test 4.0.2-14` 直接使用 `sqlite3` 驗證 SQLite WAL 引擎在程序被強制終止後的回滾能力；`Test 4.0.2-15` 則透過專案 `createDatabaseSubsystem` + `WriteQueue` + `executePacketTransactionPlan` 驗證應用程式封包交易在中段（已執行 3/4 條 SQL）與 `COMMIT` 後遭遇 `SIGKILL` 的恢復行為。兩者皆屬**跨程序異常終止 (`SIGKILL`) 測試，不等同於實體主機斷電（Power Loss）、作業系統核心崩潰（Kernel Panic）或磁碟硬體扇區損毀測試**。
-- **本機測試 Broker Wire-Level MQTT 傳輸 (`Test 4.0.2-16`)**：使用本機 `net.Server` 測試 Broker（於 Windows 環境透過 Named Pipe 避免沙盒阻擋 Loopback TCP）完成真實 MQTT `CONNECT -> CONNACK -> SUBSCRIBE -> SUBACK` 並發送 Wire-Level `PUBLISH (0x30)` 封包，不連接外部正式環境 MQTT Broker。
-- **正式環境零接觸**：全部 **90 項 `it()` 測試**（`46 + 27 + 17 = 90`）均於 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫執行，並於測試結束後完整清除，完全不讀取、不修改、不壓測正式環境 `d:\meshtastic\Meshtastic-DashBoard-Prod`。
+- **本機測試 Broker Wire-Level MQTT 傳輸與 Stream Parser (`Test 4.0.2-16` & `Test 4.0.2-18 ~ 24`)**：使用本機 `net.Server` 測試 Broker（於 Windows 環境透過 Named Pipe 避免沙盒阻擋 Loopback TCP），為每個 Socket 維護獨立 `receiveBuffer`、多位元組 MQTT Remaining Length 解碼、拆包/黏包重組與超限記憶體保護，完成真實 MQTT `CONNECT -> CONNACK -> SUBSCRIBE -> SUBACK` 並發送 Wire-Level `PUBLISH (0x30)` 封包，不連接外部正式環境 MQTT Broker。
+- **正式環境零接觸**：全部 **97 項 `it()` 測試**（`46 + 27 + 24 = 97`）均於 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫執行，並於測試結束後完整清除，完全不讀取、不修改、不壓測正式環境 `d:\meshtastic\Meshtastic-DashBoard-Prod`。

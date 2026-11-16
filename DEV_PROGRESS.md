@@ -133,25 +133,28 @@
 - **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成並強化 4.0.2 資料庫封包交易可靠性與全套實證測試：
   1. **Packet Transaction Boundary**：將單一邏輯封包的跨表 SQLite 寫入合併為不可拆分的原子交易單位，確保全部成功才 `COMMIT`、任一失敗整包 `ROLLBACK`、二元隔離不拆開單一封包語句，且外部副作用僅於 `COMMIT` 成功後執行。
   2. **P1 — 修正 `UNKNOWN` 錯誤被誤送入 Binary Isolation**：嚴格規定僅 `ERROR_TYPES.DATA_CONSTRAINT` 可進入 `_binaryIsolateBatch()`；`ERROR_TYPES.UNKNOWN`（如 SQL 語法錯誤、欄位或資料表不存在等 `SQLITE_ERROR`）絕不進入 Binary Isolation 或被標記為 `QUARANTINED`，而是觸發 `handleAdapterFatalError(err)`、將 `WriteQueue` 轉入 `PAUSED_ERROR`、將該批次未提交項目設為 `UNCOMMITTED_ERROR`，並完整保留 `failedStatementIndex`、`failedStatementSql`、`errorType` 與 `transactionLabel` 診斷資訊。
-  3. **P1 — 修正 Turso 分支 Packet Transaction Fallback**：當 `db.queuePacketTransaction` 與 `db.queueDbOp` 皆不存在時（如設定 `TURSO_URL` 之分支），`queuePacketTransaction()` 與 `flushDbQueue()` 透過 `executeSequentialFallbackItem()` 辨識 `isTransactionUnit`，依陣列順序逐一執行全部 `statements`（絕不將 `options.label` 當作 SQL，亦不在第一筆 SQL 完成後就提前回報成功）；任一筆失敗時立即停止後續語句、跳過全部 Post-commit 副作用並僅回報一次錯誤；僅在全部語句成功後才執行 Post-commit 副作用與 `callback(null)`（並誠實區分本地 SQLite 具備單一連線原子 `ROLLBACK` 保證，而 Turso fallback 為依序多語句執行、不具備本地 SQLite 之原子回滾保證）。
+  3. **P1 — 修正 Turso 分支 Packet Transaction Fallback 與共用佇列調度器**：當 `db.queuePacketTransaction` 與 `db.queueDbOp` 皆不存在時（如設定 `TURSO_URL` 之分支），`index.js` 與測試透過共用的 `createTursoDbWrapper()` 及 `createSequentialFallbackQueueController()` 執行完整鏈路 `queuePacketTransaction() / queueDbOp() -> dbQueue -> flushDbQueue() -> executeSequentialFallbackItem()`，辨識 `isTransactionUnit` 並依陣列順序逐一執行全部 `statements`（絕不將 `options.label` 當作 SQL，亦不在第一筆 SQL 完成後就提前回報成功）；任一筆失敗時立即停止後續語句、跳過全部 Post-commit 副作用並僅回報一次錯誤；支援同一佇列混合一般 `queueDbOp` 與多語句封包交易並嚴格保持 FIFO 順序（誠實區分本地 SQLite 具備單一連線原子 `ROLLBACK` 保證，而 Turso fallback 為依序多語句執行、不具備本地 SQLite 之原子回滾保證）。
   4. **P2 — 修正 Post-Commit Hook 例外導致呼叫端 Callback 遺失**：於 `executePacketTransactionPlan()` 中將 `logger.log`、`recordLivePacketAnalytics` 與每筆 `batchEmit` 呼叫分別獨立包覆 `try/catch`（`reportPostCommitHookError`）及單次保護 `invokeCallerCallbackOnce`，確保任一 Hook 拋出例外時記錄 `[POST_COMMIT_HOOK_ERROR]` 並附加於 `result.postCommitErrors`，絕不阻斷其他副作用、絕不把已提交成功的交易覆蓋為交易失敗（`err === null`），且保證呼叫端 `callback` 具備 `exactly-once` 語意。
-  5. **強化封包交易與跨程序整合測試（共 17 項 4.0.2 專屬 `it()` 測試）**：涵蓋 4 語句第 3 筆失敗回滾、RF Tunnel 第 2 筆失敗回滾、`DATA_CONSTRAINT` 二元隔離、`UNKNOWN` 致命暫停、高併發寫入+持續讀取+線上 `VACUUM INTO` 備份、進行中交易關機排空、Post-commit 時序與 Hook 異常隔離、Mock Turso 依序執行成功與中段失敗、雙層 `SIGKILL` 測試（`SQLite WAL Process Death Recovery Test` 與經過 `WriteQueue` + `executePacketTransactionPlan` 之 `Application Packet Transaction Process Death Test`），以及透過本機真實 TCP/Pipe Mock MQTT Broker 發送二進位 `PUBLISH (0x30)` 封包的 `index.js` 子程序端到端測試。
+  5. **共用 Backup Scheduler Policy、MQTT Mock Broker Stream Parser 與版本 Metadata 同步（共 24 項 4.0.2 專屬 `it()` 測試）**：
+     - 抽取 `index.js` 與測試共用的 `createAppBackupSchedulePolicy()` 與 `registerAppBackupSchedule()`（維持 `'0 0 * * 0'`），驗證情境 A/B/C/D。
+     - 為本機測試 MQTT Broker 實作每個 Socket 獨立的 `receiveBuffer`、MQTT 多位元組 Remaining Length 解碼、拆包/黏包重組、關閉清理與超限記憶體保護，並新增 7 項 Stream Parser 專屬測試（`Test 4.0.2-18` 至 `Test 4.0.2-24`，對應 Tests A–G）。
+     - 同步 `package.json` / `package-lock.json`（及 `frontend/package-lock.json`）根套件版本 metadata 為 `3.1.0`。
 - **新增與修改模組**：
   - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
     - 新增 `enqueuePacketTransaction(statements, callback, options)` 並擴充 `enqueue()` 支援多語句封包交易單位（`isTransactionUnit: true`、`statements: [...]`）。
     - 於 `_commitOrIsolate(batch)` 中在同一個 `adapter.transaction(async (tx) => ...)` 內依序執行封包單位之全部語句；失敗時區分 `ERROR_TYPES.DATA_CONSTRAINT`（進入 `_binaryIsolateBatch` 整包隔離）與 `ERROR_TYPES.UNKNOWN`（呼叫 `handleAdapterFatalError` 並轉入 `PAUSED_ERROR`，標記 `UNCOMMITTED_ERROR`）。
   - [packet-transaction.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js)：
-    - 實作 `buildMqttPacketTransactionPlan(context)`、`buildRfTunnelPacketTransactionPlan(context)`、`executePacketTransactionPlan(plan, hooks, callback)` 與 `executeSequentialFallbackItem(dbTarget, item, onSuccess, onError)`。
+    - 實作 `buildMqttPacketTransactionPlan(context)`、`buildRfTunnelPacketTransactionPlan(context)`、`executePacketTransactionPlan(plan, hooks, callback)`、`executeSequentialFallbackItem(dbTarget, item, onItemDone)`、`createTursoDbWrapper(client)` 與 `createSequentialFallbackQueueController(options)`。
     - 內建 `reportPostCommitHookError()` 與 `invokeCallerCallbackOnce()`，保護交易 `COMMIT` 後的 `logger.log`、`recordLivePacketAnalytics` 與 `batchEmit`（事件名稱為 `'node_seen'`、`'raw_packet'`、`'telemetry_update'`）。
-  - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
-    - 公開 `queuePacketTransaction` 與 `executeSequentialFallbackItem`；修正 `index.js` 中 `TURSO_URL` 分支之 `db.run`/`db.all`/`db.get` 參數正規化與 `flushDbQueue()` 多語句依序執行，並支援 `MQTT_PIPE_PATH` 供本機測試 Broker 連線。
+  - [backup-manager.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js)、[src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
+    - 公開 `createTursoDbWrapper`、`createSequentialFallbackQueueController`、`APP_BACKUP_CRON_EXPRESSION`、`createAppBackupSchedulePolicy` 與 `registerAppBackupSchedule`；`index.js` 直接使用上述共用模組，並支援 `MQTT_PIPE_PATH` 與 `TEST_FLUSH_DB_QUEUE`。
   - [sigkill_tx_worker.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/helpers/sigkill_tx_worker.js) & [packet_transaction_4_0_2.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)：
-    - 擴充 `sigkill_tx_worker.js` 支援 `MID_TX`、`AFTER_COMMIT`、`APP_PACKET_TX_MID_FLIGHT` 與 `APP_PACKET_TX_AFTER_COMMIT` 四種模式；`packet_transaction_4_0_2.test.js` 擴充為 **17 項獨立 `it()` 測試案例（`Test 4.0.2-1` 至 `Test 4.0.2-17`）**。
+    - 擴充 `sigkill_tx_worker.js` 支援 `MID_TX`、`AFTER_COMMIT`、`APP_PACKET_TX_MID_FLIGHT` 與 `APP_PACKET_TX_AFTER_COMMIT` 四種模式；`packet_transaction_4_0_2.test.js` 擴充為 **24 項獨立 `it()` 測試案例（`Test 4.0.2-1` 至 `Test 4.0.2-24`）**。
 - **4.0.2 修改檔案與測試結果**：
-  - 新增與修改檔案：`src/database/write-queue.js`、`src/database/packet-transaction.js`、`src/database/index.js`、`index.js`、`tests/database/helpers/sigkill_tx_worker.js`、`tests/database/packet_transaction_4_0_2.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
-  - 實際測試結果（以 `it()` 測試案例 1 對 1 計算）：`sqlite_reliability.test.js`（46 項）+ `data_integrity_4_0_1.test.js`（27 項）+ `packet_transaction_4_0_2.test.js`（17 項），共 **90 項 `it()` 測試全數通過（90 PASS, 0 FAIL, 0 BLOCKED, 0 NOT TESTED）**。
+  - 新增與修改檔案：`src/database/write-queue.js`、`src/database/packet-transaction.js`、`src/database/backup-manager.js`、`src/database/index.js`、`index.js`、`package-lock.json`、`frontend/package-lock.json`、`tests/database/helpers/sigkill_tx_worker.js`、`tests/database/packet_transaction_4_0_2.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
+  - 實際測試結果（以 `it()` 測試案例 1 對 1 計算）：`sqlite_reliability.test.js`（46 項）+ `data_integrity_4_0_1.test.js`（27 項）+ `packet_transaction_4_0_2.test.js`（24 項），共 **97 項 `it()` 測試全數通過（97 PASS, 0 FAIL, 0 BLOCKED, 0 NOT TESTED）**。
   - 誠實測試邊界說明：`Test 4.0.2-14` 與 `Test 4.0.2-15` 為真實跨程序異常終止（`SIGKILL`）與 WAL 回滾恢復測試，不等同於實體主機斷電（Power Loss）、OS 核心崩潰或磁碟硬體損毀測試；Turso fallback 為依序多語句執行，不具備本地 SQLite 之單一連線原子回滾保證。
-  - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
+  - 當前版本狀態：**`READY FOR PRODUCTION REVIEW`**（注意：未授權前絕不部署或重啟 Production PM2）。
 
 ---
 

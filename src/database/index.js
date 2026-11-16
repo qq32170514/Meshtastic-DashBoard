@@ -2,7 +2,14 @@
 const { SQLiteAdapter, ADAPTER_STATES, AUTH_TYPES } = require('./sqlite.adapter');
 const { WriteQueue, QUEUE_STATES, ITEM_STATUS } = require('./write-queue');
 const { ShutdownHandler } = require('./shutdown-handler');
-const { BackupManager, BACKUP_VERIFY_STATUS, RESTORE_STATUS } = require('./backup-manager');
+const {
+    BackupManager,
+    BACKUP_VERIFY_STATUS,
+    RESTORE_STATUS,
+    APP_BACKUP_CRON_EXPRESSION,
+    createAppBackupSchedulePolicy,
+    registerAppBackupSchedule
+} = require('./backup-manager');
 const {
     REQUIRED_TABLES,
     COLUMN_MIGRATIONS,
@@ -17,7 +24,9 @@ const {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
-    executeSequentialFallbackItem
+    executeSequentialFallbackItem,
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController
 } = require('./packet-transaction');
 const defaultConfig = require('./sqlite.config');
 
@@ -379,8 +388,13 @@ module.exports = {
     BackupManager,
     BACKUP_VERIFY_STATUS,
     RESTORE_STATUS,
+    APP_BACKUP_CRON_EXPRESSION,
+    createAppBackupSchedulePolicy,
+    registerAppBackupSchedule,
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
-    executeSequentialFallbackItem
+    executeSequentialFallbackItem,
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController
 };
