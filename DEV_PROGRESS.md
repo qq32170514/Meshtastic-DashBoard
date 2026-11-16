@@ -129,26 +129,28 @@
 
 ---
 
-### 8. Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Policy Confirmation & Cross-Process Integration Tests (READY FOR REVIEW)
-- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，一次完成三大範圍：(1) **4.0.2 Packet Transaction Boundary**（將單一邏輯封包的跨表 SQLite 寫入合併為不可拆分的原子交易單位，確保全部成功才 `COMMIT`、任一失敗整包 `ROLLBACK`、二元隔離不拆開單一封包語句，且外部副作用僅於 `COMMIT` 成功後執行）；(2) **`TURSO_URL` 分支與備份排程政策確認**（明確盤點 `TURSO_URL` 與本地 SQLite 分支差異，以及 `BACKUP_PATH`、`'0 0 * * 0'` vs. `'0 4 * * *'` 與 `stopSchedule()` 現況）；(3) **跨程序異常終止 (`SIGKILL`) 與完整 `index.js` 子程序啟動整合測試**。
+### 8. Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Classification, Turso Fallback, Post-Commit Protection & Cross-Process Integration Tests (READY FOR REVIEW)
+- **核心目標**：在不更動 SQLite Reliability v2.7.7 核心架構與不碰觸 Production 的前提下，完成並強化 4.0.2 資料庫封包交易可靠性與全套實證測試：
+  1. **Packet Transaction Boundary**：將單一邏輯封包的跨表 SQLite 寫入合併為不可拆分的原子交易單位，確保全部成功才 `COMMIT`、任一失敗整包 `ROLLBACK`、二元隔離不拆開單一封包語句，且外部副作用僅於 `COMMIT` 成功後執行。
+  2. **P1 — 修正 `UNKNOWN` 錯誤被誤送入 Binary Isolation**：嚴格規定僅 `ERROR_TYPES.DATA_CONSTRAINT` 可進入 `_binaryIsolateBatch()`；`ERROR_TYPES.UNKNOWN`（如 SQL 語法錯誤、欄位或資料表不存在等 `SQLITE_ERROR`）絕不進入 Binary Isolation 或被標記為 `QUARANTINED`，而是觸發 `handleAdapterFatalError(err)`、將 `WriteQueue` 轉入 `PAUSED_ERROR`、將該批次未提交項目設為 `UNCOMMITTED_ERROR`，並完整保留 `failedStatementIndex`、`failedStatementSql`、`errorType` 與 `transactionLabel` 診斷資訊。
+  3. **P1 — 修正 Turso 分支 Packet Transaction Fallback**：當 `db.queuePacketTransaction` 與 `db.queueDbOp` 皆不存在時（如設定 `TURSO_URL` 之分支），`queuePacketTransaction()` 與 `flushDbQueue()` 透過 `executeSequentialFallbackItem()` 辨識 `isTransactionUnit`，依陣列順序逐一執行全部 `statements`（絕不將 `options.label` 當作 SQL，亦不在第一筆 SQL 完成後就提前回報成功）；任一筆失敗時立即停止後續語句、跳過全部 Post-commit 副作用並僅回報一次錯誤；僅在全部語句成功後才執行 Post-commit 副作用與 `callback(null)`（並誠實區分本地 SQLite 具備單一連線原子 `ROLLBACK` 保證，而 Turso fallback 為依序多語句執行、不具備本地 SQLite 之原子回滾保證）。
+  4. **P2 — 修正 Post-Commit Hook 例外導致呼叫端 Callback 遺失**：於 `executePacketTransactionPlan()` 中將 `logger.log`、`recordLivePacketAnalytics` 與每筆 `batchEmit` 呼叫分別獨立包覆 `try/catch`（`reportPostCommitHookError`）及單次保護 `invokeCallerCallbackOnce`，確保任一 Hook 拋出例外時記錄 `[POST_COMMIT_HOOK_ERROR]` 並附加於 `result.postCommitErrors`，絕不阻斷其他副作用、絕不把已提交成功的交易覆蓋為交易失敗（`err === null`），且保證呼叫端 `callback` 具備 `exactly-once` 語意。
+  5. **強化封包交易與跨程序整合測試（共 17 項 4.0.2 專屬 `it()` 測試）**：涵蓋 4 語句第 3 筆失敗回滾、RF Tunnel 第 2 筆失敗回滾、`DATA_CONSTRAINT` 二元隔離、`UNKNOWN` 致命暫停、高併發寫入+持續讀取+線上 `VACUUM INTO` 備份、進行中交易關機排空、Post-commit 時序與 Hook 異常隔離、Mock Turso 依序執行成功與中段失敗、雙層 `SIGKILL` 測試（`SQLite WAL Process Death Recovery Test` 與經過 `WriteQueue` + `executePacketTransactionPlan` 之 `Application Packet Transaction Process Death Test`），以及透過本機真實 TCP/Pipe Mock MQTT Broker 發送二進位 `PUBLISH (0x30)` 封包的 `index.js` 子程序端到端測試。
 - **新增與修改模組**：
   - [write-queue.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js)：
     - 新增 `enqueuePacketTransaction(statements, callback, options)` 並擴充 `enqueue()` 支援多語句封包交易單位（`isTransactionUnit: true`、`statements: [...]`）。
-    - 於 `_commitOrIsolate(batch)` 中在同一個 `adapter.transaction(async (tx) => ...)` 內依序執行封包單位之全部語句；若任一語句失敗則標記 `fromPacketTransactionUnit`、`failedStatementIndex`、`failedStatementSql` 並立即回滾。
-    - 於 `_binaryIsolateBatch(batch)` 中確保二元隔離最小切分粒度為「單一封包交易單位」（`batch.length === 1`），**絕不拆開單一封包內部的多筆 SQL 個別提交**，並將失敗封包完整記錄於 `quarantinedItems`。
-  - [packet-transaction.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js)（新增）：
-    - 實作 `buildMqttPacketTransactionPlan(context)`、`buildRfTunnelPacketTransactionPlan(context)` 與 `executePacketTransactionPlan(plan, hooks, callback)`。
-    - 將 MQTT 各類封包（`ENCRYPTED`、`TEXT_MESSAGE_APP`、`POSITION_APP`、`NODEINFO_APP`、`ROUTING_APP`、`TELEMETRY_APP`、`TRACEROUTE_APP`、`NEIGHBORINFO_APP`、`MAP_REPORT_APP`）與 RF TCP Tunnel 座標封包之跨表寫入（`nodes`、`packet_logs`、`telemetry_data`、`chat_messages`、`neighbors`）封裝為單一原子交易計畫，並消除原本 `POSITION_APP` 重複的 `UPDATE nodes` 與 `TELEMETRY_APP` 重複的即時統計呼叫。
-    - 嚴格將 `batchEmit` 與 `recordLivePacketAnalytics` 移至交易 `COMMIT` 成功後的 callback 執行，交易失敗或回滾時保證 0 次觸發。
+    - 於 `_commitOrIsolate(batch)` 中在同一個 `adapter.transaction(async (tx) => ...)` 內依序執行封包單位之全部語句；失敗時區分 `ERROR_TYPES.DATA_CONSTRAINT`（進入 `_binaryIsolateBatch` 整包隔離）與 `ERROR_TYPES.UNKNOWN`（呼叫 `handleAdapterFatalError` 並轉入 `PAUSED_ERROR`，標記 `UNCOMMITTED_ERROR`）。
+  - [packet-transaction.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js)：
+    - 實作 `buildMqttPacketTransactionPlan(context)`、`buildRfTunnelPacketTransactionPlan(context)`、`executePacketTransactionPlan(plan, hooks, callback)` 與 `executeSequentialFallbackItem(dbTarget, item, onSuccess, onError)`。
+    - 內建 `reportPostCommitHookError()` 與 `invokeCallerCallbackOnce()`，保護交易 `COMMIT` 後的 `logger.log`、`recordLivePacketAnalytics` 與 `batchEmit`（事件名稱為 `'node_seen'`、`'raw_packet'`、`'telemetry_update'`）。
   - [src/database/index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/index.js) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：
-    - 於 `db` 相容介面公開 `queuePacketTransaction(statements, callback, options)`，並將 `index.js` 中 `client.on('message', ...)` 與 `setupRFListener` 全面改由 `buildMqttPacketTransactionPlan` / `buildRfTunnelPacketTransactionPlan` + `executePacketTransactionPlan` 執行（保持 `flushLiveAnalytics`、`computeAndSaveDaySummary`、`fetchAndSaveCWAData`、`cleanupOldData` 等獨立背景工作各自獨立）。
-    - 支援非侵入式環境變數覆寫（`DB_PATH`、`EVENT_LOG_PATH`、`DISABLE_RF_TUNNEL`）與子程序 IPC 封包注入鉤點（`TEST_INJECT_MQTT_PACKET`），使真實 `index.js` 子程序測試可在完全隔離的臨時目錄執行。
-  - [sigkill_tx_worker.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/helpers/sigkill_tx_worker.js) & [packet_transaction_4_0_2.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（新增）：
-    - 新增 10 項涵蓋單一封包多表成功、中段失敗回滾、末筆失敗回滾、同批次多封包二元隔離、高併發寫入+讀取+備份、關機排空、COMMIT 後副作用時序、`TURSO_URL`/備份排程政策確認、跨程序 `SIGKILL` 強制終止恢復，以及完整 `index.js` 子程序啟動/Protobuf 封包寫入/優雅關機/Schema 驗證失敗中止之整合測試。
+    - 公開 `queuePacketTransaction` 與 `executeSequentialFallbackItem`；修正 `index.js` 中 `TURSO_URL` 分支之 `db.run`/`db.all`/`db.get` 參數正規化與 `flushDbQueue()` 多語句依序執行，並支援 `MQTT_PIPE_PATH` 供本機測試 Broker 連線。
+  - [sigkill_tx_worker.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/helpers/sigkill_tx_worker.js) & [packet_transaction_4_0_2.test.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)：
+    - 擴充 `sigkill_tx_worker.js` 支援 `MID_TX`、`AFTER_COMMIT`、`APP_PACKET_TX_MID_FLIGHT` 與 `APP_PACKET_TX_AFTER_COMMIT` 四種模式；`packet_transaction_4_0_2.test.js` 擴充為 **17 項獨立 `it()` 測試案例（`Test 4.0.2-1` 至 `Test 4.0.2-17`）**。
 - **4.0.2 修改檔案與測試結果**：
   - 新增與修改檔案：`src/database/write-queue.js`、`src/database/packet-transaction.js`、`src/database/index.js`、`index.js`、`tests/database/helpers/sigkill_tx_worker.js`、`tests/database/packet_transaction_4_0_2.test.js`、`DATA_INTEGRITY_GUIDE.md`、`DEV_PROGRESS.md`。
-  - 實際測試結果：`sqlite_reliability.test.js`（46 項）+ `data_integrity_4_0_1.test.js`（27 項）+ `packet_transaction_4_0_2.test.js`（10 項），共 **83 項測試全數通過（83 passed, 0 failed, 0 skipped）**。
-  - 誠實測試邊界說明：`Test 4.0.2-SIGKILL` 為真實跨程序異常終止（`SIGKILL`）與 WAL 回滾恢復測試，不等同於實體主機斷電（Power Loss）、OS 核心崩潰或磁碟硬體損毀測試。
+  - 實際測試結果（以 `it()` 測試案例 1 對 1 計算）：`sqlite_reliability.test.js`（46 項）+ `data_integrity_4_0_1.test.js`（27 項）+ `packet_transaction_4_0_2.test.js`（17 項），共 **90 項 `it()` 測試全數通過（90 PASS, 0 FAIL, 0 BLOCKED, 0 NOT TESTED）**。
+  - 誠實測試邊界說明：`Test 4.0.2-14` 與 `Test 4.0.2-15` 為真實跨程序異常終止（`SIGKILL`）與 WAL 回滾恢復測試，不等同於實體主機斷電（Power Loss）、OS 核心崩潰或磁碟硬體損毀測試；Turso fallback 為依序多語句執行，不具備本地 SQLite 之單一連線原子回滾保證。
   - 當前版本狀態：**`READY FOR REVIEW`**（注意：`READY FOR REVIEW` $\neq$ `READY FOR PRODUCTION`）。
 
 ---

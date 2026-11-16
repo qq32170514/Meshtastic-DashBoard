@@ -16,7 +16,8 @@ const {
 const {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
-    executePacketTransactionPlan
+    executePacketTransactionPlan,
+    executeSequentialFallbackItem
 } = require('./packet-transaction');
 const defaultConfig = require('./sqlite.config');
 
@@ -380,5 +381,6 @@ module.exports = {
     RESTORE_STATUS,
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
-    executePacketTransactionPlan
+    executePacketTransactionPlan,
+    executeSequentialFallbackItem
 };

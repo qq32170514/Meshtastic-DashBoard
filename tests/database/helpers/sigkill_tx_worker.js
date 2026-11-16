@@ -1,10 +1,18 @@
 // tests/database/helpers/sigkill_tx_worker.js
 // 4.0.2 Cross-Process Abnormal Termination (SIGKILL) 測試專用子行程 Worker
+// 支援兩大類跨程序異常終止驗證：
+// 1. SQLite WAL Engine Process Death Modes: 'BEFORE_TX' | 'MID_TX_UNCOMMITTED' | 'AFTER_COMMIT'
+// 2. Application Packet Transaction Process Death Modes: 'APP_PACKET_TX_MID_FLIGHT' | 'APP_PACKET_TX_AFTER_COMMIT'
 // 只對傳入的獨立臨時測試 SQLite DB 進行受控交易階段測試，透過 IPC / stdout 同步精確時間點。
 
 const sqlite3 = require('sqlite3').verbose();
+const {
+    createDatabaseSubsystem,
+    buildMqttPacketTransactionPlan,
+    executePacketTransactionPlan
+} = require('../../../src/database');
 
-const mode = process.argv[2]; // 'BEFORE_TX' | 'MID_TX_UNCOMMITTED' | 'AFTER_COMMIT'
+const mode = process.argv[2];
 const dbPath = process.argv[3];
 const nodeId = process.argv[4] || '!deadbeef';
 
@@ -31,8 +39,100 @@ function runSql(db, sql, params = []) {
 }
 
 (async () => {
-    const db = new sqlite3.Database(dbPath);
     try {
+        // =====================================================================
+        // 模式群組 A：Application Packet Transaction Process Death (走專案真實 WriteQueue + PacketTransaction + SQLiteAdapter.transaction)
+        // =====================================================================
+        if (mode === 'APP_PACKET_TX_MID_FLIGHT' || mode === 'APP_PACKET_TX_AFTER_COMMIT') {
+            const dbSubsystem = await createDatabaseSubsystem({
+                dbPath,
+                bootstrapSchema: false,
+                config: { queue: { batchChunkSize: 10, flushIntervalMs: 5000 } }
+            });
+
+            const plan = buildMqttPacketTransactionPlan({
+                fromId: nodeId,
+                topic: 'msh/TW/2/e/MediumFast/!gw_app_sigkill',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw_app_sigkill',
+                packet: { id: 8801, hop_limit: 2, hop_start: 3, rx_snr: 10.5, rx_rssi: -72 },
+                rawHex: 'CAFEBABE',
+                decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+                payloadObj: { device_metrics: { battery_level: 77 }, environment_metrics: { temperature: 27.5, relative_humidity: 64.0 } },
+                telemetryData: {
+                    batteryLevel: 77,
+                    finalVoltage: 4.05,
+                    finalCurrent: 130.0,
+                    temperature: 27.5,
+                    humidity: 64.0,
+                    channelUtilization: 9.5,
+                    airUtilTx: 1.2,
+                    adcVoltage: 4.04
+                }
+            });
+
+            if (mode === 'APP_PACKET_TX_MID_FLIGHT') {
+                // 攔截 SQLiteAdapter.transaction 內部的 tx.execute：
+                // 讓此封包交易的第 0 筆 (INSERT nodes)、第 1 筆 (INSERT packet_logs)、第 2 筆 (UPDATE nodes) 真實寫入 SQLite 交易中，
+                // 並在準備執行第 3 筆 (INSERT telemetry_data) 與 COMMIT 前暫停，通知父行程發送 SIGKILL！
+                const origTransaction = dbSubsystem.adapter.transaction.bind(dbSubsystem.adapter);
+                dbSubsystem.adapter.transaction = async (txFn) => {
+                    return origTransaction(async (tx) => {
+                        let stmtCounter = 0;
+                        const wrappedTx = {
+                            ...tx,
+                            execute: async (sql, params) => {
+                                stmtCounter++;
+                                if (stmtCounter === 4) {
+                                    notifyParent('READY_FOR_SIGKILL_APP_PACKET_TX_MID_FLIGHT', { executedStatementsBeforeKill: 3 });
+                                    await new Promise(() => {}); // 永久掛起等待父行程 SIGKILL
+                                }
+                                return tx.execute(sql, params);
+                            }
+                        };
+                        return txFn(wrappedTx);
+                    });
+                };
+
+                executePacketTransactionPlan(plan, {
+                    enqueuePacketTransaction: dbSubsystem.queuePacketTransaction.bind(dbSubsystem),
+                    batchEmit: () => {},
+                    recordLivePacketAnalytics: () => {},
+                    logger: { log: () => {}, error: () => {} }
+                });
+
+                await dbSubsystem.flushDbQueue();
+                return;
+            }
+
+            if (mode === 'APP_PACKET_TX_AFTER_COMMIT') {
+                await new Promise((resolve, reject) => {
+                    executePacketTransactionPlan(
+                        plan,
+                        {
+                            enqueuePacketTransaction: dbSubsystem.queuePacketTransaction.bind(dbSubsystem),
+                            batchEmit: () => {},
+                            recordLivePacketAnalytics: () => {},
+                            logger: { log: () => {}, error: () => {} }
+                        },
+                        (err) => {
+                            if (err) return reject(err);
+                            resolve();
+                        }
+                    );
+                    dbSubsystem.flushDbQueue().catch(reject);
+                });
+
+                notifyParent('READY_FOR_SIGKILL_APP_PACKET_TX_AFTER_COMMIT');
+                setInterval(() => {}, 1000);
+                return;
+            }
+        }
+
+        // =====================================================================
+        // 模式群組 B：SQLite WAL Engine Process Death (原生 sqlite3 連線交易測試)
+        // =====================================================================
+        const db = new sqlite3.Database(dbPath);
         await runSql(db, 'PRAGMA journal_mode = WAL');
         await runSql(db, 'PRAGMA synchronous = NORMAL');
         await runSql(db, 'PRAGMA busy_timeout = 5000');
@@ -45,7 +145,7 @@ function runSql(db, sql, params = []) {
         }
 
         if (mode === 'MID_TX_UNCOMMITTED') {
-            // 階段 2：啟動 BEGIN IMMEDIATE 並寫入封包的前兩筆關聯表（nodes 與 packet_logs），但故意停在第三筆（telemetry_data）與 COMMIT 之前
+            // 階段 2：啟動 BEGIN IMMEDIATE 並寫入封包的前四張關聯表（nodes, packet_logs, chat_messages, neighbors），但故意停在 telemetry_data 與 COMMIT 之前
             await runSql(db, 'BEGIN IMMEDIATE TRANSACTION');
             await runSql(
                 db,

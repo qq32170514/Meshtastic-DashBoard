@@ -499,7 +499,8 @@ const dbQueueMetrics = {
 const {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
-    executePacketTransactionPlan
+    executePacketTransactionPlan,
+    executeSequentialFallbackItem
 } = require('./src/database/packet-transaction');
 
 function queueDbOp(sql, params, callback) {
@@ -507,14 +508,26 @@ function queueDbOp(sql, params, callback) {
         return db.queueDbOp(sql, params, callback);
     }
 
+    const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+    const actualCallback = typeof params === 'function' ? params : callback;
+
     // 🛡️ 背壓防護 (Backpressure): 超過上限時記錄警示，避免記憶體溢位 (OOM)
     if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
         console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
-        if (callback) callback(new Error('DB queue backpressure limit reached'));
+        if (typeof actualCallback === 'function') {
+            try { actualCallback(new Error('DB queue backpressure limit reached')); } catch (_) {}
+        }
         return false;
     }
 
-    dbQueue.push({ sql, params, callback, queuedAt: Date.now() });
+    dbQueue.push({
+        isTransactionUnit: false,
+        sql,
+        params: actualParams,
+        callback: actualCallback,
+        callbackInvoked: false,
+        queuedAt: Date.now()
+    });
     dbQueueMetrics.totalQueued++;
     if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
         dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
@@ -535,7 +548,8 @@ function queueDbOp(sql, params, callback) {
 
 /**
  * 🛡️ 4.0.2 Packet Transaction Boundary:
- * 將單一邏輯封包的多筆 SQL 寫入作為不可拆分的單一交易單位送入 WriteQueue
+ * - 本地 SQLite 分支：將單一邏輯封包的多筆 SQL 寫入作為不可拆分的原子交易單位送入 WriteQueue
+ * - Turso fallback 分支：將多筆 SQL 排入 dbQueue 並按原始順序逐一執行（誠實限制：Turso fallback 為順序執行，不宣稱具備 Local SQLite Adapter 的單連線原子交易保證）
  */
 function queuePacketTransaction(statements, callback = null, options = {}) {
     if (db && typeof db.queuePacketTransaction === 'function') {
@@ -550,24 +564,42 @@ function queuePacketTransaction(statements, callback = null, options = {}) {
         });
     }
 
-    if (!Array.isArray(statements) || statements.length === 0) {
-        const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列');
-        if (callback) callback(err);
+    if (
+        !Array.isArray(statements) ||
+        statements.length === 0 ||
+        !statements.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
+    ) {
+        const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
+        if (typeof callback === 'function') {
+            try { callback(err); } catch (_) {}
+        }
         return false;
     }
 
     if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
         console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
-        if (callback) callback(new Error('DB queue backpressure limit reached'));
+        if (typeof callback === 'function') {
+            try { callback(new Error('DB queue backpressure limit reached')); } catch (_) {}
+        }
         return false;
     }
 
+    const normalizedStatements = statements.map((s) => ({
+        sql: s.sql,
+        params: Array.isArray(s.params) ? s.params : []
+    }));
+
     dbQueue.push({
         isTransactionUnit: true,
-        statements,
-        sql: (options && options.label) || statements[0].sql,
-        params: statements[0].params || [],
+        statements: normalizedStatements,
+        label: (options && typeof options.label === 'string' && options.label.trim().length > 0)
+            ? options.label.trim()
+            : `[PACKET_TX:${normalizedStatements.length}]`,
+        packetMeta: (options && options.packetMeta) || null,
+        sql: normalizedStatements[0].sql,
+        params: normalizedStatements[0].params,
         callback,
+        callbackInvoked: false,
         queuedAt: Date.now()
     });
     dbQueueMetrics.totalQueued++;
@@ -595,64 +627,50 @@ function flushDbQueue() {
         clearTimeout(dbQueueTimer);
         dbQueueTimer = null;
     }
-    if (dbQueue.length === 0 || isFlushingDbQueue) return;
+    if (dbQueue.length === 0 || isFlushingDbQueue) return Promise.resolve();
 
-    // 🚀 分批切片 (Chunking)，每次最多處理 BATCH_CHUNK_SIZE 筆，避免單一交易鎖定過久
+    // 🚀 分批切片 (Chunking)，每次最多處理 BATCH_CHUNK_SIZE 筆
     const batch = dbQueue.splice(0, BATCH_CHUNK_SIZE);
     isFlushingDbQueue = true;
 
     const startTime = Date.now();
-    db.serialize(() => {
-        // 使用 IMMEDIATE 交易預先鎖定寫入，避免死鎖
-        db.run('BEGIN IMMEDIATE TRANSACTION', (beginErr) => {
-            if (beginErr) {
-                console.error('❌ [DB_QUEUE] BEGIN IMMEDIATE 失敗:', beginErr.message);
-                dbQueueMetrics.totalErrors += batch.length;
+    return new Promise((resolve) => {
+        let itemIdx = 0;
+
+        const runNextBatchItem = () => {
+            if (itemIdx >= batch.length) {
+                const duration = Date.now() - startTime;
+                dbQueueMetrics.lastBatchSize = batch.length;
+                dbQueueMetrics.lastDurationMs = duration;
                 isFlushingDbQueue = false;
-                batch.forEach(item => item.callback && item.callback(beginErr));
-                if (dbQueue.length > 0) setTimeout(flushDbQueue, 50);
+
+                if (dbQueue.length > 0) {
+                    setImmediate(() => {
+                        flushDbQueue().then(resolve);
+                    });
+                } else {
+                    resolve();
+                }
                 return;
             }
 
-            let completed = 0;
-            let batchHasError = false;
-
-            batch.forEach((item) => {
-                db.run(item.sql, item.params, function (err) {
-                    if (err) {
-                        batchHasError = true;
-                        dbQueueMetrics.totalErrors++;
-                    }
-                    if (item.callback) {
-                        try { item.callback.call(this, err); } catch (_) { }
-                    }
-                    completed++;
-
-                    if (completed === batch.length) {
-                        const txEndSql = batchHasError ? 'ROLLBACK' : 'COMMIT';
-                        db.run(txEndSql, (commitErr) => {
-                            const duration = Date.now() - startTime;
-                            dbQueueMetrics.lastBatchSize = batch.length;
-                            dbQueueMetrics.lastDurationMs = duration;
-
-                            if (commitErr || batchHasError) {
-                                console.error(`⚠️ [DB_QUEUE] 交易結束 (${txEndSql}) 異常:`, commitErr?.message || '單項操作失敗');
-                            } else {
-                                dbQueueMetrics.totalCommitted += batch.length;
-                            }
-
-                            isFlushingDbQueue = false;
-                            // 🚀 採用路由級別 5 秒 TTL 自然過期，避免每 200ms 全面清空快取造成並行查詢穿透至 DB
-
-                            // 若隊列中仍有剩餘待處理資料，立即處理下一批
-                            if (dbQueue.length > 0) {
-                                setImmediate(flushDbQueue);
-                            }
-                        });
-                    }
-                });
+            const item = batch[itemIdx++];
+            executeSequentialFallbackItem(db, item, (itemErr) => {
+                if (itemErr) {
+                    dbQueueMetrics.totalErrors++;
+                    console.error(`⚠️ [DB_QUEUE] 佇列項目執行異常 (${item.label || item.sql}):`, itemErr.message);
+                } else {
+                    dbQueueMetrics.totalCommitted++;
+                }
+                runNextBatchItem();
             });
-        });
+        };
+
+        if (db && typeof db.serialize === 'function') {
+            db.serialize(runNextBatchItem);
+        } else {
+            runNextBatchItem();
+        }
     });
 }
 
@@ -735,11 +753,30 @@ if (process.env.TURSO_URL) {
         url: process.env.TURSO_URL,
         authToken: process.env.TURSO_TOKEN,
     });
-    // 建立一個相容 sqlite3 語法的包裝器
+    // 建立一個相容 sqlite3 語法的包裝器（支援 (sql, cb) 與 (sql, params, cb) 兩種呼叫形式）
     db = {
-        run: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb && cb.call({ lastID: Number(r.lastInsertRowid) }, null)).catch(cb),
-        all: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows)).catch(cb),
-        get: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows[0])).catch(cb),
+        isTursoFallback: true,
+        run: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb.call({ lastID: Number(r?.lastInsertRowid ?? 0), changes: Number(r?.rowsAffected ?? 0) }, null))
+                .catch(err => actualCb && actualCb(err));
+        },
+        all: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb(null, r.rows))
+                .catch(err => actualCb && actualCb(err));
+        },
+        get: (sql, params, cb) => {
+            const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+            const actualCb = typeof params === 'function' ? params : cb;
+            return client.execute({ sql, args: actualParams })
+                .then(r => actualCb && actualCb(null, r.rows ? r.rows[0] : undefined))
+                .catch(err => actualCb && actualCb(err));
+        },
         serialize: (fn) => fn()
     };
     console.log(`☁️ 已連線至 Turso 雲端資料庫`);
@@ -4177,12 +4214,15 @@ function startMqttClient() {
         throw new Error('❌ Missing required MQTT environment variables (MQTT_BROKER, MQTT_USER, MQTT_PASSWORD)');
     }
 
-    const client = mqtt.connect(broker, {
+    const connectOpts = {
         username: username,
         password: password,
         clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10),
         connectTimeout: 5000
-    });
+    };
+    const client = process.env.MQTT_PIPE_PATH
+        ? new mqtt.MqttClient(() => net.connect(process.env.MQTT_PIPE_PATH), connectOpts)
+        : mqtt.connect(broker, connectOpts);
     mqttClient = client; // 🚀 Expose client instance
 
     client.on('connect', () => {
@@ -4527,6 +4567,17 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 process.on('message', async (msg) => {
     if (msg === 'shutdown') {
         handleShutdown('PM2_SHUTDOWN');
+    } else if (msg && msg.type === 'TEST_FLUSH_DB_QUEUE') {
+        try {
+            await flushDbQueue();
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_DB_QUEUE_FLUSHED', requestId: msg.requestId || null, ok: true });
+            }
+        } catch (err) {
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_DB_QUEUE_FLUSHED', requestId: msg.requestId || null, ok: false, error: err.message });
+            }
+        }
     } else if (msg && msg.type === 'TEST_INJECT_MQTT_PACKET' && mqttClient) {
         try {
             mqttClient.emit('message', msg.topic, Buffer.from(msg.payloadHex, 'hex'));

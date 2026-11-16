@@ -1,6 +1,6 @@
 // tests/database/packet_transaction_4_0_2.test.js
-// Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Turso/Backup Policy & Cross-Process Integration Suite
-// 嚴格遵守開發環境隔離：所有測試僅在 os.tmpdir() 建立與銷毀獨立 Temporary SQLite DB、臨時通訊埠與子行程，絕不接觸正式環境。
+// Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Classification, Turso Fallback & Cross-Process Integration Suite
+// 嚴格遵守開發環境隔離：所有測試僅在 os.tmpdir() 建立與銷毀獨立 Temporary SQLite DB、臨時通訊端點與子行程，絕不接觸正式環境。
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const net = require('net');
-const http = require('http');
+const sqlite3 = require('sqlite3').verbose();
 const { spawn } = require('child_process');
 const protobuf = require('protobufjs');
 
@@ -17,8 +17,11 @@ const {
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
     executePacketTransactionPlan,
+    executeSequentialFallbackItem,
+    QUEUE_STATES,
     ITEM_STATUS
 } = require('../../src/database');
+const { ERROR_TYPES, classifyError } = require('../../src/database/retry-policy');
 const sqliteConfig = require('../../src/database/sqlite.config');
 
 function createTempPath(prefix = 'mesh_402_test', ext = '.db') {
@@ -60,8 +63,9 @@ function assertDataConservation(metrics) {
 }
 
 /**
- * 建立輕量級原生 TCP MQTT 3.1.1 測試 Broker（無外部依賴，僅監聽 127.0.0.1 臨時埠）
- * 支援 CONNECT -> CONNACK、SUBSCRIBE -> SUBACK、PINGREQ -> PINGRESP 與主動 PUBLISH Protobuf 封包
+ * 建立輕量級原生 MQTT (v3.1.1 / v5.0) Wire-Level 測試 Broker
+ * 支援 CONNECT -> CONNACK、SUBSCRIBE -> SUBACK、PINGREQ -> PINGRESP 與主動發送 Wire-Level PUBLISH (0x30) 二進位封包。
+ * 在 Windows 環境支援 Named Pipe (\\.\pipe\...) 以避免沙盒阻擋 TCP Loopback，在 POSIX 支援 Unix Socket 或 127.0.0.1 TCP。
  */
 function encodeMqttRemainingLength(length) {
     const bytes = [];
@@ -81,7 +85,6 @@ function buildMqttPublishPacket(topic, payloadBuffer, protocolVersion = 4) {
     const topicBuf = Buffer.from(topic, 'utf8');
     const topicLenBuf = Buffer.alloc(2);
     topicLenBuf.writeUInt16BE(topicBuf.length, 0);
-    // MQTT v5.0 PUBLISH (QoS 0) 在 Topic Name 後方包含 1-byte Properties Length (0x00)
     const propsBuf = protocolVersion === 5 ? Buffer.from([0x00]) : Buffer.alloc(0);
     const body = Buffer.concat([topicLenBuf, topicBuf, propsBuf, payloadBuffer]);
     const fixedHeader = Buffer.from([0x30]); // PUBLISH QoS 0
@@ -89,7 +92,14 @@ function buildMqttPublishPacket(topic, payloadBuffer, protocolVersion = 4) {
     return Buffer.concat([fixedHeader, remLen, body]);
 }
 
-function startLocalMockMqttBroker() {
+function startLocalMockMqttBroker(options = {}) {
+    const usePipe = options.usePipe !== undefined ? options.usePipe : (process.platform === 'win32');
+    const pipePath = usePipe
+        ? (process.platform === 'win32'
+            ? `\\\\.\\pipe\\mesh_mqtt_broker_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+            : createTempPath('mesh_mqtt_broker', '.sock'))
+        : null;
+
     const sockets = new Set();
     let clientProtocolVersion = 4;
     let subscribedResolve = null;
@@ -106,7 +116,6 @@ function startLocalMockMqttBroker() {
             let offset = 0;
             while (offset < chunk.length) {
                 const packetType = chunk[offset] & 0xf0;
-                // 解碼 MQTT Remaining Length
                 let multiplier = 1;
                 let remLen = 0;
                 let idx = offset + 1;
@@ -122,23 +131,18 @@ function startLocalMockMqttBroker() {
                 if (packetEnd > chunk.length) return;
 
                 if (packetType === 0x10) {
-                    // CONNECT: Variable Header 為 [0x00, 0x04, 'M', 'Q', 'T', 'T', protocolLevel]
                     const protoNameLen = chunk.readUInt16BE(idx);
                     const protoLevel = chunk[idx + 2 + protoNameLen];
                     clientProtocolVersion = protoLevel === 5 ? 5 : 4;
                     if (clientProtocolVersion === 5) {
-                        // MQTT v5.0 CONNACK: [0x20, remLen=3, ackFlags=0, reasonCode=0, propsLen=0]
                         socket.write(Buffer.from([0x20, 0x03, 0x00, 0x00, 0x00]));
                     } else {
-                        // MQTT v3.1.1 CONNACK: [0x20, remLen=2, ackFlags=0, returnCode=0]
                         socket.write(Buffer.from([0x20, 0x02, 0x00, 0x00]));
                     }
                 } else if (packetType === 0x80) {
-                    // SUBSCRIBE -> 讀取 Packet Identifier 並回傳 SUBACK (0x90)
                     const pktIdHi = chunk[idx];
                     const pktIdLo = chunk[idx + 1];
                     if (clientProtocolVersion === 5) {
-                        // MQTT v5.0 SUBACK: [0x90, remLen=4, pktIdHi, pktIdLo, propsLen=0, reasonCode=0]
                         socket.write(Buffer.from([0x90, 0x04, pktIdHi, pktIdLo, 0x00, 0x00]));
                     } else {
                         socket.write(Buffer.from([0x90, 0x03, pktIdHi, pktIdLo, 0x00]));
@@ -148,10 +152,8 @@ function startLocalMockMqttBroker() {
                         subscribedResolve = null;
                     }
                 } else if (packetType === 0xc0) {
-                    // PINGREQ -> 回傳 PINGRESP (0xd0, 0x00)
                     socket.write(Buffer.from([0xd0, 0x00]));
                 } else if (packetType === 0xe0) {
-                    // DISCONNECT
                     socket.end();
                 }
 
@@ -162,11 +164,13 @@ function startLocalMockMqttBroker() {
 
     return new Promise((resolve, reject) => {
         server.on('error', reject);
-        server.listen(0, '127.0.0.1', () => {
+        const onListening = () => {
             const address = server.address();
+            const port = typeof address === 'object' && address ? address.port : 1883;
             resolve({
-                port: address.port,
-                url: `mqtt://127.0.0.1:${address.port}`,
+                port,
+                pipePath,
+                url: `mqtt://127.0.0.1:${port}`,
                 waitForSubscription: () => subscribedPromise,
                 publish(topic, payloadBuffer) {
                     const pkt = buildMqttPublishPacket(topic, payloadBuffer, clientProtocolVersion);
@@ -180,9 +184,18 @@ function startLocalMockMqttBroker() {
                     }
                     sockets.clear();
                     await new Promise((r) => server.close(() => r()));
+                    if (pipePath && process.platform !== 'win32') {
+                        try { if (fs.existsSync(pipePath)) fs.unlinkSync(pipePath); } catch (_) {}
+                    }
                 }
             });
-        });
+        };
+
+        if (pipePath) {
+            server.listen(pipePath, onListening);
+        } else {
+            server.listen(0, '127.0.0.1', onListening);
+        }
     });
 }
 
@@ -197,30 +210,25 @@ function getFreeTcpPort() {
     });
 }
 
-function httpGetJson(url) {
+function querySqliteAll(dbFile, sql, params = []) {
     return new Promise((resolve, reject) => {
-        const req = http.get(url, (res) => {
-            let body = '';
-            res.setEncoding('utf8');
-            res.on('data', (d) => { body += d; });
-            res.on('end', () => {
-                try {
-                    resolve({ statusCode: res.statusCode, data: JSON.parse(body) });
-                } catch (err) {
-                    reject(new Error(`Invalid JSON from ${url}: ${body}`));
-                }
+        const conn = new sqlite3.Database(dbFile, sqlite3.OPEN_READONLY, (openErr) => {
+            if (openErr) return reject(openErr);
+            conn.all(sql, params, (err, rows) => {
+                conn.close(() => {
+                    if (err) return reject(err);
+                    resolve(rows);
+                });
             });
         });
-        req.on('error', reject);
     });
 }
 
-describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Process Integration Suite', () => {
+describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Classification, Turso Fallback & Cross-Process Suite', () => {
 
     // =========================================================================
-    // 一、4.0.2 Packet Transaction Boundary 整合測試 (10 個必要情境)
+    // 1. 單一封包多資料表原子提交成功
     // =========================================================================
-
     it('Test 4.0.2-1 — Multi-Table Packet Commit Success: 單一封包的多筆關聯表寫入全部成功時，所有相關表紀錄皆原子存在', async () => {
         const dbPath = createTempPath('pkt_tx_success');
         const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
@@ -235,7 +243,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 logger: { log: () => {}, error: () => {} }
             };
 
-            // 1. TELEMETRY_APP 封包 (同時寫入 nodes 基礎狀態、packet_logs、nodes 遙測欄位、telemetry_data 共 4 筆 SQL)
             const telePlan = buildMqttPacketTransactionPlan({
                 fromId: '!11223344',
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -258,7 +265,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             assert.equal(telePlan.statements.length, 4, 'TELEMETRY_APP 交易單位應包含 4 筆關聯 SQL');
 
-            // 2. TEXT_MESSAGE_APP 封包 (同時寫入 nodes、chat_messages、packet_logs 共 3 筆 SQL)
             const chatPlan = buildMqttPacketTransactionPlan({
                 fromId: '!11223344',
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -271,7 +277,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             assert.equal(chatPlan.statements.length, 3, 'TEXT_MESSAGE_APP 交易單位應包含 3 筆關聯 SQL');
 
-            // 3. NEIGHBORINFO_APP 封包 (同時寫入 nodes、2 筆 neighbors、packet_logs 共 4 筆 SQL)
             const neighborPlan = buildMqttPacketTransactionPlan({
                 fromId: '!11223344',
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -318,6 +323,10 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
 
             assert.equal(analyticsCalls.length, 3, '3 個已提交封包應觸發 3 次戰情累加');
             assert.ok(emittedEvents.length >= 6, 'COMMIT 後應觸發對應之 batchEmit 推播');
+            // 確認發出的事件名稱嚴格屬於專案實際定義的 node_seen / raw_packet / telemetry_update
+            for (const e of emittedEvents) {
+                assert.ok(['node_seen', 'raw_packet', 'telemetry_update'].includes(e.type), `未預期的事件名稱: ${e.type}`);
+            }
             assertDataConservation(db.writeQueue.getMetrics());
         } finally {
             await db.close();
@@ -325,18 +334,129 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
     });
 
-    it('Test 4.0.2-2 & 4.0.2-3 — Atomic Rollback & Zero Partial State: 單一封包多筆寫入中任一步驟失敗時，整個封包全部回滾且不留任何部分資料', async () => {
-        const dbPath = createTempPath('pkt_tx_rollback');
+    // =========================================================================
+    // 2. 中間步驟 SQL 失敗與 Rollback (Section 五 #1)
+    // =========================================================================
+    it('Test 4.0.2-2 — Middle SQL Failure & Atomic Rollback: 4 筆語句之封包在第 3 筆 (中間步驟 index=2) 失敗時，前 2 筆完整 Rollback 且第 4 筆絕不執行', async () => {
+        const dbPath = createTempPath('pkt_tx_mid_rollback');
         const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
 
         try {
-            // 在 telemetry_data 建立一個針對特定測試錯誤標記的 SQLite Trigger，模擬封包交易第 4 步寫入時發生約束失敗
+            // TELEMETRY_APP 包含 4 筆 SQL:
+            // [0] INSERT INTO nodes ... (節點發現 Upsert)
+            // [1] INSERT INTO packet_logs ... (封包紀錄)
+            // [2] UPDATE nodes SET battery_level = ... (中間第 3 筆語句!)
+            // [3] INSERT INTO telemetry_data ... (最後第 4 筆語句)
+            // 在 nodes 的 UPDATE 建立 Trigger，讓第 3 筆語句 (index=2) 觸發 SQLITE_CONSTRAINT 失敗
             await db.run(`
-                CREATE TRIGGER trg_reject_invalid_telemetry
+                CREATE TRIGGER trg_reject_middle_node_telemetry_update
+                BEFORE UPDATE OF battery_level ON nodes
+                WHEN NEW.battery_level < -500
+                BEGIN
+                    SELECT RAISE(ABORT, 'MIDDLE_STEP_3_NODE_UPDATE_CONSTRAINT_FAILED');
+                END;
+            `);
+
+            const executedSqlTrace = [];
+            const origTransaction = db.adapter.transaction.bind(db.adapter);
+            db.adapter.transaction = async (txFn) => {
+                return origTransaction(async (tx) => {
+                    const wrappedTx = {
+                        ...tx,
+                        execute: async (sql, params) => {
+                            executedSqlTrace.push(sql.trim().split(/\s+/)[0].toUpperCase() + ':' + sql.trim().slice(0, 32));
+                            return tx.execute(sql, params);
+                        }
+                    };
+                    return txFn(wrappedTx);
+                });
+            };
+
+            const emittedEvents = [];
+            const analyticsCalls = [];
+            let callbackErr = null;
+
+            const midFailPlan = buildMqttPacketTransactionPlan({
+                fromId: '!midfail01',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 202, hop_limit: 3, hop_start: 3, rx_snr: 6.0, rx_rssi: -88 },
+                rawHex: 'AA11BB22',
+                decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+                payloadObj: { device_metrics: { battery_level: -600 } },
+                telemetryData: {
+                    batteryLevel: -600,
+                    finalVoltage: 3.85,
+                    finalCurrent: 40,
+                    temperature: 21.0,
+                    humidity: 55.0,
+                    channelUtilization: 4.0,
+                    airUtilTx: 0.4,
+                    adcVoltage: 3.85
+                }
+            });
+            assert.equal(midFailPlan.statements.length, 4);
+
+            executePacketTransactionPlan(
+                midFailPlan,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    batchEmit: (type, payload) => emittedEvents.push({ type, payload }),
+                    recordLivePacketAnalytics: (port, snr, rssi) => analyticsCalls.push({ port, snr, rssi }),
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    callbackErr = err;
+                }
+            );
+
+            await db.flushDbQueue();
+
+            assert.ok(callbackErr, '中間步驟失敗時必須透過 callback 回報錯誤');
+            assert.equal(callbackErr.failedStatementIndex, 2, '應明確記錄失敗發生在第 3 條 SQL (index=2)');
+            assert.match(callbackErr.failedStatementSql, /^UPDATE nodes SET/i);
+
+            // 驗證第 4 條 SQL (INSERT INTO telemetry_data) 根本沒有被繼續執行
+            assert.equal(executedSqlTrace.length, 3, '只應執行到第 3 條 SQL (0, 1, 2)，第 4 條 SQL 絕不可繼續執行');
+            assert.equal(
+                executedSqlTrace.some((s) => s.includes('telemetry_data')),
+                false,
+                '第 4 條 INSERT INTO telemetry_data 絕不可被執行'
+            );
+
+            // 驗證第 1 條 (nodes) 與第 2 條 (packet_logs) 的寫入已完整 Rollback
+            const ghostNode = await db.get('SELECT * FROM nodes WHERE node_id = ?', ['!midfail01']);
+            const ghostLogs = await db.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!midfail01']);
+            const ghostTele = await db.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!midfail01']);
+
+            assert.equal(ghostNode, null, '前一步驟寫入的 nodes 必須被完整 Rollback');
+            assert.equal(ghostLogs.length, 0, '前一步驟寫入的 packet_logs 必須被完整 Rollback');
+            assert.equal(ghostTele.length, 0, '後續步驟的 telemetry_data 必須為 0 筆');
+
+            assert.equal(emittedEvents.length, 0, '失敗交易不得觸發任何 batchEmit');
+            assert.equal(analyticsCalls.length, 0, '失敗交易不得觸發任何 recordLivePacketAnalytics');
+            assertDataConservation(db.writeQueue.getMetrics());
+        } finally {
+            await db.close();
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 3. 最終步驟 SQL 失敗與 Rollback
+    // =========================================================================
+    it('Test 4.0.2-3 — Final SQL Failure & Atomic Rollback: 4 筆語句之封包在最後一筆 (index=3) 失敗時，前面所有表寫入全數 Rollback', async () => {
+        const dbPath = createTempPath('pkt_tx_final_rollback');
+        const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
+
+        try {
+            await db.run(`
+                CREATE TRIGGER trg_reject_final_telemetry_insert
                 BEFORE INSERT ON telemetry_data
                 WHEN NEW.battery_level < -900
                 BEGIN
-                    SELECT RAISE(ABORT, 'SIMULATED_TELEMETRY_STEP_CONSTRAINT_FAILURE');
+                    SELECT RAISE(ABORT, 'SIMULATED_TELEMETRY_FINAL_STEP_CONSTRAINT_FAILURE');
                 END;
             `);
 
@@ -354,7 +474,7 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
                 payloadObj: { device_metrics: { battery_level: -999 } },
                 telemetryData: {
-                    batteryLevel: -999, // 第 1 步 (INSERT nodes)、第 2 步 (INSERT packet_logs)、第 3 步 (UPDATE nodes) 均合法，但第 4 步 (INSERT telemetry_data) 觸發 ABORT!
+                    batteryLevel: -999,
                     finalVoltage: 3.99,
                     finalCurrent: 50,
                     temperature: 22.0,
@@ -380,12 +500,10 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
 
             await db.flushDbQueue();
 
-            // 驗證回呼收到錯誤，且明確指出失敗於第 4 筆語句 (index = 3)
             assert.ok(callbackErr, '失敗封包的回呼必須收到錯誤');
             assert.match(callbackErr.message, /QUARANTINED_CONSTRAINT_ERROR/);
             assert.equal(callbackErr.failedStatementIndex, 3, '應精確記錄失敗發生於第 4 筆 SQL (index=3)');
 
-            // 關鍵驗證 (1.5 #2 & #3)：前面第 1 步寫入的 nodes 與第 2 步寫入的 packet_logs 必須完全被 ROLLBACK，不留任何殘留紀錄！
             const ghostNode = await db.get('SELECT * FROM nodes WHERE node_id = ?', ['!bad00001']);
             const ghostLogs = await db.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!bad00001']);
             const ghostTele = await db.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!bad00001']);
@@ -394,7 +512,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             assert.equal(ghostLogs.length, 0, '回滾後 packet_logs 表絕不可殘留 !bad00001 的部分寫入');
             assert.equal(ghostTele.length, 0, '回滾後 telemetry_data 表絕不可殘留 !bad00001 的部分寫入');
 
-            // 關鍵驗證 (1.4 & 1.5 #7)：失敗回滾的封包絕不可觸發 batchEmit 或戰情累加
             assert.equal(emittedEvents.length, 0, '回滾封包絕不可觸發任何 WebSocket batchEmit');
             assert.equal(analyticsCalls.length, 0, '回滾封包絕不可觸發任何戰情分析累加');
             assertDataConservation(db.writeQueue.getMetrics());
@@ -404,7 +521,88 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
     });
 
-    it('Test 4.0.2-4 & 4.0.2-5 — Multi-Packet Batch & Indivisible Binary Isolation: 批次中單一封包失敗時，Binary Isolation 絕不拆開封包內部語句，且同批其他有效封包全數成功提交', async () => {
+    // =========================================================================
+    // 4. RF Tunnel 封包交易失敗與 Rollback (Section 五 #2)
+    // =========================================================================
+    it('Test 4.0.2-4 — RF Tunnel Packet Transaction Failure & Rollback: RF Tunnel 封包第 2 條 SQL 失敗時，第 1 條 packet_logs 寫入完整 Rollback 且不發送成功事件', async () => {
+        const dbPath = createTempPath('pkt_tx_rf_rollback');
+        const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
+
+        try {
+            // 先建立一個既有節點，確認後續 RF Tunnel 交易失敗不會污染其原本的 last_gateway
+            await db.run(
+                `INSERT INTO nodes (node_id, long_name, short_name, last_gateway) VALUES (?, ?, ?, ?)`,
+                ['!rfnode01', 'RF Existing Node', 'RF01', '!gw_original']
+            );
+
+            // 在 nodes 的 UPDATE 建立 Trigger，模擬 RF Tunnel 交易的第 2 條 SQL (UPDATE nodes SET last_seen=..., last_gateway=?) 發生約束失敗
+            await db.run(`
+                CREATE TRIGGER trg_reject_rf_tunnel_node_update
+                BEFORE UPDATE OF last_gateway ON nodes
+                WHEN NEW.last_gateway = '隧道:故障測試站'
+                BEGIN
+                    SELECT RAISE(ABORT, 'RF_TUNNEL_STEP_2_NODE_UPDATE_FAILED');
+                END;
+            `);
+
+            const rfEmits = [];
+            let rfCallbackErr = null;
+            let rfCallbackCount = 0;
+
+            const rfPlan = buildRfTunnelPacketTransactionPlan({
+                fromId: '!rfnode01',
+                gatewayId: 'RELAY_FAULTY',
+                snr: 5.5,
+                rssi: -92,
+                lat: 24.1477,
+                lng: 120.6736,
+                hopsAway: 2,
+                sourceName: 'taichung_faulty',
+                sourceLabel: '故障測試站',
+                packetData: { from: '!rfnode01', portnum: 'POSITION', source: 'taichung_faulty' }
+            });
+            assert.equal(rfPlan.statements.length, 2, 'RF Tunnel 交易應包含 2 條 SQL');
+
+            executePacketTransactionPlan(
+                rfPlan,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    batchEmit: (type, payload) => rfEmits.push({ type, payload }),
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    rfCallbackCount++;
+                    rfCallbackErr = err;
+                }
+            );
+
+            await db.flushDbQueue();
+
+            assert.equal(rfCallbackCount, 1, 'RF Tunnel 失敗回呼應精確執行 1 次');
+            assert.ok(rfCallbackErr, 'RF Tunnel 失敗時應收到錯誤');
+            assert.equal(rfCallbackErr.failedStatementIndex, 1, '應記錄失敗發生於第 2 條 SQL (index=1)');
+
+            // 驗證第 1 條已執行的 INSERT INTO packet_logs 被完整 Rollback
+            const tunnelLogs = await db.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!rfnode01']);
+            assert.equal(tunnelLogs.length, 0, 'RF Tunnel 交易 Rollback 後，packet_logs 不得殘留第 1 條 SQL 的紀錄');
+
+            // 驗證 nodes 表維持原狀
+            const nodeAfter = await db.get('SELECT * FROM nodes WHERE node_id = ?', ['!rfnode01']);
+            assert.equal(nodeAfter.last_gateway, '!gw_original', 'nodes.last_gateway 不得被失敗交易修改');
+
+            // 驗證未觸發成功事件
+            assert.equal(rfEmits.length, 0, 'RF Tunnel 交易失敗時不得觸發 raw_packet 推播');
+            assertDataConservation(db.writeQueue.getMetrics());
+        } finally {
+            await db.close();
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 5. P1 測試 A：DATA_CONSTRAINT 二元隔離 (Section 二 測試 A)
+    // =========================================================================
+    it('Test 4.0.2-5 — DATA_CONSTRAINT Binary Isolation (P1 Test A): 封包交易發生資料約束錯誤時，Binary Isolation 正常隔離壞封包且同批合法封包完整提交', async () => {
         const dbPath = createTempPath('pkt_tx_batch_iso');
         const db = await createDatabaseSubsystem({
             dbPath,
@@ -443,15 +641,11 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                     decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
                     payloadObj: { text: `Message from ${nodeId}`, channel_name: 'MediumFast' }
                 });
-                // 順序為：Statement 0 (INSERT nodes) -> Statement 1 (INSERT chat_messages) -> Statement 2 (INSERT packet_logs)
-                // 對於 !bad_pkt_3，Statement 0 與 Statement 1 會先執行，直到 Statement 2 (packet_logs) 才觸發錯誤！
-                // 若 Binary Isolation 錯誤地拆開同一封包的 statements，!bad_pkt_3 的 nodes 與 chat_messages 就會被提交！
                 executePacketTransactionPlan(plan, hooks, (err) => {
                     results.push({ nodeId, ok: !err, err });
                 });
             }
 
-            // 一次性 Flush 包含 5 個多語句封包的同一批次
             await db.flushDbQueue();
 
             assert.equal(results.length, 5, '5 個封包都應完成回呼');
@@ -461,9 +655,9 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             assert.deepEqual(goodResults, ['!good_pkt_1', '!good_pkt_2', '!good_pkt_4', '!good_pkt_5']);
             assert.equal(badResults.length, 1);
             assert.equal(badResults[0].nodeId, '!bad_pkt_3');
+            assert.equal(badResults[0].err.errorType, ERROR_TYPES.DATA_CONSTRAINT);
             assert.equal(badResults[0].err.failedStatementIndex, 2, '應在封包的第 3 筆語句 (packet_logs) 觸發失敗');
 
-            // 驗證 Binary Isolation 沒有把 !bad_pkt_3 的前兩筆語句 (nodes, chat_messages) 拆開提交！
             const badNodeRow = await db.get('SELECT * FROM nodes WHERE node_id = ?', ['!bad_pkt_3']);
             const badChatRows = await db.all('SELECT * FROM chat_messages WHERE node_id = ?', ['!bad_pkt_3']);
             const badLogRows = await db.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!bad_pkt_3']);
@@ -471,7 +665,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             assert.equal(badChatRows.length, 0, 'Binary Isolation 絕不可將失敗封包的第 2 筆 chat_messages 語句單獨提交');
             assert.equal(badLogRows.length, 0, 'Binary Isolation 絕不可將失敗封包的第 3 筆 packet_logs 語句提交');
 
-            // 驗證其他 4 個有效封包的所有關聯表 (nodes, chat_messages, packet_logs) 均完整提交
             const committedNodes = await db.all('SELECT node_id FROM nodes ORDER BY node_id ASC');
             const committedChats = await db.all('SELECT node_id, message FROM chat_messages ORDER BY node_id ASC');
             const committedLogs = await db.all('SELECT node_id FROM packet_logs ORDER BY node_id ASC');
@@ -481,10 +674,13 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             assert.deepEqual(committedLogs.map(r => r.node_id), ['!good_pkt_1', '!good_pkt_2', '!good_pkt_4', '!good_pkt_5']);
 
             const qMetrics = db.writeQueue.getMetrics();
+            assert.equal(db.writeQueue.state, QUEUE_STATES.NORMAL, 'DATA_CONSTRAINT 隔離後佇列應維持 NORMAL 狀態');
             assert.equal(qMetrics.totalAccepted, 5);
             assert.equal(qMetrics.totalCommitted, 4);
             assert.equal(qMetrics.totalQuarantined, 1);
+            assert.equal(qMetrics.uncommittedErrorCount, 0);
             assert.equal(db.writeQueue.quarantinedItems[0].isTransactionUnit, true);
+            assert.equal(db.writeQueue.quarantinedItems[0].errorType, ERROR_TYPES.DATA_CONSTRAINT);
             assert.equal(db.writeQueue.quarantinedItems[0].statements.length, 3);
             assertDataConservation(qMetrics);
         } finally {
@@ -493,7 +689,121 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
     });
 
-    it('Test 4.0.2-6 & 4.0.2-7 — Callback Exactly-Once & Post-Commit Ordering Guarantee: 每個封包回呼最多只觸發一次，且未提交前絕不提前回報成功或觸發推播', async () => {
+    // =========================================================================
+    // 6. P1 測試 B：UNKNOWN 錯誤嚴禁進入 Binary Isolation 並觸發 Fatal 暫停 (Section 二 測試 B)
+    // =========================================================================
+    it('Test 4.0.2-6 — UNKNOWN Error Fatal Pause & No Binary Isolation (P1 Test B): 封包交易發生 SQLITE_ERROR 等 UNKNOWN 錯誤時，不進入 Binary Isolation、不標記 QUARANTINED，並觸發 Fatal 暫停保護', async () => {
+        const dbPath = createTempPath('pkt_tx_unknown_fatal');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            bootstrapSchema: true,
+            config: { queue: { batchChunkSize: 10, flushIntervalMs: 5000 } }
+        });
+
+        try {
+            let binaryIsolateCalled = false;
+            const origBinaryIsolate = db.writeQueue._binaryIsolateBatch.bind(db.writeQueue);
+            db.writeQueue._binaryIsolateBatch = async (...args) => {
+                binaryIsolateCalled = true;
+                return origBinaryIsolate(...args);
+            };
+
+            const settledCallbacks = [];
+            const emits = [];
+            const hooks = {
+                enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                batchEmit: (type, payload) => emits.push({ type, payload }),
+                recordLivePacketAnalytics: () => {},
+                logger: { log: () => {}, error: () => {} }
+            };
+
+            // 封包 1：合法封包（但與封包 2 在同一個批次交易中）
+            const validPlan = buildMqttPacketTransactionPlan({
+                fromId: '!pkt_before_unknown',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 601, hop_limit: 3, hop_start: 3, rx_snr: 8.0, rx_rssi: -75 },
+                rawHex: '0101',
+                decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
+                payloadObj: { text: 'Valid packet in same batch', channel_name: 'MediumFast' }
+            });
+
+            // 封包 2：包含 SQLITE_ERROR (不存在的資料表 / 欄位語法錯誤 -> classifyError 判定為 ERROR_TYPES.UNKNOWN)
+            const unknownErrPlan = buildMqttPacketTransactionPlan({
+                fromId: '!pkt_with_unknown_err',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 602, hop_limit: 3, hop_start: 3, rx_snr: 8.0, rx_rssi: -75 },
+                rawHex: '0202',
+                decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
+                payloadObj: { text: 'Packet triggering SQLITE_ERROR', channel_name: 'MediumFast' },
+                extraStatements: [
+                    {
+                        sql: 'INSERT INTO non_existent_table_xyz (bad_col) VALUES (?)',
+                        params: ['boom']
+                    }
+                ]
+            });
+
+            executePacketTransactionPlan(validPlan, hooks, (err, res) => {
+                settledCallbacks.push({ id: 'pkt1', err, res });
+            });
+            executePacketTransactionPlan(unknownErrPlan, hooks, (err, res) => {
+                settledCallbacks.push({ id: 'pkt2', err, res });
+            });
+
+            await db.flushDbQueue();
+
+            // 1. 確認該錯誤確實屬於 ERROR_TYPES.UNKNOWN
+            assert.ok(db.writeQueue.lastError, 'WriteQueue 應記錄 lastError');
+            assert.equal(classifyError(db.writeQueue.lastError), ERROR_TYPES.UNKNOWN);
+
+            // 2. 確認絕對沒有進入 Binary Isolation，也沒有任何項目被標記為 QUARANTINED
+            assert.equal(binaryIsolateCalled, false, 'ERROR_TYPES.UNKNOWN 絕不可進入 _binaryIsolateBatch');
+            assert.equal(db.writeQueue.totalQuarantined, 0, 'UNKNOWN 錯誤不得標記為 QUARANTINED');
+            assert.equal(db.writeQueue.quarantinedItems.length, 0);
+
+            // 3. 確認 WriteQueue 已進入 PAUSED_ERROR 致命錯誤暫停狀態，且拒絕後續新寫入
+            assert.equal(db.writeQueue.state, QUEUE_STATES.PAUSED_ERROR, '遇到 UNKNOWN 錯誤時 WriteQueue 必須進入 PAUSED_ERROR');
+            assert.equal(db.writeQueue._shutdownGateClosed, true, '必須關閉寫入閘門防止持續寫入異常資料庫');
+
+            let postPauseRejectErr = null;
+            const acceptedAfterPause = db.queueDbOp('INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)', ['!x', 'y', 'z'], (err) => {
+                postPauseRejectErr = err;
+            });
+            assert.equal(acceptedAfterPause, false, 'PAUSED_ERROR 狀態下必須拒絕後續新寫入');
+            assert.ok(postPauseRejectErr);
+
+            // 4. 確認尚未提交的項目全數標記為 UNCOMMITTED_ERROR，沒有任何項目被錯誤回報為成功
+            assert.equal(settledCallbacks.length, 2, '批次內 2 個未提交項目皆應收到錯誤回呼');
+            assert.ok(settledCallbacks[0].err, '同批次未提交之 pkt1 不得被誤判為成功');
+            assert.ok(settledCallbacks[1].err, '觸發 UNKNOWN 之 pkt2 不得被誤判為成功');
+            assert.equal(emits.length, 0, '交易回滾時不得發出任何 batchEmit');
+
+            // 5. 確認保留完整診斷資訊 (failedStatementIndex, failedStatementSql, errorType, transactionLabel)
+            assert.equal(db.writeQueue.uncommittedErrors.length, 2);
+            const diag = db.writeQueue.uncommittedErrors[1];
+            assert.equal(diag.errorType, ERROR_TYPES.UNKNOWN);
+            assert.equal(diag.failedStatementIndex, 3);
+            assert.match(diag.failedStatementSql, /non_existent_table_xyz/);
+            assert.equal(diag.transactionLabel, 'MQTT_PACKET:!pkt_with_unknown_err:TEXT_MESSAGE_APP');
+
+            // 6. 確認資料庫中無任何殘留寫入
+            const nodesInDb = await db.all('SELECT * FROM nodes');
+            assert.equal(nodesInDb.length, 0, '回滾後資料庫不得有任何部分寫入');
+            assertDataConservation(db.writeQueue.getMetrics());
+        } finally {
+            await db.close();
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 7. Post-Commit 時序與 Callback Exactly-Once 保證
+    // =========================================================================
+    it('Test 4.0.2-7 — Post-Commit Ordering & Exactly-Once Callback: 每個封包回呼最多只觸發一次，且未提交前絕不提前回報成功或觸發推播', async () => {
         const dbPath = createTempPath('pkt_tx_cb_order');
         const db = await createDatabaseSubsystem({
             dbPath,
@@ -505,7 +815,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             const timeline = [];
             let cbInvocationCount = 0;
 
-            // 包裝 adapter.transaction 以觀測底層 COMMIT 完成的時間點
             const origTransaction = db.adapter.transaction.bind(db.adapter);
             db.adapter.transaction = async (txFn) => {
                 timeline.push('TX_BEGIN');
@@ -551,7 +860,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 }
             );
 
-            // 入列後、尚未 Flush 時，絕不可提前觸發任何推播、戰情累加或成功回呼
             assert.equal(cbInvocationCount, 0, '尚未 Flush/COMMIT 前，回呼次數必須為 0');
             assert.deepEqual(timeline, [], '尚未 COMMIT 前，不得有任何推播或戰情副作用');
 
@@ -574,54 +882,244 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
     });
 
-    it('Test 4.0.2-8 — High-Concurrency Multi-Packet Ingestion: 多封包高併發快速連續進入時，不會互相污染或交錯破壞交易完整性', async () => {
-        const dbPath = createTempPath('pkt_tx_concurrent');
+    // =========================================================================
+    // 8. P2：Post-Commit Hook 例外保護與 Callback 不遺失測試 (Section 四)
+    // =========================================================================
+    it('Test 4.0.2-8 — Post-Commit Hook Exception Isolation (P2): 分別模擬 logger、analytics、batchEmit 拋出例外，確認 SQLite 交易維持已提交、其他 hook 繼續執行且 caller callback 確保執行一次', async () => {
+        const dbPath = createTempPath('pkt_tx_hook_isolation');
+        const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
+
+        try {
+            // Case 1: logger.log 拋出例外 -> analytics、batchEmit 與 caller callback 仍正常執行
+            const case1ErrorsLogged = [];
+            let case1AnalyticsCount = 0;
+            const case1Emits = [];
+            let case1CbCount = 0;
+            let case1CbErr = 'NOT_CALLED';
+            let case1CbRes = null;
+
+            const plan1 = buildMqttPacketTransactionPlan({
+                fromId: '!hook_node_1',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 701, hop_limit: 3, hop_start: 3, rx_snr: 8.0, rx_rssi: -70 },
+                rawHex: 'AA01',
+                decodedData: { portnum: 'NODEINFO_APP', channel_name: 'MediumFast' },
+                payloadObj: { long_name: 'Hook Test 1', short_name: 'HK1', role: 'CLIENT' },
+                nodeInfoData: { long_name: 'Hook Test 1', short_name: 'HK1', role: 'CLIENT' }
+            });
+
+            executePacketTransactionPlan(
+                plan1,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    logger: {
+                        log: () => { throw new Error('LOGGER_LOG_BOOM'); },
+                        error: (msg) => case1ErrorsLogged.push(msg)
+                    },
+                    recordLivePacketAnalytics: () => { case1AnalyticsCount++; },
+                    batchEmit: (type, payload) => { case1Emits.push(type); }
+                },
+                (err, res) => {
+                    case1CbCount++;
+                    case1CbErr = err;
+                    case1CbRes = res;
+                }
+            );
+
+            // Case 2: recordLivePacketAnalytics 拋出例外 -> logger、batchEmit 與 caller callback 仍正常執行
+            const case2ErrorsLogged = [];
+            const case2Logs = [];
+            const case2Emits = [];
+            let case2CbCount = 0;
+            let case2CbErr = 'NOT_CALLED';
+            let case2CbRes = null;
+
+            const plan2 = buildMqttPacketTransactionPlan({
+                fromId: '!hook_node_2',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 702, hop_limit: 3, hop_start: 3, rx_snr: 8.5, rx_rssi: -71 },
+                rawHex: 'AA02',
+                decodedData: { portnum: 'NODEINFO_APP', channel_name: 'MediumFast' },
+                payloadObj: { long_name: 'Hook Test 2', short_name: 'HK2', role: 'CLIENT' },
+                nodeInfoData: { long_name: 'Hook Test 2', short_name: 'HK2', role: 'CLIENT' }
+            });
+
+            executePacketTransactionPlan(
+                plan2,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    logger: {
+                        log: (m) => case2Logs.push(m),
+                        error: (msg) => case2ErrorsLogged.push(msg)
+                    },
+                    recordLivePacketAnalytics: () => { throw new Error('ANALYTICS_BOOM'); },
+                    batchEmit: (type) => { case2Emits.push(type); }
+                },
+                (err, res) => {
+                    case2CbCount++;
+                    case2CbErr = err;
+                    case2CbRes = res;
+                }
+            );
+
+            // Case 3: batchEmit 拋出例外 -> logger、analytics、其餘 emit 與 caller callback 仍正常執行
+            const case3ErrorsLogged = [];
+            let case3AnalyticsCount = 0;
+            const case3Emits = [];
+            let case3CbCount = 0;
+            let case3CbErr = 'NOT_CALLED';
+            let case3CbRes = null;
+
+            const plan3 = buildMqttPacketTransactionPlan({
+                fromId: '!hook_node_3',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 703, hop_limit: 3, hop_start: 3, rx_snr: 9.0, rx_rssi: -72 },
+                rawHex: 'AA03',
+                decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+                payloadObj: { device_metrics: { battery_level: 91 } },
+                telemetryData: { batteryLevel: 91, finalVoltage: 4.12, finalCurrent: 80, temperature: 24.0, humidity: 55.0 }
+            });
+
+            let emitCallIdx = 0;
+            executePacketTransactionPlan(
+                plan3,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    logger: {
+                        log: () => {},
+                        error: (msg) => case3ErrorsLogged.push(msg)
+                    },
+                    recordLivePacketAnalytics: () => { case3AnalyticsCount++; },
+                    batchEmit: (type) => {
+                        emitCallIdx++;
+                        if (emitCallIdx === 1) {
+                            throw new Error('BATCH_EMIT_FIRST_EVENT_BOOM');
+                        }
+                        case3Emits.push(type);
+                    }
+                },
+                (err, res) => {
+                    case3CbCount++;
+                    case3CbErr = err;
+                    case3CbRes = res;
+                }
+            );
+
+            await db.flushDbQueue();
+
+            // 驗證 Case 1 (logger.log 失敗)
+            assert.equal(case1CbCount, 1, 'Case 1 caller callback 必須精確執行 1 次');
+            assert.equal(case1CbErr, null, 'Case 1 交易已提交，不得因 logger 失敗誤判為交易失敗');
+            assert.equal(case1AnalyticsCount, 1, 'Case 1 analytics 仍應正常執行');
+            assert.equal(case1Emits.length, 3, 'Case 1 batchEmit 仍應正常執行');
+            assert.equal(case1ErrorsLogged.length, 1, 'Case 1 必須記錄 POST_COMMIT_HOOK_ERROR');
+            assert.match(case1ErrorsLogged[0], /POST_COMMIT_HOOK_ERROR.*logger\.log/);
+            assert.equal(case1CbRes.postCommitErrors.length, 1);
+
+            // 驗證 Case 2 (recordLivePacketAnalytics 失敗)
+            assert.equal(case2CbCount, 1, 'Case 2 caller callback 必須精確執行 1 次');
+            assert.equal(case2CbErr, null, 'Case 2 交易已提交，不得因 analytics 失敗誤判為交易失敗');
+            assert.equal(case2Logs.length, 1, 'Case 2 logger.log 仍應正常執行');
+            assert.equal(case2Emits.length, 3, 'Case 2 batchEmit 仍應正常執行');
+            assert.equal(case2ErrorsLogged.length, 1, 'Case 2 必須記錄 POST_COMMIT_HOOK_ERROR');
+            assert.match(case2ErrorsLogged[0], /POST_COMMIT_HOOK_ERROR.*recordLivePacketAnalytics/);
+            assert.equal(case2CbRes.postCommitErrors.length, 1);
+
+            // 驗證 Case 3 (batchEmit 第一個事件失敗)
+            assert.equal(case3CbCount, 1, 'Case 3 caller callback 必須精確執行 1 次');
+            assert.equal(case3CbErr, null, 'Case 3 交易已提交，不得因 batchEmit 失敗誤判為交易失敗');
+            assert.equal(case3AnalyticsCount, 1, 'Case 3 analytics 仍應正常執行');
+            assert.equal(case3Emits.length, 2, 'Case 3 第 1 個 emit 拋錯後，剩餘 2 個 emit 仍應繼續執行');
+            assert.equal(case3ErrorsLogged.length, 1, 'Case 3 必須記錄 POST_COMMIT_HOOK_ERROR');
+            assert.match(case3ErrorsLogged[0], /POST_COMMIT_HOOK_ERROR.*batchEmit/);
+            assert.equal(case3CbRes.postCommitErrors.length, 1);
+
+            // 驗證 3 筆 SQLite 交易在資料庫中全部維持已提交狀態
+            const committedNodes = await db.all('SELECT node_id FROM nodes ORDER BY node_id ASC');
+            assert.deepEqual(committedNodes.map(n => n.node_id), ['!hook_node_1', '!hook_node_2', '!hook_node_3']);
+        } finally {
+            await db.close();
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 9. 併發寫入 + 併發讀取 + BackupManager VACUUM INTO 備份一致性測試 (Section 五 #3)
+    // =========================================================================
+    it('Test 4.0.2-9 — Concurrent Packet Transactions, Concurrent Reads & Online Backup: 30 個以上封包交易併發執行期間同時進行讀取與 VACUUM INTO 備份，驗證讀取與備份皆無部分交易狀態', async () => {
+        const dbPath = createTempPath('pkt_tx_conc_backup');
+        const backupDir = createTempPath('pkt_tx_backups', '');
+        fs.mkdirSync(backupDir, { recursive: true });
+
         const db = await createDatabaseSubsystem({
             dbPath,
+            backupDir,
             bootstrapSchema: true,
-            config: { queue: { batchChunkSize: 12, flushIntervalMs: 20 } }
+            config: { queue: { batchChunkSize: 5, flushIntervalMs: 10 } }
         });
 
         try {
-            const totalPackets = 60;
-            const settledPromises = [];
+            const totalPackets = 32; // > 25 個交易單位，分成多個批次提交
+            const writePromises = [];
+            const readObservations = [];
+            let stopReaders = false;
 
+            // 啟動持續併發讀取 Worker：檢查任一時間點讀取到的 nodes、packet_logs、telemetry_data 數量必須完全一致（無半套封包）
+            const readerLoop = (async () => {
+                while (!stopReaders) {
+                    const snapshot = await db.get(`
+                        SELECT
+                            (SELECT COUNT(*) FROM nodes) AS nodes_cnt,
+                            (SELECT COUNT(*) FROM packet_logs) AS logs_cnt,
+                            (SELECT COUNT(*) FROM telemetry_data) AS tele_cnt
+                    `);
+                    readObservations.push(snapshot);
+                    assert.equal(
+                        snapshot.nodes_cnt,
+                        snapshot.logs_cnt,
+                        `併發讀取不可觀測到不一致狀態: nodes=${snapshot.nodes_cnt} !== logs=${snapshot.logs_cnt}`
+                    );
+                    assert.equal(
+                        snapshot.logs_cnt,
+                        snapshot.tele_cnt,
+                        `併發讀取不可觀測到不一致狀態: logs=${snapshot.logs_cnt} !== tele=${snapshot.tele_cnt}`
+                    );
+                    await new Promise(r => setTimeout(r, 5));
+                }
+            })();
+
+            // 分批推入 32 個跨表 TELEMETRY_APP 封包交易，並在寫入進行到一半時觸發真實 BackupManager.performBackup()
+            let backupPromise = null;
             for (let i = 1; i <= totalPackets; i++) {
-                const nodeId = `!conc${String(i).padStart(4, '0')}`;
-                const isTelemetry = (i % 2 === 0);
-                const plan = isTelemetry
-                    ? buildMqttPacketTransactionPlan({
-                        fromId: nodeId,
-                        topic: 'msh/TW/2/e/MediumFast/!gw_conc',
-                        resolvedChannel: 'MediumFast',
-                        gatewayId: '!gw_conc',
-                        packet: { id: 1000 + i, hop_limit: 2, hop_start: 3, rx_snr: 6.5, rx_rssi: -85 },
-                        rawHex: 'AABB',
-                        decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
-                        payloadObj: { device_metrics: { battery_level: i } },
-                        telemetryData: {
-                            batteryLevel: i,
-                            finalVoltage: 4.0 + (i * 0.001),
-                            finalCurrent: 100 + i,
-                            temperature: 20 + (i * 0.1),
-                            humidity: 50 + (i * 0.2),
-                            channelUtilization: 10,
-                            airUtilTx: 1,
-                            adcVoltage: 4.0
-                        }
-                    })
-                    : buildMqttPacketTransactionPlan({
-                        fromId: nodeId,
-                        topic: 'msh/TW/2/e/MediumFast/!gw_conc',
-                        resolvedChannel: 'MediumFast',
-                        gatewayId: '!gw_conc',
-                        packet: { id: 1000 + i, hop_limit: 1, hop_start: 3, rx_snr: 4.5, rx_rssi: -91 },
-                        rawHex: 'CCDD',
-                        decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
-                        payloadObj: { text: `Concurrent msg #${i}`, channel_name: 'MediumFast' }
-                    });
+                const nodeId = `!cbkp${String(i).padStart(4, '0')}`;
+                const plan = buildMqttPacketTransactionPlan({
+                    fromId: nodeId,
+                    topic: 'msh/TW/2/e/MediumFast/!gw_bkp',
+                    resolvedChannel: 'MediumFast',
+                    gatewayId: '!gw_bkp',
+                    packet: { id: 2000 + i, hop_limit: 2, hop_start: 3, rx_snr: 7.5, rx_rssi: -80 },
+                    rawHex: '112233',
+                    decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+                    payloadObj: { device_metrics: { battery_level: i } },
+                    telemetryData: {
+                        batteryLevel: i,
+                        finalVoltage: 4.0,
+                        finalCurrent: 100,
+                        temperature: 25.0,
+                        humidity: 60.0,
+                        channelUtilization: 10,
+                        airUtilTx: 1,
+                        adcVoltage: 4.0
+                    }
+                });
 
-                settledPromises.push(
+                writePromises.push(
                     new Promise((resolve, reject) => {
                         executePacketTransactionPlan(
                             plan,
@@ -638,28 +1136,216 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                         );
                     })
                 );
+
+                if (i % 5 === 0) {
+                    // 觸發非同步 Flush 讓批次交易在背景持續進行
+                    db.flushDbQueue().catch(() => {});
+                    await new Promise(r => setTimeout(r, 5));
+                }
+
+                if (i === 15) {
+                    // 在交易持續進行期間啟動真實 VACUUM INTO 線上備份
+                    backupPromise = db.backupManager.performBackup('concurrent_snapshot.db', { backupDir });
+                }
             }
 
-            await db.flushDbQueue();
-            await Promise.all(settledPromises);
+            const [backupResult] = await Promise.all([
+                backupPromise,
+                db.flushDbQueue(),
+                Promise.all(writePromises)
+            ]);
+            stopReaders = true;
+            await readerLoop;
 
-            const nodesCount = await db.get('SELECT COUNT(*) as c FROM nodes');
-            const logsCount = await db.get('SELECT COUNT(*) as c FROM packet_logs');
-            const teleCount = await db.get('SELECT COUNT(*) as c FROM telemetry_data');
-            const chatCount = await db.get('SELECT COUNT(*) as c FROM chat_messages');
+            assert.ok(readObservations.length > 0, '交易執行期間必須實際執行併發讀取');
+            assert.ok(backupResult, 'BackupManager.performBackup 必須回傳結果');
+            assert.equal(backupResult.status, 'COMPLETED', '線上備份必須成功完成');
+            assert.ok(fs.existsSync(backupResult.targetPath), '備份檔案必須實際存在於磁碟');
 
-            assert.equal(nodesCount.c, 60, '60 個併發節點必須全數寫入 nodes');
-            assert.equal(logsCount.c, 60, '60 筆封包日誌必須全數寫入 packet_logs');
-            assert.equal(teleCount.c, 30, '30 筆遙測封包必須全數寫入 telemetry_data');
-            assert.equal(chatCount.c, 30, '30 筆聊天封包必須全數寫入 chat_messages');
+            // 開啟獨立備份資料庫檔案，驗證完整性與跨表交易一致性（無半套封包）
+            const bkpIntegrity = await querySqliteAll(backupResult.targetPath, 'PRAGMA integrity_check');
+            assert.equal(bkpIntegrity[0].integrity_check, 'ok', '備份資料庫 PRAGMA integrity_check 必須為 ok');
+
+            const bkpCounts = await querySqliteAll(backupResult.targetPath, `
+                SELECT
+                    (SELECT COUNT(*) FROM nodes) AS nodes_cnt,
+                    (SELECT COUNT(*) FROM packet_logs) AS logs_cnt,
+                    (SELECT COUNT(*) FROM telemetry_data) AS tele_cnt
+            `);
+            const snap = bkpCounts[0];
+            assert.ok(snap.nodes_cnt > 0, '備份檔案應包含已提交的封包資料');
+            assert.equal(snap.nodes_cnt, snap.logs_cnt, '備份檔案中 nodes 與 packet_logs 筆數必須完全一致（無部分交易）');
+            assert.equal(snap.logs_cnt, snap.tele_cnt, '備份檔案中 packet_logs 與 telemetry_data 筆數必須完全一致（無部分交易）');
+
+            // 驗證主資料庫最終 32 個封包全數提交完成
+            const finalMainCounts = await db.get(`
+                SELECT
+                    (SELECT COUNT(*) FROM nodes) AS nodes_cnt,
+                    (SELECT COUNT(*) FROM packet_logs) AS logs_cnt,
+                    (SELECT COUNT(*) FROM telemetry_data) AS tele_cnt
+            `);
+            assert.equal(finalMainCounts.nodes_cnt, totalPackets);
+            assert.equal(finalMainCounts.logs_cnt, totalPackets);
+            assert.equal(finalMainCounts.tele_cnt, totalPackets);
             assertDataConservation(db.writeQueue.getMetrics());
         } finally {
             await db.close();
             cleanupDbFiles(dbPath);
+            cleanupDirRecursive(backupDir);
         }
     });
 
-    it('Test 4.0.2-9 & 4.0.2-10 — Unknown Node Pre-NODEINFO Arrival & COALESCE / RF Tunnel Semantics: 未知節點先收到封包可正常寫入，後續 NODEINFO 與 COALESCE 更新語意完全相容', async () => {
+    // =========================================================================
+    // 10. Shutdown 時的 Active Transaction Drain 測試 (Section 五 #4)
+    // =========================================================================
+    it('Test 4.0.2-10 — Shutdown Active Packet Transaction Drain: 交易執行中延遲並觸發 ShutdownHandler，確認等待進行中與排隊交易完成後才安全關閉資料庫', async () => {
+        const dbPath = createTempPath('pkt_tx_shutdown_drain');
+        const db = await createDatabaseSubsystem({
+            dbPath,
+            bootstrapSchema: true,
+            config: { queue: { batchChunkSize: 1, flushIntervalMs: 5000 } }
+        });
+
+        try {
+            const timeline = [];
+            let tx1MidStepReachedResolve;
+            const tx1MidStepReached = new Promise((resolve) => {
+                tx1MidStepReachedResolve = resolve;
+            });
+
+            // 包裝 adapter.transaction 與 close，讓第 1 筆封包交易在第 2 條 SQL 處延遲 120ms，確保 Shutdown 發生時該交易正處於 Active In-Flight 狀態
+            const origTransaction = db.adapter.transaction.bind(db.adapter);
+            db.adapter.transaction = async (txFn) => {
+                return origTransaction(async (tx) => {
+                    let step = 0;
+                    const delayedTx = {
+                        ...tx,
+                        execute: async (sql, params) => {
+                            step++;
+                            const res = await tx.execute(sql, params);
+                            if (step === 2) {
+                                timeline.push('TX1_MID_FLIGHT_REACHED');
+                                if (tx1MidStepReachedResolve) {
+                                    tx1MidStepReachedResolve();
+                                    tx1MidStepReachedResolve = null;
+                                }
+                                await new Promise(r => setTimeout(r, 120));
+                                timeline.push('TX1_DELAY_FINISHED');
+                            }
+                            return res;
+                        }
+                    };
+                    const out = await txFn(delayedTx);
+                    timeline.push('ACTIVE_TX_COMMITTED');
+                    return out;
+                });
+            };
+
+            const origClose = db.adapter.close.bind(db.adapter);
+            db.adapter.close = async (...args) => {
+                timeline.push('ADAPTER_CLOSE_CALLED');
+                return origClose(...args);
+            };
+
+            let cb1Count = 0;
+            let cb1Err = null;
+            let cb2Count = 0;
+            let cb2Err = null;
+
+            const plan1 = buildMqttPacketTransactionPlan({
+                fromId: '!drain_node_1',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 801, hop_limit: 3, hop_start: 3, rx_snr: 9.0, rx_rssi: -70 },
+                rawHex: 'AA01',
+                decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
+                payloadObj: { text: 'In-flight active transaction during shutdown', channel_name: 'MediumFast' }
+            });
+
+            const plan2 = buildMqttPacketTransactionPlan({
+                fromId: '!drain_node_2',
+                topic: 'msh/TW/2/e/MediumFast/!gw01',
+                resolvedChannel: 'MediumFast',
+                gatewayId: '!gw01',
+                packet: { id: 802, hop_limit: 3, hop_start: 3, rx_snr: 9.5, rx_rssi: -68 },
+                rawHex: 'AA02',
+                decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
+                payloadObj: { text: 'Queued transaction drained during shutdown', channel_name: 'MediumFast' }
+            });
+
+            // 排入 plan1 (因為 batchChunkSize=1 會立即啟動 flush 進入 active transaction)
+            executePacketTransactionPlan(
+                plan1,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    batchEmit: () => {},
+                    recordLivePacketAnalytics: () => {},
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    cb1Count++;
+                    cb1Err = err;
+                    timeline.push('CB1_INVOKED');
+                }
+            );
+
+            // 等待 plan1 進入交易中段 (尚未完成、尚未 COMMIT)
+            await tx1MidStepReached;
+
+            // 在 plan1 仍在交易中段時，再排入 plan2 並立即觸發 ShutdownHandler.handle('SIGTERM')
+            executePacketTransactionPlan(
+                plan2,
+                {
+                    enqueuePacketTransaction: db.queuePacketTransaction.bind(db),
+                    batchEmit: () => {},
+                    recordLivePacketAnalytics: () => {},
+                    logger: { log: () => {}, error: () => {} }
+                },
+                (err) => {
+                    cb2Count++;
+                    cb2Err = err;
+                    timeline.push('CB2_INVOKED');
+                }
+            );
+
+            timeline.push('SHUTDOWN_TRIGGERED');
+            await db.shutdownHandler.handle('SIGTERM', { exitProcess: false });
+
+            // 驗證：Shutdown 發生在 TX1 交易中段之後，但資料庫關閉 (ADAPTER_CLOSE_CALLED) 必須發生在 TX1 與 TX2 皆完成提交與 callback 之後！
+            const midIdx = timeline.indexOf('TX1_MID_FLIGHT_REACHED');
+            const shutdownIdx = timeline.indexOf('SHUTDOWN_TRIGGERED');
+            const delayDoneIdx = timeline.indexOf('TX1_DELAY_FINISHED');
+            const cb1Idx = timeline.indexOf('CB1_INVOKED');
+            const cb2Idx = timeline.indexOf('CB2_INVOKED');
+            const closeIdx = timeline.indexOf('ADAPTER_CLOSE_CALLED');
+
+            assert.ok(midIdx !== -1 && shutdownIdx > midIdx, 'Shutdown 必須在交易仍在進行中時觸發');
+            assert.ok(delayDoneIdx > shutdownIdx, '交易延遲結束必須在 Shutdown 觸發之後');
+            assert.ok(cb1Idx > delayDoneIdx && cb1Idx < closeIdx, '進行中交易之 callback 必須在關閉連線前完成');
+            assert.ok(cb2Idx > cb1Idx && cb2Idx < closeIdx, '佇列中交易之 callback 必須在關閉連線前完成');
+
+            assert.equal(cb1Count, 1, 'CB1 必須精確執行 1 次');
+            assert.equal(cb1Err, null, '進行中交易必須成功提交');
+            assert.equal(cb2Count, 1, 'CB2 必須精確執行 1 次');
+            assert.equal(cb2Err, null, '排隊交易必須在 Drain 階段成功提交');
+
+            // 重新開啟資料庫驗證兩筆交易皆完整持久化且資料庫無損壞
+            const rows = await querySqliteAll(dbPath, 'SELECT node_id, message FROM chat_messages ORDER BY node_id ASC');
+            assert.equal(rows.length, 2, '兩筆封包交易皆應完整寫入資料庫');
+            assert.deepEqual(rows.map(r => r.node_id), ['!drain_node_1', '!drain_node_2']);
+
+            const integrity = await querySqliteAll(dbPath, 'PRAGMA integrity_check');
+            assert.equal(integrity[0].integrity_check, 'ok');
+        } finally {
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 11. 未知節點先到達、COALESCE 與 RF Tunnel 相容性測試 (Section 七)
+    // =========================================================================
+    it('Test 4.0.2-11 — Unknown Node Pre-NODEINFO Arrival & COALESCE / RF Tunnel Semantics: 未知節點先收到封包可正常寫入，後續 NODEINFO 與 COALESCE 更新語意完全相容', async () => {
         const dbPath = createTempPath('pkt_tx_unknown_node');
         const db = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
 
@@ -673,7 +1359,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
 
             const unknownNodeId = '!f00dbabe';
 
-            // Step 1: 未知節點尚未發送過 NODEINFO，先收到 POSITION_APP 封包
             const posPlan = buildMqttPacketTransactionPlan({
                 fromId: unknownNodeId,
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -689,7 +1374,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             executePacketTransactionPlan(posPlan, hooks);
 
-            // Step 2: 未知節點接著收到 TELEMETRY_APP (僅含電池與電壓，不含溫溼度)
             const telePlan1 = buildMqttPacketTransactionPlan({
                 fromId: unknownNodeId,
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -712,7 +1396,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             executePacketTransactionPlan(telePlan1, hooks);
 
-            // Step 3: 未知節點接著收到第二筆 TELEMETRY_APP (僅含環境溫溼度，電池為 null -> 測試 COALESCE 不覆寫既有電池)
             const telePlan2 = buildMqttPacketTransactionPlan({
                 fromId: unknownNodeId,
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -735,7 +1418,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             executePacketTransactionPlan(telePlan2, hooks);
 
-            // Step 4: 最後才收到 NODEINFO_APP -> 驗證長短名稱更新且不洗掉先前寫入的座標與遙測數值
             const nodeInfoPlan = buildMqttPacketTransactionPlan({
                 fromId: unknownNodeId,
                 topic: 'msh/TW/2/e/MediumFast/!gw01',
@@ -756,7 +1438,6 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             });
             executePacketTransactionPlan(nodeInfoPlan, hooks);
 
-            // Step 5: RF Tunnel 位置封包寫入同一節點
             const rfEmits = [];
             const rfPlan = buildRfTunnelPacketTransactionPlan({
                 fromId: unknownNodeId,
@@ -798,25 +1479,172 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
     });
 
     // =========================================================================
-    // 二、TURSO_URL 與備份排程策略確認測試
+    // 12. P1：Turso Fallback 多語句順序執行與錯誤中斷測試 (Section 三)
     // =========================================================================
+    it('Test 4.0.2-12 — Turso Fallback Sequential Multi-Statement Execution (P1): 驗證 Turso fallback 依序執行所有 statements、不將 label 當 SQL、中途失敗立即停止且不觸發成功副作用', async () => {
+        const executedCalls = [];
+        let failAtCallIndex = -1;
 
-    it('Test 4.0.2-Policy — Backup Schedule & TURSO_URL Policy Verification: 驗證備份排程 shouldRun 守門條件與設定檔差異維持凍結政策', async () => {
+        // 建立模擬 Turso @libsql/client.execute 的本地隔離 Mock 包裝器（與 index.js TURSO_URL 分支完全一致）
+        const mockLibsqlClient = {
+            execute: async ({ sql, args }) => {
+                const currentIdx = executedCalls.length;
+                executedCalls.push({ sql, args });
+                if (currentIdx === failAtCallIndex) {
+                    throw new Error(`MOCK_TURSO_SQL_FAILURE_AT_STEP_${currentIdx}`);
+                }
+                return { lastInsertRowid: BigInt(100 + currentIdx), rowsAffected: 1, rows: [] };
+            }
+        };
+
+        const mockTursoDb = {
+            isTursoFallback: true,
+            run: (sql, params, cb) => {
+                const actualParams = typeof params === 'function' ? [] : (Array.isArray(params) ? params : []);
+                const actualCb = typeof params === 'function' ? params : cb;
+                return mockLibsqlClient.execute({ sql, args: actualParams })
+                    .then(r => actualCb && actualCb.call({ lastID: Number(r?.lastInsertRowid ?? 0), changes: Number(r?.rowsAffected ?? 0) }, null))
+                    .catch(err => actualCb && actualCb(err));
+            },
+            serialize: (fn) => fn()
+        };
+
+        // 模擬 index.js 中的 fallback queuePacketTransaction -> executeSequentialFallbackItem 流程
+        const enqueueViaTursoFallback = (statements, callback, options = {}) => {
+            const item = {
+                isTransactionUnit: true,
+                statements: statements.map(s => ({ sql: s.sql, params: Array.isArray(s.params) ? s.params : [] })),
+                label: options.label || `[PACKET_TX:${statements.length}]`,
+                packetMeta: options.packetMeta || null,
+                sql: statements[0].sql,
+                params: statements[0].params || [],
+                callback,
+                callbackInvoked: false
+            };
+            executeSequentialFallbackItem(mockTursoDb, item);
+            return true;
+        };
+
+        // --- Subcase A: 4 條 SQL 全部成功 ---
+        const telePlan = buildMqttPacketTransactionPlan({
+            fromId: '!turso001',
+            topic: 'msh/TW/2/e/MediumFast/!gw_turso',
+            resolvedChannel: 'MediumFast',
+            gatewayId: '!gw_turso',
+            packet: { id: 901, hop_limit: 2, hop_start: 3, rx_snr: 9.0, rx_rssi: -75 },
+            rawHex: 'FFEE',
+            decodedData: { portnum: 'TELEMETRY_APP', channel_name: 'MediumFast' },
+            payloadObj: { device_metrics: { battery_level: 85 } },
+            telemetryData: { batteryLevel: 85, finalVoltage: 4.08, finalCurrent: 90, temperature: 25.0, humidity: 60.0 }
+        });
+        assert.equal(telePlan.statements.length, 4);
+
+        const subcaseAOrder = [];
+        let subcaseACbCount = 0;
+        let subcaseAResult = null;
+
+        await new Promise((resolve, reject) => {
+            executePacketTransactionPlan(
+                telePlan,
+                {
+                    enqueuePacketTransaction: enqueueViaTursoFallback,
+                    recordLivePacketAnalytics: () => subcaseAOrder.push('POST_ANALYTICS'),
+                    batchEmit: (type) => subcaseAOrder.push(`POST_EMIT:${type}`),
+                    logger: { log: () => subcaseAOrder.push('POST_LOG'), error: () => {} }
+                },
+                (err, res) => {
+                    subcaseACbCount++;
+                    if (err) return reject(err);
+                    subcaseAResult = res;
+                    subcaseAOrder.push('CALLER_CALLBACK');
+                    resolve();
+                }
+            );
+        });
+
+        // 1. 驗證 4 條 SQL 皆被執行，且順序與 telePlan.statements 完全一致
+        assert.equal(executedCalls.length, 4, 'Turso fallback 必須完整執行全部 4 條 SQL，不得只執行第 1 條');
+        for (let i = 0; i < 4; i++) {
+            assert.equal(executedCalls[i].sql, telePlan.statements[i].sql, `第 ${i} 條 SQL 順序必須完全一致`);
+            assert.notEqual(executedCalls[i].sql, telePlan.label, '絕不可把 options.label 當成 SQL 執行');
+        }
+        assert.equal(subcaseACbCount, 1, '成功 callback 必須精確執行 1 次');
+        assert.equal(subcaseAResult.statementCount, 4);
+        assert.equal(subcaseAResult.isTursoSequentialFallback, true);
+        assert.ok(subcaseAOrder.includes('POST_ANALYTICS'), '所有 SQL 成功後才執行 analytics');
+        assert.ok(subcaseAOrder.includes('POST_EMIT:telemetry_update'), '所有 SQL 成功後才執行 batchEmit');
+
+        // --- Subcase B: 中途第 2 條 SQL (index=1) 失敗 ---
+        executedCalls.length = 0;
+        failAtCallIndex = 1; // 讓第 2 條 SQL 失敗
+
+        const subcaseBEffects = [];
+        let subcaseBCbCount = 0;
+        let subcaseBErr = null;
+
+        await new Promise((resolve) => {
+            executePacketTransactionPlan(
+                telePlan,
+                {
+                    enqueuePacketTransaction: enqueueViaTursoFallback,
+                    recordLivePacketAnalytics: () => subcaseBEffects.push('ANALYTICS'),
+                    batchEmit: (type) => subcaseBEffects.push(`EMIT:${type}`),
+                    logger: { log: () => subcaseBEffects.push('LOG'), error: () => {} }
+                },
+                (err) => {
+                    subcaseBCbCount++;
+                    subcaseBErr = err;
+                    resolve();
+                }
+            );
+        });
+
+        // 2. 驗證第 2 條 SQL (index=1) 失敗時，第 3 條與第 4 條 SQL 絕不會被繼續執行
+        assert.equal(executedCalls.length, 2, '第 2 條 SQL 失敗後必須立即中止，不得繼續執行第 3、4 條 SQL');
+        assert.equal(subcaseBCbCount, 1, '錯誤 callback 必須精確觸發 1 次');
+        assert.ok(subcaseBErr, '必須收到錯誤物件');
+        assert.equal(subcaseBErr.failedStatementIndex, 1, '應記錄失敗於 index=1');
+        assert.equal(subcaseBErr.failedStatementSql, telePlan.statements[1].sql);
+        assert.equal(subcaseBErr.transactionLabel, telePlan.label);
+        assert.equal(subcaseBEffects.length, 0, '中途失敗時不得執行任何成功的 post-commit effects');
+
+        // --- Subcase C: 驗證非封包交易之一般單筆 SQL 寫入相容性 ---
+        executedCalls.length = 0;
+        failAtCallIndex = -1;
+        let singleOpDone = false;
+        await new Promise((resolve, reject) => {
+            executeSequentialFallbackItem(mockTursoDb, {
+                isTransactionUnit: false,
+                sql: 'DELETE FROM chat_messages WHERE id = ?',
+                params: [42],
+                callback: function (err) {
+                    if (err) return reject(err);
+                    singleOpDone = true;
+                    resolve();
+                }
+            });
+        });
+        assert.equal(singleOpDone, true);
+        assert.equal(executedCalls.length, 1);
+        assert.equal(executedCalls[0].sql, 'DELETE FROM chat_messages WHERE id = ?');
+    });
+
+    // =========================================================================
+    // 13. TURSO_URL 與備份排程策略確認測試
+    // =========================================================================
+    it('Test 4.0.2-13 — Backup Schedule & TURSO_URL Policy Verification: 驗證備份排程 shouldRun 守門條件與設定檔差異維持凍結政策', async () => {
         const dbPath = createTempPath('policy_check');
         const backupDir = createTempPath('policy_backups', '');
         fs.mkdirSync(backupDir, { recursive: true });
 
         const db = await createDatabaseSubsystem({ dbPath, backupDir, bootstrapSchema: true });
         try {
-            // 1. 確認 sqlite.config.js 的預設 cronSchedule 與 index.js 的 '0 0 * * 0' 差異維持既有狀態（未擅自合併修改）
             assert.equal(sqliteConfig.backup.cronSchedule, '0 4 * * *', 'sqlite.config.js 預設 cronSchedule 應維持 0 4 * * *');
 
-            // 2. 驗證 index.js 使用的 shouldRun 規則：未設定 BACKUP_PATH 時回傳 false，設定後且 isBootstrapReady() 為 true 時回傳 true
             let registeredCronExpr = null;
-            let registeredOptions = null;
             const fakeCron = {
                 validate: (expr) => expr === '0 0 * * 0',
-                schedule: (expr, fn) => {
+                schedule: (expr) => {
                     registeredCronExpr = expr;
                     return { stop: () => {} };
                 }
@@ -851,14 +1679,12 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
     });
 
     // =========================================================================
-    // 三、3.1 Cross-Process Abnormal Termination (SIGKILL) & WAL Recovery 測試
+    // 14. SQLite WAL Engine Process Death Recovery Test (SIGKILL) (Section 五 #6 Part 1)
     // =========================================================================
-
-    it('Test 4.0.2-SIGKILL — Cross-Process Abnormal Termination & Recovery: 驗證交易前、交易中段未提交、COMMIT 後立即遭遇跨行程 SIGKILL 之 WAL 恢復與零殘留保證', async () => {
-        const dbPath = createTempPath('cross_proc_sigkill');
+    it('Test 4.0.2-14 — SQLite WAL Process Death Recovery Test (SIGKILL): 驗證原生 SQLite WAL 連線在交易前、交易中段未提交、COMMIT 後遭遇跨行程 SIGKILL 之 WAL 恢復', async () => {
+        const dbPath = createTempPath('wal_engine_sigkill');
         const workerScript = path.join(__dirname, 'helpers', 'sigkill_tx_worker.js');
 
-        // 先透過主子系統完成 Temporary SQLite DB 的完整 Schema Bootstrap，再關閉連線交給子行程操作
         const initDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
         await initDb.close();
 
@@ -874,21 +1700,16 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 const onStageReady = () => {
                     if (stageReached) return;
                     stageReached = true;
-                    // 在收到子行程抵達指定交易階段訊號後，立即發送 SIGKILL 強制終止子行程
                     child.kill('SIGKILL');
                 };
 
                 child.on('message', (msg) => {
-                    if (msg && msg.stage === expectedStage) {
-                        onStageReady();
-                    }
+                    if (msg && msg.stage === expectedStage) onStageReady();
                 });
 
                 child.stdout.on('data', (chunk) => {
                     stdoutBuf += chunk.toString('utf8');
-                    if (stdoutBuf.includes(`"stage":"${expectedStage}"`)) {
-                        onStageReady();
-                    }
+                    if (stdoutBuf.includes(`"stage":"${expectedStage}"`)) onStageReady();
                 });
 
                 child.on('error', reject);
@@ -902,66 +1723,33 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
 
         try {
-            // 1. 子行程 A：完成封包交易 COMMIT 後立即遭遇 SIGKILL (Survivor Node: !aaaa0001)
             await runWorkerAndSigkillAtGate('AFTER_COMMIT', '!aaaa0001', 'READY_FOR_SIGKILL_AFTER_COMMIT');
-
-            // 2. 子行程 B：交易開始前遭遇 SIGKILL
             await runWorkerAndSigkillAtGate('BEFORE_TX', '!00000000', 'READY_FOR_SIGKILL_BEFORE_TX');
-
-            // 3. 子行程 C：在 BEGIN IMMEDIATE 交易中段（已寫入 nodes, packet_logs, chat_messages, neighbors 四張表，尚未寫入 telemetry_data 且尚未 COMMIT）遭遇 SIGKILL (Ghost Node: !bbbb0002)
             await runWorkerAndSigkillAtGate('MID_TX_UNCOMMITTED', '!bbbb0002', 'READY_FOR_SIGKILL_MID_TX');
 
-            // 4. 重新啟動資料庫子系統連接該 Temporary SQLite DB，觸發 SQLite WAL 自動回滾與恢復
             const recoveredDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
             try {
-                // 5. 驗證 PRAGMA integrity_check === 'ok'
                 const integrityRow = await recoveredDb.get('PRAGMA integrity_check');
-                assert.equal(integrityRow.integrity_check, 'ok', '跨行程 SIGKILL 重啟後 PRAGMA integrity_check 必須為 ok');
+                assert.equal(integrityRow.integrity_check, 'ok');
 
-                // 6. 驗證已 COMMIT 的封包資料 (!aaaa0001) 完整存在於所有關聯表
                 const survivorNode = await recoveredDb.get('SELECT * FROM nodes WHERE node_id = ?', ['!aaaa0001']);
                 const survivorLogs = await recoveredDb.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!aaaa0001']);
                 const survivorTele = await recoveredDb.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!aaaa0001']);
-                assert.ok(survivorNode, 'COMMIT 後遭遇 SIGKILL 的節點 !aaaa0001 必須完整保留');
-                assert.equal(survivorNode.short_name, 'SURV');
-                assert.equal(survivorLogs.length, 1, 'COMMIT 後遭遇 SIGKILL 的 packet_logs 必須完整保留');
-                assert.equal(survivorTele.length, 1, 'COMMIT 後遭遇 SIGKILL 的 telemetry_data 必須完整保留');
+                assert.ok(survivorNode);
+                assert.equal(survivorLogs.length, 1);
+                assert.equal(survivorTele.length, 1);
 
-                // 7. 驗證交易中段未 COMMIT 即遭遇 SIGKILL 的封包 (!bbbb0002) 在所有關聯表均零殘留
                 const ghostNode = await recoveredDb.get('SELECT * FROM nodes WHERE node_id = ?', ['!bbbb0002']);
                 const ghostLogs = await recoveredDb.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!bbbb0002']);
                 const ghostChat = await recoveredDb.all('SELECT * FROM chat_messages WHERE node_id = ?', ['!bbbb0002']);
                 const ghostNb = await recoveredDb.all('SELECT * FROM neighbors WHERE node_id = ?', ['!bbbb0002']);
                 const ghostTele = await recoveredDb.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!bbbb0002']);
 
-                assert.equal(ghostNode, null, 'MID_TX SIGKILL 未提交的 nodes 寫入必須被 WAL 完全回滾');
-                assert.equal(ghostLogs.length, 0, 'MID_TX SIGKILL 未提交的 packet_logs 寫入必須被 WAL 完全回滾');
-                assert.equal(ghostChat.length, 0, 'MID_TX SIGKILL 未提交的 chat_messages 寫入必須被 WAL 完全回滾');
-                assert.equal(ghostNb.length, 0, 'MID_TX SIGKILL 未提交的 neighbors 寫入必須被 WAL 完全回滾');
-                assert.equal(ghostTele.length, 0, 'MID_TX SIGKILL 未提交的 telemetry_data 必須為 0');
-
-                // 8. 驗證恢復後的資料庫可繼續正常讀寫與提交新封包交易
-                const postRecoveryPlan = buildMqttPacketTransactionPlan({
-                    fromId: '!cccc0003',
-                    topic: 'msh/TW/2/e/MediumFast/!gw01',
-                    resolvedChannel: 'MediumFast',
-                    gatewayId: '!gw01',
-                    packet: { id: 901, hop_limit: 3, hop_start: 3, rx_snr: 9.0, rx_rssi: -70 },
-                    rawHex: '99887766',
-                    decodedData: { portnum: 'TEXT_MESSAGE_APP', channel_name: 'MediumFast' },
-                    payloadObj: { text: 'Post-SIGKILL recovery write OK', channel_name: 'MediumFast' }
-                });
-                executePacketTransactionPlan(postRecoveryPlan, {
-                    enqueuePacketTransaction: recoveredDb.queuePacketTransaction.bind(recoveredDb),
-                    batchEmit: () => {},
-                    recordLivePacketAnalytics: () => {},
-                    logger: { log: () => {}, error: () => {} }
-                });
-                await recoveredDb.flushDbQueue();
-
-                const newMsg = await recoveredDb.get('SELECT * FROM chat_messages WHERE node_id = ?', ['!cccc0003']);
-                assert.ok(newMsg, '恢復後寫入的新封包必須成功提交並可讀取');
-                assert.equal(newMsg.message, 'Post-SIGKILL recovery write OK');
+                assert.equal(ghostNode, null);
+                assert.equal(ghostLogs.length, 0);
+                assert.equal(ghostChat.length, 0);
+                assert.equal(ghostNb.length, 0);
+                assert.equal(ghostTele.length, 0);
             } finally {
                 await recoveredDb.close();
             }
@@ -971,17 +1759,101 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
     });
 
     // =========================================================================
-    // 四、3.2 Full index.js Startup, Real MQTT Ingestion & Shutdown Integration 測試
+    // 15. Application Packet Transaction Process Death Recovery Test (SIGKILL) (Section 五 #6 Part 2)
     // =========================================================================
+    it('Test 4.0.2-15 — Application Packet Transaction Process Death Test (SIGKILL): 驗證經過專案 WriteQueue 與 PacketTransaction 路徑在執行第 3/4 步中段與 COMMIT 後遭遇 SIGKILL 之原子性恢復', async () => {
+        const dbPath = createTempPath('app_packet_tx_sigkill');
+        const workerScript = path.join(__dirname, 'helpers', 'sigkill_tx_worker.js');
 
-    it('Test 4.0.2-IndexStartup-Success — Full index.js Startup, Real MQTT Protobuf Ingestion & Graceful Shutdown: 完整啟動受控 index.js 子行程，驗證啟動屏障順序、真實 Protobuf 封包寫入與安全關機流程', async () => {
+        const initDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
+        await initDb.close();
+
+        function runAppWorkerAndSigkill(mode, nodeId, expectedStage) {
+            return new Promise((resolve, reject) => {
+                const child = spawn(process.execPath, [workerScript, mode, dbPath, nodeId], {
+                    stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+                });
+
+                let stageReached = false;
+                let stdoutBuf = '';
+                let stderrBuf = '';
+
+                const onStageReady = () => {
+                    if (stageReached) return;
+                    stageReached = true;
+                    child.kill('SIGKILL');
+                };
+
+                child.on('message', (msg) => {
+                    if (msg && msg.stage === expectedStage) onStageReady();
+                });
+
+                child.stdout.on('data', (chunk) => {
+                    stdoutBuf += chunk.toString('utf8');
+                    if (stdoutBuf.includes(`"stage":"${expectedStage}"`)) onStageReady();
+                });
+
+                child.stderr.on('data', (chunk) => {
+                    stderrBuf += chunk.toString('utf8');
+                });
+
+                child.on('error', reject);
+                child.on('exit', (code, signal) => {
+                    if (!stageReached) {
+                        return reject(new Error(`App Worker (${mode}) exited before ${expectedStage} (code=${code}, signal=${signal}, stdout=${stdoutBuf}, stderr=${stderrBuf})`));
+                    }
+                    resolve({ code, signal });
+                });
+            });
+        }
+
+        try {
+            // 1. 透過專案 WriteQueue + executePacketTransactionPlan 完成 COMMIT 後立即 SIGKILL (!app_surv_01)
+            await runAppWorkerAndSigkill('APP_PACKET_TX_AFTER_COMMIT', '!app_surv_01', 'READY_FOR_SIGKILL_APP_PACKET_TX_AFTER_COMMIT');
+
+            // 2. 透過專案 WriteQueue + executePacketTransactionPlan 執行 TELEMETRY_APP 前 3 條 SQL (nodes insert, packet_logs insert, nodes update)，在第 4 條 SQL 與 COMMIT 前遭 SIGKILL (!app_ghost_02)
+            await runAppWorkerAndSigkill('APP_PACKET_TX_MID_FLIGHT', '!app_ghost_02', 'READY_FOR_SIGKILL_APP_PACKET_TX_MID_FLIGHT');
+
+            // 3. 重新以專案 createDatabaseSubsystem 開啟資料庫驗證
+            const recoveredDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
+            try {
+                const integrityRow = await recoveredDb.get('PRAGMA integrity_check');
+                assert.equal(integrityRow.integrity_check, 'ok');
+
+                // 已完成 COMMIT 的封包交易 (!app_surv_01) 在 3 張關聯表均完整保留
+                const survNode = await recoveredDb.get('SELECT * FROM nodes WHERE node_id = ?', ['!app_surv_01']);
+                const survLogs = await recoveredDb.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!app_surv_01']);
+                const survTele = await recoveredDb.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!app_surv_01']);
+                assert.ok(survNode, 'Application Packet Transaction COMMIT 後遭 SIGKILL 的節點必須存在');
+                assert.equal(survNode.battery_level, 77);
+                assert.equal(survLogs.length, 1);
+                assert.equal(survTele.length, 1);
+
+                // 在 WriteQueue 交易中段 (已執行 3/4 條 SQL) 遭 SIGKILL 的封包 (!app_ghost_02) 必須完全回滾、0 殘留
+                const ghostNode = await recoveredDb.get('SELECT * FROM nodes WHERE node_id = ?', ['!app_ghost_02']);
+                const ghostLogs = await recoveredDb.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!app_ghost_02']);
+                const ghostTele = await recoveredDb.all('SELECT * FROM telemetry_data WHERE node_id = ?', ['!app_ghost_02']);
+                assert.equal(ghostNode, null, 'Application Packet Transaction 中段 SIGKILL 的 nodes 寫入必須完全回滾');
+                assert.equal(ghostLogs.length, 0, 'Application Packet Transaction 中段 SIGKILL 的 packet_logs 寫入必須完全回滾');
+                assert.equal(ghostTele.length, 0, 'Application Packet Transaction 中段 SIGKILL 的 telemetry_data 必須為 0');
+            } finally {
+                await recoveredDb.close();
+            }
+        } finally {
+            cleanupDbFiles(dbPath);
+        }
+    });
+
+    // =========================================================================
+    // 16. 完整 index.js 子程序啟動 + 本機測試 Broker Wire-Level MQTT PUBLISH + 安全關機整合測試 (Section 五 #5 & Scope 3.2)
+    // =========================================================================
+    it('Test 4.0.2-16 — Full index.js Startup, Real Wire-Level MQTT Broker PUBLISH & Graceful Shutdown: 透過本機測試 Broker 真正發送 MQTT Wire-Level PUBLISH 二進位封包至 index.js 子程序，驗證啟動屏障、封包交易提交與安全關機', async () => {
         const dbPath = createTempPath('index_full_startup');
         const eventLogPath = createTempPath('index_events', '.json');
-        const mockBroker = await startLocalMockMqttBroker();
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
         const httpPort = await getFreeTcpPort();
         const appEntryPath = path.resolve(__dirname, '..', '..', 'index.js');
 
-        // 載入真實 Protobuf 定義以編碼 ServiceEnvelope 測試封包
         const protoRoot = new protobuf.Root();
         protoRoot.resolvePath = (origin, target) => path.resolve(__dirname, '..', '..', 'protobufs', target);
         await protoRoot.load([
@@ -1002,26 +1874,38 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
 
             let bootstrapLoggedAt = null;
             let httpListenLoggedAt = null;
-            let mqttReadyLoggedAt = null;
+            let mqttSubscribedLoggedAt = null;
             let seqCounter = 0;
 
             let resolveServerReady;
-            let resolveMqttReady;
+            let resolveMqttSubscribed;
+            let resolveNodeInfoCommitted;
             let startupTimer;
+            let mqttTimer;
+            let nodeInfoTimer;
+
             const serverReadyPromise = new Promise((resolve, reject) => {
                 resolveServerReady = () => {
                     clearTimeout(startupTimer);
                     resolve();
                 };
-                startupTimer = setTimeout(() => reject(new Error(`index.js startup timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 4000);
+                startupTimer = setTimeout(() => reject(new Error(`index.js startup timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 5000);
             });
-            let mqttTimer;
-            const mqttReadyPromise = new Promise((resolve, reject) => {
-                resolveMqttReady = () => {
+
+            const mqttSubscribedPromise = new Promise((resolve, reject) => {
+                resolveMqttSubscribed = () => {
                     clearTimeout(mqttTimer);
                     resolve();
                 };
-                mqttTimer = setTimeout(() => reject(new Error(`index.js MQTT client init timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 4000);
+                mqttTimer = setTimeout(() => reject(new Error(`index.js MQTT subscribe timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 5000);
+            });
+
+            const nodeInfoCommittedPromise = new Promise((resolve, reject) => {
+                resolveNodeInfoCommitted = () => {
+                    clearTimeout(nodeInfoTimer);
+                    resolve();
+                };
+                nodeInfoTimer = setTimeout(() => reject(new Error(`Wire-level MQTT packet commit timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 5000);
             });
 
             child = spawn(process.execPath, [appEntryPath], {
@@ -1036,6 +1920,7 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                     DISABLE_RF_TUNNEL: 'true',
                     CWA_API_KEY: '',
                     MQTT_BROKER: mockBroker.url,
+                    MQTT_PIPE_PATH: mockBroker.pipePath,
                     MQTT_USER: 'test_user',
                     MQTT_PASSWORD: 'test_password',
                     MQTT_TOPICS: 'msh/TW/#'
@@ -1054,9 +1939,12 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                         httpListenLoggedAt = ++seqCounter;
                         resolveServerReady();
                     }
-                    if (line.includes('📚 Protobuf 字典載入完成！準備啟動雷達...') && mqttReadyLoggedAt === null) {
-                        mqttReadyLoggedAt = ++seqCounter;
-                        resolveMqttReady();
+                    if (line.includes('📡 訂閱成功！正在監聽:') && mqttSubscribedLoggedAt === null) {
+                        mqttSubscribedLoggedAt = ++seqCounter;
+                        resolveMqttSubscribed();
+                    }
+                    if (line.includes('👤 [節點資訊] 更新: WIR1 角色:')) {
+                        resolveNodeInfoCommitted();
                     }
                 }
             });
@@ -1065,29 +1953,30 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 stderrLog += chunk.toString('utf8');
             });
 
-            // 等待 HTTP Server 啟動與 MQTT Client 監聽器掛載完成
+            // 等待 HTTP Server 啟動且 MQTT Client 完成真實 CONNECT -> CONNACK -> SUBSCRIBE -> SUBACK 握手
             await Promise.all([
                 serverReadyPromise,
-                mqttReadyPromise
+                mqttSubscribedPromise,
+                mockBroker.waitForSubscription()
             ]);
 
-            // 1. 驗證 Database Bootstrap Barrier 必須先於 HTTP 服務啟動
             assert.ok(bootstrapLoggedAt !== null, '必須輸出 [BOOTSTRAP] 完成日誌');
             assert.ok(httpListenLoggedAt !== null, '必須輸出 HTTP 伺服器啟動日誌');
-            assert.ok(bootstrapLoggedAt < httpListenLoggedAt, 'Database Schema Bootstrap 必須在 HTTP 伺服器開啟通訊埠之前完成');
+            assert.ok(mqttSubscribedLoggedAt !== null, '必須完成真實 MQTT SUBSCRIBE 握手');
+            assert.ok(bootstrapLoggedAt < httpListenLoggedAt, 'Database Schema Bootstrap 必須早於 HTTP 服務啟動');
 
-            // 2. 編碼一筆真實的 Protobuf NODEINFO_APP ServiceEnvelope 並注入 index.js 的 mqttClient message 管線
+            // 透過本機測試 Broker 真正發送 Wire-Level MQTT PUBLISH (0x30) 二進位封包至 index.js 子程序
             const userPayload = User.encode(User.create({
                 id: '!abcd1234',
-                long_name: 'FullStartupNode',
-                short_name: 'FSN1',
+                long_name: 'WireLevelBrokerNode',
+                short_name: 'WIR1',
                 hw_model: 4,
                 role: 0
             })).finish();
 
             const envelopeBytes = ServiceEnvelope.encode(ServiceEnvelope.create({
                 channel_id: 'MediumFast',
-                gateway_id: '!gw_test',
+                gateway_id: '!gw_wire_broker',
                 packet: {
                     from: 0xabcd1234,
                     to: 0xffffffff,
@@ -1103,28 +1992,13 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                 }
             })).finish();
 
-            let flushTimer;
-            const packetFlushedPromise = new Promise((resolve, reject) => {
-                flushTimer = setTimeout(() => reject(new Error(`MQTT packet flush timeout. stdout:\n${stdoutLog}`)), 3000);
-                child.on('message', (msg) => {
-                    if (msg && msg.type === 'TEST_MQTT_PACKET_FLUSHED' && msg.requestId === 'req_nodeinfo_1') {
-                        clearTimeout(flushTimer);
-                        if (!msg.ok) return reject(new Error(msg.error || 'Flush failed'));
-                        resolve(msg);
-                    }
-                });
-            });
+            mockBroker.publish('msh/TW/2/e/MediumFast/!gw_wire_broker', Buffer.from(envelopeBytes));
 
-            child.send({
-                type: 'TEST_INJECT_MQTT_PACKET',
-                requestId: 'req_nodeinfo_1',
-                topic: 'msh/TW/2/e/MediumFast/!gw_test',
-                payloadHex: Buffer.from(envelopeBytes).toString('hex')
-            });
+            // 觸發子程序立即 Flush WriteQueue，等待 post-commit 日誌「👤 [節點資訊] 更新: WIR1」出現
+            child.send({ type: 'TEST_FLUSH_DB_QUEUE', requestId: 'flush_wire_1' });
+            await nodeInfoCommittedPromise;
 
-            await packetFlushedPromise;
-
-            // 3. 觸發正常 Shutdown（透過 IPC 傳送 'shutdown' 訊息，與 PM2 / graceful shutdown 一致）
+            // 觸發正常 Shutdown
             let exitTimer;
             const exitPromise = new Promise((resolve, reject) => {
                 exitTimer = setTimeout(() => reject(new Error(`Shutdown exit timeout. stdout:\n${stdoutLog}\nstderr:\n${stderrLog}`)), 5000);
@@ -1136,23 +2010,22 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
             child.send('shutdown');
 
             const exitResult = await exitPromise;
-            assert.equal(exitResult.code, 0, `index.js 正常關閉應以 exit code 0 結束 (stdout:\n${stdoutLog}\nstderr:\n${stderrLog})`);
+            assert.equal(exitResult.code, 0, `index.js 正常關閉應以 exit code 0 結束`);
             assert.match(stdoutLog, /\[SHUTDOWN\] 隊列資料已全數安全寫入並排空/);
             assert.match(stdoutLog, /\[SHUTDOWN\] WAL 檔案已安全截斷並回寫主資料庫/);
             assert.match(stdoutLog, /\[SHUTDOWN\] SQLite 連線已安全關閉/);
             child = null;
 
-            // 4. 重新開啟 Temporary SQLite DB 驗證 index.js 寫入並完成 TRUNCATE Checkpoint 的封包與節點紀錄
             const verifyDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: false });
             try {
                 const nodeRow = await verifyDb.get('SELECT * FROM nodes WHERE node_id = ?', ['!abcd1234']);
-                assert.ok(nodeRow, 'index.js 應將真實 Protobuf NODEINFO 封包原子寫入 nodes 表');
-                assert.equal(nodeRow.long_name, 'FullStartupNode');
-                assert.equal(nodeRow.short_name, 'FSN1');
+                assert.ok(nodeRow, '透過本機 Broker Wire-Level PUBLISH 發送的 NODEINFO 封包應原子寫入 nodes 表');
+                assert.equal(nodeRow.long_name, 'WireLevelBrokerNode');
+                assert.equal(nodeRow.short_name, 'WIR1');
 
                 const logRows = await verifyDb.all('SELECT * FROM packet_logs WHERE node_id = ?', ['!abcd1234']);
-                assert.equal(logRows.length, 1, 'index.js 應在同一交易將封包寫入 packet_logs 表');
-                assert.equal(logRows[0].gateway_id, '!gw_test');
+                assert.equal(logRows.length, 1, '應在同一交易將封包寫入 packet_logs 表');
+                assert.equal(logRows[0].gateway_id, '!gw_wire_broker');
             } finally {
                 await verifyDb.close();
             }
@@ -1166,14 +2039,16 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
         }
     });
 
-    it('Test 4.0.2-IndexStartup-BootstrapFailure — Schema Bootstrap Failure Blocks Service Startup: 當 Schema Index 驗證失敗時，index.js 不會提前啟動 HTTP 或 MQTT 服務並以非 0 狀態碼退出', async () => {
+    // =========================================================================
+    // 17. Schema Bootstrap 失敗阻擋 index.js 啟動測試 (Scope 3.2)
+    // =========================================================================
+    it('Test 4.0.2-17 — Schema Bootstrap Failure Blocks Service Startup: 當 Schema Index 驗證失敗時，index.js 不會提前啟動 HTTP 或 MQTT 服務並以非 0 狀態碼退出', async () => {
         const dbPath = createTempPath('index_boot_fail');
         const eventLogPath = createTempPath('index_fail_events', '.json');
-        const mockBroker = await startLocalMockMqttBroker();
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
         const httpPort = await getFreeTcpPort();
         const appEntryPath = path.resolve(__dirname, '..', '..', 'index.js');
 
-        // 先建立一個帶有錯誤同名索引定義 (idx_packet_logs_timestamp 建立在錯誤欄位 node_id 上) 的 Temporary DB
         const prepDb = await createDatabaseSubsystem({ dbPath, bootstrapSchema: true });
         await prepDb.run('DROP INDEX idx_packet_logs_timestamp');
         await prepDb.run('CREATE INDEX idx_packet_logs_timestamp ON packet_logs(node_id)');
@@ -1196,6 +2071,7 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary & Cross-Pro
                     DISABLE_RF_TUNNEL: 'true',
                     CWA_API_KEY: '',
                     MQTT_BROKER: mockBroker.url,
+                    MQTT_PIPE_PATH: mockBroker.pipePath,
                     MQTT_USER: 'test_user',
                     MQTT_PASSWORD: 'test_password'
                 },

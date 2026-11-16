@@ -468,15 +468,57 @@ function buildRfTunnelPacketTransactionPlan(context) {
 }
 
 /**
+ * 記錄 Post-Commit Hook 異常，確保錯誤可被追蹤且不會阻斷其他 Hook 或使用者 Callback
+ */
+function reportPostCommitHookError(hookName, hookErr, planLabel, logger, postCommitErrors) {
+    const errMsg = hookErr && hookErr.message ? hookErr.message : String(hookErr);
+    const entry = {
+        hook: hookName,
+        label: planLabel || 'UNKNOWN_PLAN',
+        message: errMsg,
+        error: hookErr
+    };
+    postCommitErrors.push(entry);
+
+    const formatted = `⚠️ [POST_COMMIT_HOOK_ERROR] (hook=${hookName}, plan=${planLabel || 'UNKNOWN'}): ${errMsg}`;
+    if (logger && typeof logger.error === 'function') {
+        try {
+            logger.error(formatted);
+            return;
+        } catch (_) {
+            // 若自訂 logger.error 本身也拋錯，退回原生 console.error
+        }
+    }
+    try {
+        console.error(formatted);
+    } catch (_) {}
+}
+
+/**
  * 執行封包交易計畫：
  * - 將 `plan.statements` 作為單一不可拆分交易單位送入 `enqueuePacketFn`（或 `dbSubsystem.queuePacketTransaction`）
  * - 嚴格保證：唯有在 SQLite `COMMIT` 成功完成後，才執行 `postCommitEffects`（`batchEmit`、`recordLivePacketAnalytics`、日誌與使用者回呼）
  * - 若交易內任一語句失敗並 `ROLLBACK`，絕不觸發任何成功推播或戰情累加
+ * - 每個 post-commit effect 皆有獨立 try/catch 保護，單一 hook 例外不阻斷其他 hook，且保證 caller callback 維持 exactly-once 執行
  */
 function executePacketTransactionPlan(plan, hooks = {}, callback = null) {
+    let callerCallbackInvoked = false;
+    const invokeCallerCallbackOnce = (cbContext, cbErr, cbResult) => {
+        if (typeof callback !== 'function') return;
+        if (callerCallbackInvoked) return;
+        callerCallbackInvoked = true;
+        try {
+            callback.call(cbContext || {}, cbErr, cbResult);
+        } catch (cbEx) {
+            try {
+                console.error(`❌ [PACKET_TX_CALLBACK_EXCEPTION] (${plan?.label || 'UNKNOWN'}):`, cbEx?.message || cbEx);
+            } catch (_) {}
+        }
+    };
+
     if (!plan || !Array.isArray(plan.statements) || plan.statements.length === 0) {
         const err = new Error('[INVALID_PACKET_PLAN] 封包交易計畫必須包含非空之 statements');
-        if (typeof callback === 'function') callback(err);
+        invokeCallerCallbackOnce({}, err, null);
         return false;
     }
 
@@ -489,7 +531,7 @@ function executePacketTransactionPlan(plan, hooks = {}, callback = null) {
 
     if (typeof enqueuePacketTransaction !== 'function') {
         const err = new Error('[MISSING_ENQUEUE_FN] 必須提供 enqueuePacketTransaction 函式');
-        if (typeof callback === 'function') callback(err);
+        invokeCallerCallbackOnce({}, err, null);
         return false;
     }
 
@@ -498,46 +540,217 @@ function executePacketTransactionPlan(plan, hooks = {}, callback = null) {
         function onPacketTransactionSettled(err, result) {
             if (err) {
                 if (logger && typeof logger.error === 'function') {
-                    logger.error(`❌ [封包交易回滾] (${plan.label}):`, err.message);
+                    try {
+                        logger.error(`❌ [封包交易回滾] (${plan.label}):`, err.message);
+                    } catch (_) {}
                 }
-                if (typeof callback === 'function') {
-                    callback(err, null);
-                }
+                invokeCallerCallbackOnce(this, err, null);
                 return;
             }
 
-            // 僅在 COMMIT 成功後執行交易外副作用
+            // 僅在 COMMIT 成功後執行交易外副作用；每個 effect 皆有獨立保護
             const effects = plan.postCommitEffects || {};
+            const postCommitErrors = [];
+
+            // 1. Post-commit logger effects
             if (Array.isArray(effects.logs) && logger && typeof logger.log === 'function') {
-                for (const msg of effects.logs) {
-                    logger.log(msg);
+                for (let i = 0; i < effects.logs.length; i++) {
+                    const msg = effects.logs[i];
+                    try {
+                        logger.log(msg);
+                    } catch (logErr) {
+                        reportPostCommitHookError(`logger.log[${i}]`, logErr, plan.label, logger, postCommitErrors);
+                    }
                 }
                 if (effects.isTelemetry && plan.packetMeta && plan.packetMeta.fromId) {
-                    const lastId = (result && result.lastID !== undefined) ? result.lastID : this?.lastID;
-                    logger.log(`💾 [寫入DB成功] 節點: ${plan.packetMeta.fromId} | 紀錄 ID: ${lastId}`);
+                    try {
+                        const lastId = (result && result.lastID !== undefined) ? result.lastID : this?.lastID;
+                        logger.log(`💾 [寫入DB成功] 節點: ${plan.packetMeta.fromId} | 紀錄 ID: ${lastId}`);
+                    } catch (teleLogErr) {
+                        reportPostCommitHookError('logger.log[telemetry]', teleLogErr, plan.label, logger, postCommitErrors);
+                    }
                 }
             }
 
+            // 2. Post-commit live analytics effect
             if (effects.analytics && typeof recordLivePacketAnalytics === 'function') {
-                const a = effects.analytics;
-                recordLivePacketAnalytics(a.port, a.snr, a.rssi, a.temp, a.hum);
-            }
-
-            if (Array.isArray(effects.emits) && typeof batchEmit === 'function') {
-                for (const evt of effects.emits) {
-                    batchEmit(evt.type, evt.payload);
+                try {
+                    const a = effects.analytics;
+                    recordLivePacketAnalytics(a.port, a.snr, a.rssi, a.temp, a.hum);
+                } catch (analyticsErr) {
+                    reportPostCommitHookError('recordLivePacketAnalytics', analyticsErr, plan.label, logger, postCommitErrors);
                 }
             }
 
-            if (typeof callback === 'function') {
-                callback.call(result || this || {}, null, result);
+            // 3. Post-commit WebSocket batchEmit effects
+            if (Array.isArray(effects.emits) && typeof batchEmit === 'function') {
+                for (let i = 0; i < effects.emits.length; i++) {
+                    const evt = effects.emits[i];
+                    try {
+                        batchEmit(evt.type, evt.payload);
+                    } catch (emitErr) {
+                        reportPostCommitHookError(`batchEmit[${i}:${evt?.type || 'unknown'}]`, emitErr, plan.label, logger, postCommitErrors);
+                    }
+                }
             }
+
+            const finalResult = (result && typeof result === 'object')
+                ? result
+                : { status: 'COMMITTED', lastID: this?.lastID, changes: this?.changes };
+
+            if (postCommitErrors.length > 0) {
+                finalResult.postCommitErrors = postCommitErrors;
+            }
+
+            // 4. 交易已 COMMIT 成功，確保 caller callback 一定以 err = null 執行一次
+            invokeCallerCallbackOnce(finalResult || this || {}, null, finalResult);
         },
         {
             label: plan.label,
             packetMeta: plan.packetMeta
         }
     );
+}
+
+/**
+ * Turso / Legacy Queue 單一佇列項目順序執行器：
+ * - 注意：此函式僅供未啟用 Local SQLiteAdapter 的 Turso fallback 分支使用，按 `statements` 原始順序逐一執行 SQL；
+ *   不宣稱具備 Local SQLite Adapter 的單一連線原子 ROLLBACK 交易保證。
+ * - 嚴格保證：
+ *   1. 辨識 `item.isTransactionUnit` 並依序執行 `item.statements` 內所有 SQL，絕不將 `label` 當成 SQL 執行。
+ *   2. 絕不在第一筆 SQL 完成後就提前回報成功；必須全部 SQL 依序成功後才觸發成功 callback。
+ *   3. 任一筆 SQL 失敗時立即中止後續 SQL，回報錯誤並附帶 `failedStatementIndex` / `failedStatementSql`，且不執行成功副作用。
+ *   4. 確保 `item.callback` 符合 Exactly-Once。
+ */
+function executeSequentialFallbackItem(targetDb, item, onItemDone = null) {
+    let itemCbInvoked = false;
+    const invokeItemCbOnce = (ctx, err, res) => {
+        if (item && !item.callbackInvoked && !itemCbInvoked && typeof item.callback === 'function') {
+            item.callbackInvoked = true;
+            itemCbInvoked = true;
+            try {
+                item.callback.call(ctx || {}, err, res);
+            } catch (_) {}
+        } else {
+            itemCbInvoked = true;
+        }
+    };
+
+    const finishItem = (err, res) => {
+        if (typeof onItemDone === 'function') {
+            onItemDone(err, res);
+        }
+    };
+
+    if (!targetDb || typeof targetDb.run !== 'function') {
+        const err = new Error('[FALLBACK_DB_UNAVAILABLE] targetDb.run is not a function');
+        invokeItemCbOnce({}, err, null);
+        finishItem(err, null);
+        return;
+    }
+
+    if (item && item.isTransactionUnit && Array.isArray(item.statements)) {
+        const stmts = item.statements;
+        if (
+            stmts.length === 0 ||
+            !stmts.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
+        ) {
+            const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
+            invokeItemCbOnce({}, err, null);
+            finishItem(err, null);
+            return;
+        }
+
+        const statementResults = [];
+        let lastID = undefined;
+        let totalChanges = 0;
+        let idx = 0;
+
+        const runNextStatement = () => {
+            if (idx >= stmts.length) {
+                const finalRes = {
+                    status: 'COMMITTED',
+                    isTransactionUnit: true,
+                    isTursoSequentialFallback: true,
+                    statementCount: stmts.length,
+                    lastID,
+                    changes: totalChanges,
+                    statementResults
+                };
+                invokeItemCbOnce(finalRes, null, finalRes);
+                finishItem(null, finalRes);
+                return;
+            }
+
+            const currentIndex = idx++;
+            const stmt = stmts[currentIndex];
+            const sql = stmt.sql;
+            const params = Array.isArray(stmt.params) ? stmt.params : [];
+
+            let stepSettled = false;
+            const onStepDone = function (stepErr) {
+                if (stepSettled) return;
+                stepSettled = true;
+
+                if (stepErr) {
+                    stepErr.fromPacketTransactionUnit = true;
+                    stepErr.failedStatementIndex = currentIndex;
+                    stepErr.failedStatementSql = sql;
+                    if (item.label) {
+                        stepErr.transactionLabel = item.label;
+                    }
+                    invokeItemCbOnce({}, stepErr, null);
+                    finishItem(stepErr, null);
+                    return;
+                }
+
+                const stepLastId = this && this.lastID !== undefined ? this.lastID : undefined;
+                const stepChanges = this && typeof this.changes === 'number' ? this.changes : 0;
+                if (stepLastId !== undefined) lastID = stepLastId;
+                totalChanges += stepChanges;
+                statementResults.push({ lastID: stepLastId, changes: stepChanges });
+                runNextStatement();
+            };
+
+            try {
+                targetDb.run(sql, params, onStepDone);
+            } catch (syncErr) {
+                onStepDone(syncErr);
+            }
+        };
+
+        runNextStatement();
+        return;
+    }
+
+    // 一般單筆 SQL 寫入項目
+    const singleSql = item ? item.sql : '';
+    const singleParams = item && Array.isArray(item.params) ? item.params : [];
+    let singleSettled = false;
+    const onSingleDone = function (err) {
+        if (singleSettled) return;
+        singleSettled = true;
+        if (err) {
+            invokeItemCbOnce(this, err, null);
+            finishItem(err, null);
+            return;
+        }
+        const resObj = {
+            status: 'COMMITTED',
+            isTransactionUnit: false,
+            statementCount: 1,
+            lastID: this && this.lastID !== undefined ? this.lastID : undefined,
+            changes: this && typeof this.changes === 'number' ? this.changes : undefined
+        };
+        invokeItemCbOnce(this || resObj, null, resObj);
+        finishItem(null, resObj);
+    };
+
+    try {
+        targetDb.run(singleSql, singleParams, onSingleDone);
+    } catch (syncErr) {
+        onSingleDone(syncErr);
+    }
 }
 
 module.exports = {
@@ -555,6 +768,7 @@ module.exports = {
     TUNNEL_NODE_UPDATE_SQL,
     buildMqttPacketTransactionPlan,
     buildRfTunnelPacketTransactionPlan,
-    executePacketTransactionPlan
+    executePacketTransactionPlan,
+    executeSequentialFallbackItem
 };
 

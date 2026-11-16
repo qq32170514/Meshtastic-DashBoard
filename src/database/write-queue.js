@@ -216,10 +216,12 @@ class WriteQueue {
             this.quarantinedItems.push({
                 id: item.id,
                 sql: item.sql,
+                transactionLabel: item.transactionLabel || item.sql || null,
                 params: item.params,
                 isTransactionUnit: Boolean(item.isTransactionUnit),
                 statements: item.statements || null,
                 packetMeta: item.packetMeta || null,
+                errorType: (error && error.errorType) || ERROR_TYPES.DATA_CONSTRAINT,
                 failedStatementIndex: error && typeof error.failedStatementIndex === 'number' ? error.failedStatementIndex : null,
                 failedStatementSql: error && error.failedStatementSql ? error.failedStatementSql : null,
                 attempt: item.attempt,
@@ -231,10 +233,14 @@ class WriteQueue {
             this.uncommittedErrors.push({
                 id: item.id,
                 sql: item.sql,
+                transactionLabel: (error && error.transactionLabel) || item.transactionLabel || item.sql || null,
                 params: item.params,
                 isTransactionUnit: Boolean(item.isTransactionUnit),
                 statements: item.statements || null,
                 packetMeta: item.packetMeta || null,
+                errorType: (error && error.errorType) || (error ? classifyError(error) : ERROR_TYPES.UNKNOWN),
+                failedStatementIndex: error && typeof error.failedStatementIndex === 'number' ? error.failedStatementIndex : null,
+                failedStatementSql: error && error.failedStatementSql ? error.failedStatementSql : null,
                 seq: item.seq,
                 attempt: item.attempt,
                 error: error ? error.message : 'UNCOMMITTED_ERROR',
@@ -508,6 +514,9 @@ class WriteQueue {
             ));
 
             const errType = classifyError(err);
+            if (err && typeof err === 'object' && !err.errorType) {
+                err.errorType = errType;
+            }
 
             if (errType === ERROR_TYPES.DISK_FULL) {
                 this.state = QUEUE_STATES.PAUSED_DISK_FULL;
@@ -522,7 +531,7 @@ class WriteQueue {
                 this._requeueRemainingBatchAtHead(remaining);
                 throw err;
             } else if (errType === ERROR_TYPES.FATAL_CORRUPT || errType === ERROR_TYPES.ROLLBACK_FAILURE || errType === ERROR_TYPES.UNKNOWN) {
-                // P1-01: UNKNOWN 與致命損毀立即熔斷並保留所有未提資料
+                // P1-01: UNKNOWN 與致命損毀立即熔斷並保留所有未提資料（絕不可誤送入 Binary Isolation）
                 this.handleAdapterFatalError(err);
                 for (const item of remaining) {
                     this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, err);
@@ -594,6 +603,7 @@ class WriteQueue {
                                 stmtErr.failedStatementIndex = stepIdx;
                                 stmtErr.failedStatementSql = stmt.sql;
                                 stmtErr.packetUnitId = item.id;
+                                stmtErr.transactionLabel = item.sql;
                                 throw stmtErr;
                             }
                         }
@@ -607,15 +617,22 @@ class WriteQueue {
                             statementResults
                         });
                     } else {
-                        const res = await tx.execute(item.sql, item.params);
-                        executionResults.set(item.id, {
-                            id: item.id,
-                            status: 'COMMITTED',
-                            isTransactionUnit: false,
-                            statementCount: 1,
-                            lastID: res ? res.lastID : undefined,
-                            changes: res ? res.changes : undefined
-                        });
+                        try {
+                            const res = await tx.execute(item.sql, item.params);
+                            executionResults.set(item.id, {
+                                id: item.id,
+                                status: 'COMMITTED',
+                                isTransactionUnit: false,
+                                statementCount: 1,
+                                lastID: res ? res.lastID : undefined,
+                                changes: res ? res.changes : undefined
+                            });
+                        } catch (singleErr) {
+                            singleErr.failedStatementIndex = 0;
+                            singleErr.failedStatementSql = item.sql;
+                            singleErr.transactionLabel = item.sql;
+                            throw singleErr;
+                        }
                     }
                 }
             });
@@ -629,22 +646,18 @@ class WriteQueue {
             }
         } catch (err) {
             const errType = classifyError(err);
+            if (err && typeof err === 'object') {
+                err.errorType = errType;
+            }
 
-            // 資料約束錯誤，或單一封包交易單位內部的語句錯誤（非磁碟滿額/鎖競爭/結構損毀/回滾失敗/Deadline）時，
-            // 以「整個 queue item（封包交易單位）」為最小不可拆分粒度進行遞迴二分隔離 (P0-1 & 4.0.2)
-            const isIsolatablePacketError = Boolean(
-                err &&
-                err.fromPacketTransactionUnit &&
-                errType === ERROR_TYPES.UNKNOWN &&
-                !(err.message && err.message.includes('DEADLINE_EXPIRED'))
-            );
-
-            if (errType === ERROR_TYPES.DATA_CONSTRAINT || isIsolatablePacketError) {
+            // P1 修正：只有明確判定為 ERROR_TYPES.DATA_CONSTRAINT 的資料約束錯誤，才可進入 Binary Isolation。
+            // ERROR_TYPES.UNKNOWN（如 SQL 語法錯誤、欄位/資料表不存在、未知資料庫錯誤）必須直接向上拋出並進入 Fatal Error 熔斷流程！
+            if (errType === ERROR_TYPES.DATA_CONSTRAINT) {
                 await this._binaryIsolateBatch(batch, capability, deadlineAt, err);
                 return;
             }
 
-            // 非資料約束錯誤（DISK_FULL, UNKNOWN, BUSY, DEADLINE 等）直接向上拋出，由最外層統一退回！
+            // 非資料約束錯誤（DISK_FULL, UNKNOWN, FATAL_CORRUPT, BUSY, DEADLINE 等）直接向上拋出，由 _executeTopLevelBatch 統一處理！
             throw err;
         }
     }
@@ -658,11 +671,16 @@ class WriteQueue {
             const badItem = batch[0];
             const detailSuffix = lastErr && lastErr.message ? ` (${lastErr.message})` : '';
             const constraintErr = new Error(`[QUARANTINED_CONSTRAINT_ERROR] 資料約束違反: ${badItem.sql}${detailSuffix}`);
+            constraintErr.errorType = ERROR_TYPES.DATA_CONSTRAINT;
+            constraintErr.transactionLabel = badItem.sql;
             if (lastErr) {
                 constraintErr.cause = lastErr;
                 if (typeof lastErr.failedStatementIndex === 'number') {
                     constraintErr.failedStatementIndex = lastErr.failedStatementIndex;
                     constraintErr.failedStatementSql = lastErr.failedStatementSql;
+                }
+                if (lastErr.packetUnitId) {
+                    constraintErr.packetUnitId = lastErr.packetUnitId;
                 }
             }
             this._transitionItem(badItem, ITEM_STATUS.QUARANTINED, constraintErr);
