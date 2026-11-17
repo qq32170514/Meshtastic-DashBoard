@@ -176,8 +176,12 @@
   - 首頁初始 API 請求：`15` 筆（含 `3` 筆重複）$\rightarrow$ **`9`** 筆（**`0`** 筆重複，**-40.0% / -100% 重複**）；冷載入 JS 傳輸：`532,601 bytes` $\rightarrow$ **`251,253 bytes`**（**-52.8%**）。
   - Node List 切換耗時：`1,216.1 ms`（P95 `1,693.7 ms`）$\rightarrow$ **`45.2 ms`**（P95 `64.8 ms`，**-96.3% / 26.9x**）；`<tr>` DOM 列數：`5,000` $\rightarrow$ **`15`**（**-99.7%**）；切換 Long Tasks：`1,339.0 ms` $\rightarrow$ **`0.0 ms`**（**-100%**）；搜尋延遲：`168.6 ms` $\rightarrow$ **`31.6 ms`**（**-81.3%**）。
 - **回歸與完整報告**：
-  - 完整實測報告見 [PERFORMANCE_OPTIMIZATION_REPORT.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/PERFORMANCE_OPTIMIZATION_REPORT.md)。
-  - 資料庫核心回歸 `npm run test:database`：**108 / 108 `it()` 測試全數通過（108 PASS, 0 FAIL, 0 SKIPPED）**；前端全分頁與虛擬化回歸（`verify_4_0_3_functional.mjs`）：**0 執行期錯誤**。
+  - 完整實測報告見 [PERFORMANCE_OPTIMIZATION_REPORT.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/PERFORMANCE_OPTIMIZATION_REPORT.md) 與地圖修復報告 [MAP_RENDERING_FIX_REPORT.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/MAP_RENDERING_FIX_REPORT.md)。
+  - **地圖顯示錯誤修復與 Leaflet 真正 Lazy Loading（4.0.3 補充定點修正）**：
+    - 移除 `App.tsx` 靜態 `mapTiles` 匯入與殘留之未匯入 `<MapContainer>` / `<CircleMarker>` / `<Polyline>` / `<Popup>` JSX（修復 `ReferenceError`）。
+    - 新增 [coordUtils.ts](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/maps/coordUtils.ts)（座標有效性檢查）、[MapErrorBoundary.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/maps/MapErrorBoundary.tsx)、[MapAutoResize.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/maps/MapAutoResize.tsx)、[TracerouteMap.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/maps/TracerouteMap.tsx)、[PacketRouteMap.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/maps/PacketRouteMap.tsx)，並強化 [PacketPositionMap.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/components/PacketPositionMap.tsx) 與將 [NetworkAnalytics.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/NetworkAnalytics.tsx) 內之 `CwaNodeMap` 改為 `React.lazy`。
+    - 驗證 `dist/index.html` 已完全移除 `vendor-leaflet` `modulepreload`；Headless Edge CDP 實測 Traceroute / Packet Position / Route Map / NodeMap / 無效座標 / 快速切換均正常渲染（`pageErrors: []`）。
+  - 資料庫核心回歸 `npm run test:database`：**108 / 108 `it()` 測試全數通過（108 PASS, 0 FAIL, 0 SKIPPED）**；前端全分頁與虛擬化回歸（`verify_4_0_3_functional.mjs`）及地圖實測（`verify_maps_and_lazy.mjs`）：**0 執行期錯誤**。
   - 當前版本狀態：**`READY FOR PRODUCTION REVIEW`**（注意：未授權前絕不部署或重啟 Production PM2）。
 
 ---

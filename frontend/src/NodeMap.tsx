@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import 'leaflet/dist/leaflet.css';
 import { MapContainer, TileLayer, Marker, Popup, CircleMarker, Polyline, Tooltip, useMap, Rectangle, GeoJSON, Circle, ImageOverlay } from 'react-leaflet';
 import * as turf from '@turf/turf';
 import L from 'leaflet';

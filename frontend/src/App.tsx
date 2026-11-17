@@ -1,17 +1,20 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart2, BarChart3, ChevronDown, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2, ExternalLink } from 'lucide-react';
-import { AppTileLayer } from './mapTiles';
 import type { TraceroutePath } from './NodeMap';
 import { fetchJsonCached } from './apiCache';
 import NodeList from './components/NodeList';
 import SystemUptime from './components/SystemUptime';
+import MapErrorBoundary from './maps/MapErrorBoundary';
+import { sanitizeCoordinatePair } from './maps/coordUtils';
 
 const PacketTypePieChart = React.lazy(() => import('./PacketTypePieChart'));
 const NodeRecoveryQR = React.lazy(() => import('./NodeRecoveryQR'));
 const SolarForecastCard = React.lazy(() => import('./SolarForecastCard'));
 const RFCoverageCard = React.lazy(() => import('./RFCoverageCard'));
 const PacketPositionMap = React.lazy(() => import('./components/PacketPositionMap'));
+const TracerouteMap = React.lazy(() => import('./maps/TracerouteMap'));
+const PacketRouteMap = React.lazy(() => import('./maps/PacketRouteMap'));
 
 const NodeMap = React.lazy(() => import('./NodeMap'));
 const TelemetryCharts = React.lazy(() => import('./TelemetryCharts'));
@@ -1378,19 +1381,27 @@ function App() {
         );
       }
       case 'POSITION': {
-        const lat = data.latitude_i ? data.latitude_i / 1e7 : data.latitude;
-        const lon = data.longitude_i ? data.longitude_i / 1e7 : data.longitude;
-        if (!lat || !lon) return null;
+        const rawLat = data.latitude_i ? data.latitude_i / 1e7 : data.latitude;
+        const rawLon = data.longitude_i ? data.longitude_i / 1e7 : data.longitude;
+        const validCoords = sanitizeCoordinatePair(rawLat, rawLon);
         return (
           <div className={`space-y-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
             <h5 className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2">
               <MapPin size={14} className="text-green-500" /> 位置廣播 Position Broadcast
             </h5>
-            <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-              <React.Suspense fallback={<div className="h-full flex items-center justify-center text-xs text-slate-400">載入地圖中...</div>}>
-                <PacketPositionMap lat={lat} lon={lon} darkMode={darkMode} />
-              </React.Suspense>
-            </div>
+            {validCoords ? (
+              <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
+                <MapErrorBoundary title="位置地圖載入失敗">
+                  <React.Suspense fallback={<div className="h-full flex items-center justify-center text-xs text-slate-400">載入地圖中...</div>}>
+                    <PacketPositionMap lat={validCoords[0]} lon={validCoords[1]} darkMode={darkMode} />
+                  </React.Suspense>
+                </MapErrorBoundary>
+              </div>
+            ) : (
+              <div className={`p-4 rounded-xl text-center text-[10px] italic ${darkMode ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-400'}`}>
+                此位置封包尚未包含有效 GPS 座標
+              </div>
+            )}
           </div>
         );
       }
@@ -1437,36 +1448,31 @@ function App() {
         const route = routeRaw.map((id: number | string) =>
           typeof id === 'number' ? `!${id.toString(16).padStart(8, '0')}` : id
         );
+        const snrTowards: number[] = Array.isArray(data.snr_towards) ? data.snr_towards : [];
 
-        const routeNodes = route.map((nodeId: string) => nodes.find(n => n.node_id === nodeId)).filter(Boolean) as Node[];
-
-        const points: [number, number][] = [];
-        routeNodes.forEach(n => { if (n.latitude && n.longitude) points.push([n.latitude, n.longitude]); });
+        const tracerouteHops = route.map((nodeId: string, idx: number) => {
+          const matchedNode = nodes.find(n => n.node_id === nodeId);
+          const rawSnr = snrTowards[idx];
+          const snrDb = typeof rawSnr === 'number' && rawSnr !== -128 ? Math.round((rawSnr / 4) * 10) / 10 : null;
+          return {
+            nodeId,
+            label: matchedNode?.long_name || matchedNode?.short_name || nodeId,
+            latitude: matchedNode?.latitude ?? null,
+            longitude: matchedNode?.longitude ?? null,
+            snr: snrDb
+          };
+        });
 
         return (
           <div className="space-y-2">
             <h5 className="text-[10px] font-black uppercase text-slate-500 tracking-widest flex items-center gap-2">
               <Zap size={14} className="text-yellow-500" /> 路徑追蹤 Traceroute Path
             </h5>
-            {points.length >= 2 ? (
-              <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-                <MapContainer key={`route-map-${points.map(p=>p.join(',')).join('|')}`} center={points[0]} zoom={10} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                  <AppTileLayer darkMode={darkMode} />
-                  {points.map((p, idx) => (
-                    <CircleMarker
-                      key={idx}
-                      center={p}
-                      radius={6}
-                      pathOptions={{ fillColor: idx === 0 ? '#eab308' : (idx === points.length - 1 ? '#ef4444' : '#3b82f6'), color: 'white', weight: 2, fillOpacity: 1 }} />
-                  ))}
-                  <Polyline positions={points} color="#eab308" weight={3} dashArray="5, 5" />
-                </MapContainer>
-              </div>
-            ) : (
-              <div className={`p-4 rounded-xl text-center text-[10px] italic ${darkMode ? 'bg-slate-800 text-slate-500' : 'bg-slate-100 text-slate-400'}`}>
-                無法顯示地圖：來源或目的地節點缺少 GPS 座標
-              </div>
-            )}
+            <MapErrorBoundary title="Traceroute 地圖載入失敗">
+              <React.Suspense fallback={<div className="h-48 flex items-center justify-center text-xs text-slate-400">載入 Traceroute 地圖中...</div>}>
+                <TracerouteMap hops={tracerouteHops} darkMode={darkMode} />
+              </React.Suspense>
+            </MapErrorBoundary>
             <div className="flex flex-wrap gap-1 mt-2">
               {route.map((id: string, i: number) => (
                 <div key={i} className="flex items-center gap-1">
@@ -4139,32 +4145,12 @@ function App() {
                         const mergedPacket = selectedPacketDetail ? { ...selectedPacket, payload_json: selectedPacketDetail.payload_json } : selectedPacket;
                         const lastHopNode = findLastHopNode(mergedPacket, nodes, traceroutePaths, neighbors);
 
-                        const gwLat = gwNode?.latitude;
-                        const gwLng = gwNode?.longitude;
-                        const senderLat = senderNode?.latitude;
-                        const senderLng = senderNode?.longitude;
-                        const lastHopLat = lastHopNode?.latitude;
-                        const lastHopLng = lastHopNode?.longitude;
-
-                        const hasGwGps = !!(gwLat && gwLng);
-                        const hasSenderGps = !!(senderLat && senderLng);
-                        const hasLastHopGps = !!(lastHopLat && lastHopLng);
-
                         const hops = selectedPacket.hops_away ?? (
                           (selectedPacket.hop_start && selectedPacket.hop_limit !== undefined)
                             ? Math.max(0, selectedPacket.hop_start - selectedPacket.hop_limit)
                             : 0
                         );
                         const isMultiHop = hops > 0 || !!lastHopNode;
-
-                        const validCoords: [number, number][] = [];
-                        if (hasSenderGps) validCoords.push([senderLat!, senderLng!]);
-                        if (hasLastHopGps) validCoords.push([lastHopLat!, lastHopLng!]);
-                        if (hasGwGps) validCoords.push([gwLat!, gwLng!]);
-
-                        const mapCenter: [number, number] = validCoords.length > 0
-                          ? validCoords[0]
-                          : [23.8, 120.9];
 
                         return (
                           <div className={`p-3 rounded-xl border space-y-2.5 ${darkMode ? 'bg-slate-800/40 border-slate-700/80' : 'bg-slate-50 border-slate-200'}`}>
@@ -4188,108 +4174,34 @@ function App() {
                               </div>
                             </div>
 
-                            {validCoords.length > 0 ? (
-                              <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700 shadow-inner">
-                                <MapContainer
-                                  key={`route-map-${selectedPacket.id || selectedPacket.timestamp}-${activeGwId}-${showAllPacketGateways}`}
-                                  center={mapCenter}
-                                  zoom={11}
-                                  style={{ height: '100%', width: '100%' }}
-                                  zoomControl={false}
-                                >
-                                  <AppTileLayer darkMode={darkMode} />
-                                  {/* 發送節點 Sender (Blue) */}
-                                  {hasSenderGps && (
-                                    <CircleMarker
-                                      center={[senderLat!, senderLng!]}
-                                      radius={7}
-                                      pathOptions={{ fillColor: '#3b82f6', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
-                                    >
-                                      <Popup>
-                                        <div className="text-[11px] font-sans">
-                                          <span className="text-blue-500 font-bold block mb-0.5">發送節點 (Sender)</span>
-                                          <strong>{senderNode?.long_name || senderNode?.short_name || selectedPacket.from}</strong>
-                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {selectedPacket.from}</div>
-                                        </div>
-                                      </Popup>
-                                    </CircleMarker>
-                                  )}
-
-                                  {/* 最後傳跳節點 Last Relay Node (Amber) */}
-                                  {hasLastHopGps && lastHopNode && (
-                                    <CircleMarker
-                                      center={[lastHopLat!, lastHopLng!]}
-                                      radius={7}
-                                      pathOptions={{ fillColor: '#f59e0b', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
-                                    >
-                                      <Popup>
-                                        <div className="text-[11px] font-sans">
-                                          <span className="text-amber-500 font-bold block mb-0.5">最後傳跳節點 (Last Relay Hop)</span>
-                                          <strong>{lastHopNode.long_name || lastHopNode.short_name || lastHopNode.node_id}</strong>
-                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {lastHopNode.node_id}</div>
-                                          <div className="text-[9px] text-amber-600 font-bold mt-0.5">多跳傳輸 ({hops} 跳)</div>
-                                        </div>
-                                      </Popup>
-                                    </CircleMarker>
-                                  )}
-
-                                  {/* 接收閘道器 Gateway (Emerald) */}
-                                  {hasGwGps && (
-                                    <CircleMarker
-                                      center={[gwLat!, gwLng!]}
-                                      radius={7}
-                                      pathOptions={{ fillColor: '#10b981', color: '#ffffff', weight: 2, fillOpacity: 0.95 }}
-                                    >
-                                      <Popup>
-                                        <div className="text-[11px] font-sans">
-                                          <span className="text-emerald-500 font-bold block mb-0.5">接收閘道器 (Gateway)</span>
-                                          <strong>{gwNode?.long_name || gwNode?.short_name || activeGwId}</strong>
-                                          <div className="text-[9px] text-slate-500 font-mono mt-0.5">ID: {activeGwId}</div>
-                                        </div>
-                                      </Popup>
-                                    </CircleMarker>
-                                  )}
-
-                                  {/* 連線繪製 */}
-                                  {/* 情境 1: 多跳且有最後傳跳點 GPS */}
-                                  {hasLastHopGps && (
-                                    <>
-                                      {/* 發送點 -> 最後傳跳點 (虛線) */}
-                                      {hasSenderGps && (
-                                        <Polyline
-                                          positions={[[senderLat!, senderLng!], [lastHopLat!, lastHopLng!]]}
-                                          color="#f59e0b"
-                                          weight={2.5}
-                                          dashArray="4, 4"
-                                        />
-                                      )}
-                                      {/* 最後傳跳點 -> 閘道 (實線) */}
-                                      {hasGwGps && (
-                                        <Polyline
-                                          positions={[[lastHopLat!, lastHopLng!], [gwLat!, gwLng!]]}
-                                          color="#10b981"
-                                          weight={3}
-                                        />
-                                      )}
-                                    </>
-                                  )}
-
-                                  {/* 情境 2: 無最後傳跳點或單跳直接接收 */}
-                                  {!hasLastHopGps && hasSenderGps && hasGwGps && (
-                                    <Polyline
-                                      positions={[[senderLat!, senderLng!], [gwLat!, gwLng!]]}
-                                      color={isMultiHop ? '#f59e0b' : '#10b981'}
-                                      weight={2.5}
-                                      dashArray={isMultiHop ? "5, 5" : undefined}
-                                    />
-                                  )}
-                                </MapContainer>
-                              </div>
-                            ) : (
-                              <div className={`p-4 rounded-xl text-center text-[10px] italic border border-dashed ${darkMode ? 'border-slate-800 text-slate-500 bg-slate-900/50' : 'border-slate-300 text-slate-400 bg-slate-100/50'}`}>
-                                發送節點或 Gateway 尚未回報 GPS 定位座標，無法繪製地理路徑連線。
-                              </div>
-                            )}
+                            <MapErrorBoundary title="收發路徑地圖載入失敗">
+                              <React.Suspense fallback={<div className="h-48 flex items-center justify-center text-xs text-slate-400">載入路徑地圖中...</div>}>
+                                <PacketRouteMap
+                                  mapKey={`route-map-${selectedPacket.id || selectedPacket.timestamp}-${activeGwId}-${showAllPacketGateways}`}
+                                  darkMode={darkMode}
+                                  sender={{
+                                    nodeId: selectedPacket.from,
+                                    displayName: senderNode?.long_name || senderNode?.short_name || selectedPacket.from,
+                                    latitude: senderNode?.latitude ?? null,
+                                    longitude: senderNode?.longitude ?? null
+                                  }}
+                                  lastHop={lastHopNode ? {
+                                    nodeId: lastHopNode.node_id,
+                                    displayName: lastHopNode.long_name || lastHopNode.short_name || lastHopNode.node_id,
+                                    latitude: lastHopNode.latitude ?? null,
+                                    longitude: lastHopNode.longitude ?? null
+                                  } : null}
+                                  gateway={{
+                                    nodeId: activeGwId || 'Unknown',
+                                    displayName: gwNode?.long_name || gwNode?.short_name || activeGwId || 'Unknown',
+                                    latitude: gwNode?.latitude ?? null,
+                                    longitude: gwNode?.longitude ?? null
+                                  }}
+                                  hops={hops}
+                                  isMultiHop={isMultiHop}
+                                />
+                              </React.Suspense>
+                            </MapErrorBoundary>
 
                             {/* 路徑文字摘要說明 */}
                             <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400 pt-1 border-t border-slate-700/30">
