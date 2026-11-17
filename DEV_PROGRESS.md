@@ -163,6 +163,25 @@
 
 ---
 
+### 9. Meshtastic-DashBoard 4.0.3 — Performance Optimization (Dashboard 首頁載入與 Node List 渲染效能優化) (READY FOR PRODUCTION REVIEW)
+- **核心目標**：以 4.0.2 為穩定基線（不改動 SQLite Reliability / Packet Transaction / BackupManager 架構，亦不更動 `package.json` 版本 metadata），先以 Headless Edge (CDP) 跨 `100 / 500 / 1,000 / 5,000` 合成節點進行基準量測，再針對實測瓶頸執行漸進式首頁載入、`NodeList` 虛擬化與元件拆分、`SystemUptime` 獨立隔離、`apiCache` 去重與 `AbortController`、WebSocket 單批次淺層比對合併、Vite Bundle 切分，以及後端 `[API_PERF]` 診斷計時與 `'7d'` 優先預熱。
+- **新增與修改模組**：
+  - [apiCache.ts](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/apiCache.ts)（新增）：輕量級 TTL + 同 URL In-Flight 去重 + `AbortSignal` 支援快取層。
+  - [SystemUptime.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/components/SystemUptime.tsx)（新增）：獨立每秒運行時間計時器，消除根元件 `App.tsx` 每秒全域重繪。
+  - [NodeList.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/components/NodeList.tsx) & [NodeListRow.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/components/NodeListRow.tsx)（新增）：Windowed 虛擬化表格（`57px` 列高 + `overscan=8` + `requestAnimationFrame` 滾動節流 + `ResizeObserver`）、`React.memo` 單列更新隔離、修正 Role `<td>` 結構。
+  - [PacketPositionMap.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/components/PacketPositionMap.tsx)（新增）：抽離 `App.tsx` 對 `leaflet` / `react-leaflet` 的靜態依賴。
+  - [App.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/App.tsx) & [NodeMap.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/NodeMap.tsx) & [vite.config.ts](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/vite.config.ts) & [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js)：移除 `appLoading` 全螢幕遮罩、消除重複初始化與重複 API、延遲載入 `coverage/griddata` 與 `traceroute/*`、WebSocket 單次 `setNodes()` 合併與參考保留、懶加載重型卡片並切分 Vite chunks、後端新增 `[API_PERF]` 計時並將 `warmCache` 改為優先預熱 `'7d'`。
+- **實測效能改善（5,000 節點，5 次冷快取中位數）**：
+  - 首頁 FCP：`268.0 ms` $\rightarrow$ **`108.0 ms`**（**-59.7%**）；LCP：`524.0 ms` $\rightarrow$ **`148.0 ms`**（**-71.8%**）；Dashboard Interactive：`248.9 ms` $\rightarrow$ **`120.6 ms`**（**-51.5%**）。
+  - 首頁初始 API 請求：`15` 筆（含 `3` 筆重複）$\rightarrow$ **`9`** 筆（**`0`** 筆重複，**-40.0% / -100% 重複**）；冷載入 JS 傳輸：`532,601 bytes` $\rightarrow$ **`251,253 bytes`**（**-52.8%**）。
+  - Node List 切換耗時：`1,216.1 ms`（P95 `1,693.7 ms`）$\rightarrow$ **`45.2 ms`**（P95 `64.8 ms`，**-96.3% / 26.9x**）；`<tr>` DOM 列數：`5,000` $\rightarrow$ **`15`**（**-99.7%**）；切換 Long Tasks：`1,339.0 ms` $\rightarrow$ **`0.0 ms`**（**-100%**）；搜尋延遲：`168.6 ms` $\rightarrow$ **`31.6 ms`**（**-81.3%**）。
+- **回歸與完整報告**：
+  - 完整實測報告見 [PERFORMANCE_OPTIMIZATION_REPORT.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/PERFORMANCE_OPTIMIZATION_REPORT.md)。
+  - 資料庫核心回歸 `npm run test:database`：**108 / 108 `it()` 測試全數通過（108 PASS, 0 FAIL, 0 SKIPPED）**；前端全分頁與虛擬化回歸（`verify_4_0_3_functional.mjs`）：**0 執行期錯誤**。
+  - 當前版本狀態：**`READY FOR PRODUCTION REVIEW`**（注意：未授權前絕不部署或重啟 Production PM2）。
+
+---
+
 ## 📋 待辦事項與後續擴充方向 (Backlog)
 
 1. **單站與全台覆蓋圖層連動**：

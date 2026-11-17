@@ -5,6 +5,7 @@ import L from 'leaflet';
 import { Node } from './App';
 import { Info, ChevronDown, ChevronUp, BarChart2, Radio, Activity, Wifi } from 'lucide-react';
 import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
+import { fetchJsonCached } from './apiCache';
 
 // Traceroute 多路徑型別
 export interface TracerouteHop {
@@ -213,8 +214,7 @@ const NodeMap = ({
 
   useEffect(() => {
     if (externalItmMeta !== undefined) return;
-    fetch('/api/coverage/itm-info')
-      .then(res => res.json())
+    fetchJsonCached('/api/coverage/itm-info', { ttlMs: 5 * 60 * 1000 })
       .then(data => {
         if (data && data.available !== false) setInternalItmMeta(data);
       })

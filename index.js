@@ -196,6 +196,19 @@ app.use((req, res, next) => {
     next();
 });
 
+// 📊 4.0.3 API 診斷計時中介軟體 (僅記錄路徑、方法、耗時與快取命中狀態，絕不記錄節點 ID / GPS / Token 等敏感資訊)
+app.use('/api/', (req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    res.on('finish', () => {
+        const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+        if (elapsedMs >= 50 || process.env.API_PERF_LOG === '1') {
+            const cacheHeader = res.getHeader('X-Cache') || 'NONE';
+            console.log(`⏱️ [API_PERF] ${req.method} ${req.path} status=${res.statusCode} durationMs=${elapsedMs.toFixed(1)} cache=${cacheHeader}`);
+        }
+    });
+    next();
+});
+
 // ==========================================
 // 🛡️ 封包去重快取引擎 (Bounded TTL Deduplication Cache)
 // 具備 5 分鐘物理傳播生命週期 (TTL) 與 10,000 筆上限，防止記憶體無上限增長
@@ -3852,12 +3865,10 @@ async function startServer() {
             // 啟動 RF 監聽
             setupRFListener(io, db);
 
-            // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取
+            // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取 (4.0.3: 優先預熱最常用的 7d 範圍，避免開機同時併發查詢 24h/7d/30d 增加 SQLite 壓力)
             const warmCache = () => {
                 const portToUse = server.address()?.port || PORT;
-                ['7d', '24h', '30d'].forEach(r => {
-                    fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => { });
-                });
+                fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=7d`).catch(() => { });
             };
             setTimeout(warmCache, 2000);
             setInterval(warmCache, 3 * 60 * 1000);

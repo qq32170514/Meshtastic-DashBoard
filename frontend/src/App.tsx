@@ -1,21 +1,23 @@
 import React, { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import { Activity, Star, Radio, Search, Clock, Zap, Map as MapIcon, List, BarChart2, BarChart3, ChevronDown, Info, Database, Signal, HardDrive, Smartphone, Battery, ZapOff, PieChart, X, Sun, Moon, Terminal, Eye, Cpu, RefreshCw, MessageCircle, MapPin, Filter, TrendingDown, Settings, Megaphone, Share2, Maximize2, Minimize2, ExternalLink } from 'lucide-react';
-import 'leaflet/dist/leaflet.css';
-import { MapContainer, CircleMarker, Polyline, Popup } from 'react-leaflet';
 import { AppTileLayer } from './mapTiles';
 import type { TraceroutePath } from './NodeMap';
-import PacketTypePieChart from './PacketTypePieChart';
-import NodeRecoveryQR from './NodeRecoveryQR';
-import SolarForecastCard from './SolarForecastCard';
-import RFCoverageCard from './RFCoverageCard';
+import { fetchJsonCached } from './apiCache';
+import NodeList from './components/NodeList';
+import SystemUptime from './components/SystemUptime';
+
+const PacketTypePieChart = React.lazy(() => import('./PacketTypePieChart'));
+const NodeRecoveryQR = React.lazy(() => import('./NodeRecoveryQR'));
+const SolarForecastCard = React.lazy(() => import('./SolarForecastCard'));
+const RFCoverageCard = React.lazy(() => import('./RFCoverageCard'));
+const PacketPositionMap = React.lazy(() => import('./components/PacketPositionMap'));
 
 const NodeMap = React.lazy(() => import('./NodeMap'));
 const TelemetryCharts = React.lazy(() => import('./TelemetryCharts'));
 const RfHealthChart = React.lazy(() => import('./RfHealthChart'));
 const TopologyGraph = React.lazy(() => import('./TopologyGraph'));
 const NetworkAnalytics = React.lazy(() => import('./NetworkAnalytics'));
-import { throttle } from 'lodash';
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
@@ -590,8 +592,8 @@ function App() {
   const [showChatAnalytics, setShowChatAnalytics] = useState(false);
   const [chatAnalyticsData, setChatAnalyticsData] = useState<any>(null);
   const [sysStatus, setSysStatus] = useState<any>(null);
-  const [displayedUptime, setDisplayedUptime] = useState<number | null>(null);
-  const [appLoading, setAppLoading] = useState(true);
+  const [initialUptime, setInitialUptime] = useState<number | null>(null);
+  const [nodesLoading, setNodesLoading] = useState(true);
   const [coverageData, setCoverageData] = useState<any[]>([]);
   const [showTraceroute, setShowTraceroute] = useState(false);
   const [showHopGrid, setShowHopGrid] = useState(false);
@@ -623,52 +625,16 @@ function App() {
 
   const [nodeActivity, setNodeActivity] = useState<Record<string, number>>({});
 
-  // 🚀 效能優化版的 WebSocket 監聽器
+  // 🚀 Socket 連線狀態監聽
   useEffect(() => {
-    socket.on('connect', () => setMqttConnected(true));
-    socket.on('disconnect', () => setMqttConnected(false));
-
-    const handleNodeUpdate = throttle((data: Node | Node[]) => {
-      setNodes(prev => {
-        const incoming = Array.isArray(data) ? data : [data];
-        const newNodes = [...prev];
-        let changed = false;
-
-        incoming.forEach(node => {
-          const idx = newNodes.findIndex(n => n.node_id === node.node_id);
-          if (idx >= 0) {
-            newNodes[idx] = { ...newNodes[idx], ...node };
-            changed = true;
-          } else {
-            newNodes.push(node);
-            changed = true;
-          }
-        });
-
-        return changed ? newNodes : prev;
-      });
-    }, 1000, { leading: true, trailing: true });
-
-    const handlePacketBatch = throttle((data: any[]) => {
-      if (!data || data.length === 0) return;
-
-      setPackets(prev => {
-        const combined = [...data, ...prev];
-        // 最多保留最新 300 筆，避免 DOM 崩潰
-        return combined.slice(0, 300);
-      });
-    }, 1000, { leading: true, trailing: true });
-
-    //socket.on('node_update', handleNodeUpdate);
-    //socket.on('raw_packet_batch', handlePacketBatch);
+    const onConnect = () => setMqttConnected(true);
+    const onDisconnect = () => setMqttConnected(false);
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
 
     return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('node_update');
-      socket.off('raw_packet_batch');
-      handleNodeUpdate.cancel();
-      handlePacketBatch.cancel();
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
     };
   }, []);
 
@@ -854,8 +820,7 @@ function App() {
   const [gatewayLeaderboard, setGatewayLeaderboard] = useState<any[]>([]);
 
   useEffect(() => {
-    fetch('/api/coverage/itm-info')
-      .then(res => res.json())
+    fetchJsonCached('/api/coverage/itm-info', { ttlMs: 5 * 60 * 1000 })
       .then(data => {
         if (data && data.available !== false) setItmMeta(data);
       })
@@ -977,31 +942,16 @@ function App() {
     return { ...n, is_favorite: favoriteIdSet.has(n.node_id) ? 1 : 0 };
   }, [nodes, selectedNodeId, favoriteIdSet]);
 
-  const uniqueRoles = useMemo(() => Array.from(new Set(nodes.map(n => n.role).filter(Boolean))).sort(), [nodes]);
-  const uniqueHardware = useMemo(() => Array.from(new Set(nodes.map(n => n.hw_model).filter(Boolean))).sort(), [nodes]);
+  const uniqueRoles = useMemo(() => Array.from(new Set(nodes.map(n => n.role).filter((r): r is string => Boolean(r)))).sort(), [nodes]);
+  const uniqueHardware = useMemo(() => Array.from(new Set(nodes.map(n => n.hw_model).filter((h): h is string => Boolean(h)))).sort(), [nodes]);
 
-  const filteredNodes = useMemo(() => {
-    const query = nodeListSearchQuery.toLowerCase();
-    const now = Date.now();
-    return nodes.map(n => ({ ...n, is_favorite: favoriteIdSet.has(n.node_id) ? 1 : 0 }))
-      .filter(node => {
-        if (query && !node.node_id.toLowerCase().includes(query) &&
-          !(node.long_name || '').toLowerCase().includes(query) &&
-          !(node.short_name || '').toLowerCase().includes(query)) {
-          return false;
-        }
-        if (nodeFilter.role !== 'ALL' && node.role !== nodeFilter.role) return false;
-        if (nodeFilter.hardware !== 'ALL' && node.hw_model !== nodeFilter.hardware) return false;
-        if (nodeFilter.timePreset !== 'ALL' && node.last_seen) {
-          const lastSeenTime = new Date(node.last_seen).getTime();
-          if (nodeFilter.timePreset === '1h' && now - lastSeenTime > 3600000) return false;
-          if (nodeFilter.timePreset === '6h' && now - lastSeenTime > 21600000) return false;
-          if (nodeFilter.timePreset === '24h' && now - lastSeenTime > 86400000) return false;
-          if (nodeFilter.timePreset === '7d' && now - lastSeenTime > 604800000) return false;
-        }
-        return true;
-      });
-  }, [nodes, nodeListSearchQuery, favoriteIdSet, nodeFilter]);
+  const nodesRef = useRef<Node[]>(nodes);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+
+  const handleSelectNodeFromList = useCallback((nodeId: string) => {
+    setSelectedNodeId(nodeId);
+    setActiveTab('details');
+  }, []);
 
   // 過濾邏輯封裝
   const applyFilter = (pkts: Packet[], filter: typeof globalFilter) => {
@@ -1140,10 +1090,9 @@ function App() {
       .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
   }, [packets, chatHistory, currentChatChannel, chatFilter, nodes]);
 
-  const fetchNodeStatus = async () => {
+  const fetchNodeStatus = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch('/api/node-status');
-      const data = await res.json();
+      const data = await fetchJsonCached<any[]>('/api/node-status', { ttlMs: 10 * 1000, signal });
       // Ensure SQLite UTC timestamps are parsed correctly in local timezone by appending 'Z'
       const formattedNodes = data.map((n: any) => ({
         ...n,
@@ -1153,19 +1102,23 @@ function App() {
       }));
       setNodes(formattedNodes);
       return formattedNodes;
-    } catch (e) {
-      console.error("Failed to fetch node status", e);
-      setAppLoading(false);
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        console.error("Failed to fetch node status", e);
+      }
       return [];
+    } finally {
+      setNodesLoading(false);
     }
-  };
+  }, []);
 
   const fetchPackets = useCallback(async (
     type: 'global' | 'favorite' | 'node',
     page: number,
     filter: typeof globalFilter | typeof nodeLogFilter | typeof favLogFilter,
     nodeId?: string,
-    nodeIds?: string[]
+    nodeIds?: string[],
+    signal?: AbortSignal
   ) => {
     setLoadingPackets(true);
     try {
@@ -1212,12 +1165,11 @@ function App() {
         return;
       }
 
-      const [packetsRes, countRes] = await Promise.all([
-        fetch(url),
-        fetch(countUrl)
+      const [packetsData, countData] = await Promise.all([
+        fetchJsonCached<any[]>(url, { ttlMs: 4 * 1000, signal }),
+        fetchJsonCached<{ count: number }>(countUrl, { ttlMs: 4 * 1000, signal })
       ]);
-      const packetsData = await packetsRes.json();
-      const countData = await countRes.json();
+      if (signal?.aborted) return;
 
       const formattedPackets = packetsData.map((p: any) => ({
         id: p.id,          // 🚀 保留 DB row id 用於懶加載
@@ -1255,24 +1207,28 @@ function App() {
         setFavoritePackets(formattedPackets);
         setFavPacketsTotalCount(countData.count);
       }
-    } catch (error) {
-      console.error("Failed to fetch packets:", error);
+    } catch (error: any) {
+      if (error?.name !== 'AbortError') {
+        console.error("Failed to fetch packets:", error);
+      }
     } finally {
-      setLoadingPackets(false);
+      if (!signal?.aborted) {
+        setLoadingPackets(false);
+      }
     }
   }, []);
 
-  const fetchGlobalPackets = useCallback((page: number, filter: typeof globalFilter) =>
-    fetchPackets('global', page, filter), [fetchPackets]);
+  const fetchGlobalPackets = useCallback((page: number, filter: typeof globalFilter, signal?: AbortSignal) =>
+    fetchPackets('global', page, filter, undefined, undefined, signal), [fetchPackets]);
 
-  const fetchNodeSpecificPackets = useCallback((nodeId: string, page: number, filter: typeof nodeLogFilter) =>
-    fetchPackets('node', page, filter, nodeId), [fetchPackets]);
+  const fetchNodeSpecificPackets = useCallback((nodeId: string, page: number, filter: typeof nodeLogFilter, signal?: AbortSignal) =>
+    fetchPackets('node', page, filter, nodeId, undefined, signal), [fetchPackets]);
 
-  const fetchFavoritePackets = useCallback((page: number, filter: typeof favLogFilter, currentNodes: Node[]) => {
+  const fetchFavoritePackets = useCallback((page: number, filter: typeof favLogFilter, currentNodes: Node[], signal?: AbortSignal) => {
     if (!Array.isArray(currentNodes) || currentNodes.length === 0) return;
     const favIds = currentNodes.filter(n => n && favoriteIdSet.has(n.node_id)).map(n => n.node_id);
     if (favIds.length === 0) return;
-    fetchPackets('favorite', page, filter, undefined, favIds);
+    fetchPackets('favorite', page, filter, undefined, favIds, signal);
   }, [fetchPackets, favoriteIdSet]);
 
   /**
@@ -1317,38 +1273,30 @@ function App() {
 
   const loadNetworkStats = useCallback(async () => {
     try {
-      const [nRes, gRes] = await Promise.all([
-        fetch('/api/neighbors'),
-        fetch('/api/gateways/leaderboard')
+      const [nData, gData] = await Promise.all([
+        fetchJsonCached<any[]>('/api/neighbors', { ttlMs: 30 * 1000 }),
+        fetchJsonCached<any[]>('/api/gateways/leaderboard', { ttlMs: 30 * 1000 })
       ]);
-      setNeighbors(await nRes.json());
-      setGatewayLeaderboard(await gRes.json());
+      setNeighbors(nData);
+      setGatewayLeaderboard(gData);
     } catch (e) { console.error("Network stats load failed", e); }
   }, []);
 
   const refreshDashboardData = useCallback(async () => {
     try {
-      const [sRes, aRes] = await Promise.all([fetch('/api/sys-status'), fetch('/api/nodes/activity')]);
-      const sData = await sRes.json();
-      const aData = await aRes.json();
+      const [sData, aData] = await Promise.all([
+        fetchJsonCached<any>('/api/sys-status', { ttlMs: 4 * 1000 }),
+        fetchJsonCached<any[]>('/api/nodes/activity', { ttlMs: 25 * 1000 })
+      ]);
 
       setSysStatus(sData);
-      // 🚀 以伺服器回傳的 uptime 作為起點，之後由本地計時器每秒遞增
-      if (sData?.uptime != null) setDisplayedUptime(sData.uptime);
+      // 🚀 以伺服器回傳的 uptime 作為起點，交由獨立的 SystemUptime 元件每秒遞增（不觸發 App 整體重繪）
+      if (sData?.uptime != null) setInitialUptime(sData.uptime);
       const activityMap: Record<string, number> = {};
       aData.forEach((item: any) => activityMap[item.node_id] = item.count);
       setNodeActivity(activityMap);
     } catch (e) { }
   }, []);
-
-  // 🚀 每秒遞增 displayedUptime，讓頁面底部的連續運行時間動態計時
-  useEffect(() => {
-    if (displayedUptime == null) return;
-    const timer = setInterval(() => {
-      setDisplayedUptime(prev => (prev != null ? prev + 1 : prev));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [displayedUptime == null]);
 
 
   const estimateBatteryLife = (node: Node) => {
@@ -1439,10 +1387,9 @@ function App() {
               <MapPin size={14} className="text-green-500" /> 位置廣播 Position Broadcast
             </h5>
             <div className="h-48 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-700">
-              <MapContainer key={`pos-map-${lat}-${lon}`} center={[lat, lon]} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
-                <AppTileLayer darkMode={darkMode} />
-                <CircleMarker center={[lat, lon]} radius={8} pathOptions={{ fillColor: '#22c55e', color: 'white', weight: 2, fillOpacity: 0.9 }} />
-              </MapContainer>
+              <React.Suspense fallback={<div className="h-full flex items-center justify-center text-xs text-slate-400">載入地圖中...</div>}>
+                <PacketPositionMap lat={lat} lon={lon} darkMode={darkMode} />
+              </React.Suspense>
             </div>
           </div>
         );
@@ -1569,7 +1516,7 @@ function App() {
     }
   }, [selectedNodeId]);
 
-  const fetchCoverageGridData = useCallback(async (start?: string, end?: string) => {
+  const fetchCoverageGridData = useCallback(async (start?: string, end?: string, signal?: AbortSignal) => {
     let url = '/api/coverage/griddata';
     const params = [];
     if (start) params.push(`timeStart=${encodeURIComponent(start.replace('T', ' '))}`);
@@ -1578,11 +1525,14 @@ function App() {
       url += '?' + params.join('&');
     }
     try {
-      const res = await fetch(url);
-      const data = await res.json();
-      setCoverageData(data);
-    } catch (e) {
-      console.error("Failed to fetch coverage grid data", e);
+      const data = await fetchJsonCached<any[]>(url, { ttlMs: 30 * 1000, signal });
+      if (!signal?.aborted) {
+        setCoverageData(data);
+      }
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        console.error("Failed to fetch coverage grid data", e);
+      }
     }
   }, []);
 
@@ -1598,91 +1548,128 @@ function App() {
 
   const hasAnyUnreadChat = useMemo(() => Object.values(unreadChannels).some(v => v), [unreadChannels]);
 
+  // 🚀 Phase 2 & 3: 核心儀表板初始化 (僅於 Mount 執行一次，不依賴分頁或篩選狀態)
   useEffect(() => {
-    console.log("App.tsx: useEffect - Initializing app...");
-    const initApp = async () => {
-      setAppLoading(true);
+    const controller = new AbortController();
+    let cancelled = false;
+
+    const initCoreDashboard = async () => {
       try {
-        const initialNodes = await fetchNodeStatus();
-        await Promise.all([
-          loadNetworkStats(),
-          refreshDashboardData(),
-          fetchGlobalPackets(globalPacketsCurrentPage, globalFilter),
-          fetchFavoritePackets(favPacketsCurrentPage, favLogFilter, initialNodes)
-        ]);
-      } catch (error) {
-        console.error("Initial app load failed:", error);
-      } finally {
-        setAppLoading(false);
+        const initialNodes = await fetchNodeStatus(controller.signal);
+        if (cancelled) return;
+        // 次要資料各自獨立非阻塞載入，不卡住首頁 Shell
+        refreshDashboardData();
+        loadNetworkStats();
+        if (initialNodes.length > 0) {
+          fetchFavoritePackets(favPacketsCurrentPage, favLogFilter, initialNodes, controller.signal);
+        }
+      } catch (error: any) {
+        if (error?.name !== 'AbortError') {
+          console.error("Initial app load failed:", error);
+        }
       }
     };
-    initApp();
+    initCoreDashboard();
 
-    // 🚀 WebSocket batch update buffers
-    const pendingNodeUpdates = new Map();
-    const pendingPackets = [];
-    let pendingMqttConnected = null;
+    const sysInterval = setInterval(refreshDashboardData, 30000);
 
-    // 🚀 WebSocket batch update flusher (runs every 1.5 seconds)
+    return () => {
+      cancelled = true;
+      controller.abort();
+      clearInterval(sysInterval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchNodeStatus, refreshDashboardData, loadNetworkStats]);
+
+  // 🚀 WebSocket 單一批次合併管線 (僅於 Mount 註冊一次；每次 Flush 最多呼叫一次 setNodes 並保留未變動節點參考)
+  useEffect(() => {
+    const pendingNodeUpdates = new Map<string, any>();
+    const pendingPackets: any[] = [];
+    let pendingMqttConnected: boolean | null = null;
+
+    const mergeNodeIfChanged = (existing: Node | undefined, patch: Record<string, any>): Node | null => {
+      if (!existing) return patch as Node;
+      let hasDiff = false;
+      for (const key of Object.keys(patch)) {
+        const nextVal = patch[key];
+        if (nextVal !== undefined && (existing as any)[key] !== nextVal) {
+          hasDiff = true;
+          break;
+        }
+      }
+      if (!hasDiff) return null;
+      return { ...existing, ...patch };
+    };
+
     const flushInterval = setInterval(() => {
-      // 1. Flush Node Updates
+      const hasNodePatch = pendingNodeUpdates.size > 0;
+      const packetsToProcess = pendingPackets.length > 0 ? pendingPackets.splice(0, pendingPackets.length) : [];
+
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const datePart = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
+      const timePart = now.toLocaleTimeString('zh-TW', { hour12: false });
+      const nowTime = `${datePart} ${timePart}`;
+
+      // 合併來自 node_seen / telemetry / raw_packet 座標的節點更新至單一 Map
+      if (hasNodePatch) {
+        for (const [id, patch] of pendingNodeUpdates.entries()) {
+          // Keep as is; coordinates from raw_packet_batch will merge below
+          if (!id) pendingNodeUpdates.delete(id);
+        }
+      }
+      for (let i = 0; i < packetsToProcess.length; i++) {
+        const packet = packetsToProcess[i];
+        const fromId = packet.from || packet.node_id;
+        if (fromId && !packet.source && (packet.latitude !== undefined || packet.longitude !== undefined)) {
+          const prevPatch = pendingNodeUpdates.get(fromId) || { node_id: fromId };
+          if (packet.latitude !== undefined && packet.latitude !== null) prevPatch.latitude = packet.latitude;
+          if (packet.longitude !== undefined && packet.longitude !== null) prevPatch.longitude = packet.longitude;
+          prevPatch.last_seen = nowIso;
+          pendingNodeUpdates.set(fromId, prevPatch);
+        }
+      }
+
+      // 1. 單次 setNodes() 批次合併更新，未變動節點與陣列完全保留原參考
       if (pendingNodeUpdates.size > 0) {
         const updatesArray = Array.from(pendingNodeUpdates.values());
         pendingNodeUpdates.clear();
 
         setNodes(prev => {
-          const nodeMap = new Map(prev.map(n => [n.node_id, n]));
-          updatesArray.forEach(updatedNode => {
-            if (updatedNode.node_id) {
-              if (nodeMap.has(updatedNode.node_id)) {
-                nodeMap.set(updatedNode.node_id, { ...nodeMap.get(updatedNode.node_id), ...updatedNode });
-              } else {
-                nodeMap.set(updatedNode.node_id, updatedNode);
+          let changed = false;
+          const indexMap = new Map<string, number>();
+          for (let i = 0; i < prev.length; i++) {
+            indexMap.set(prev[i].node_id, i);
+          }
+          let nextNodes = prev;
+          const ensureCloned = () => {
+            if (nextNodes === prev) nextNodes = prev.slice();
+          };
+
+          for (let i = 0; i < updatesArray.length; i++) {
+            const patch = updatesArray[i];
+            if (!patch || !patch.node_id) continue;
+            const idx = indexMap.get(patch.node_id);
+            if (idx !== undefined) {
+              const merged = mergeNodeIfChanged(nextNodes[idx], patch);
+              if (merged) {
+                ensureCloned();
+                nextNodes[idx] = merged;
+                changed = true;
               }
+            } else {
+              ensureCloned();
+              indexMap.set(patch.node_id, nextNodes.length);
+              nextNodes.push(patch as Node);
+              changed = true;
             }
-          });
-          return Array.from(nodeMap.values());
+          }
+          return changed ? nextNodes : prev;
         });
       }
 
-      // 2. Flush Packet Logs & Coordinates
-      if (pendingPackets.length > 0) {
-        const packetsToProcess = [...pendingPackets];
-        pendingPackets.length = 0; // Clear the array
-
-        const now = new Date();
-        const nowIso = now.toISOString();
-        const datePart = `${now.getFullYear()}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getDate().toString().padStart(2, '0')}`;
-        const timePart = now.toLocaleTimeString('zh-TW', { hour12: false });
-        const nowTime = `${datePart} ${timePart}`;
-
-        // 2a. Update coordinates in node state
-        setNodes(prev => {
-          let changed = false;
-          const nodeMap = new Map(prev.map(n => [n.node_id, n]));
-          packetsToProcess.forEach(packet => {
-            const fromId = packet.from || packet.node_id;
-            if (fromId && nodeMap.has(fromId)) {
-              const existing = nodeMap.get(fromId);
-              // Only update if coords actually changed
-              const hasNewCoords = !packet.source && (packet.latitude !== undefined || packet.longitude !== undefined);
-              if (hasNewCoords) {
-                nodeMap.set(fromId, {
-                  ...existing,
-                  latitude: packet.latitude !== undefined && packet.latitude !== null ? packet.latitude : existing.latitude,
-                  longitude: packet.longitude !== undefined && packet.longitude !== null ? packet.longitude : existing.longitude,
-                  last_seen: nowIso
-                });
-                changed = true;
-              }
-            }
-          });
-          return changed ? Array.from(nodeMap.values()) : prev;
-        });
-
-        // 2b. 覆蓋網格由 coverageInterval 定期 2 分鐘刷新，避免每個位置封包均觸發高負載全網格重新計算
-
-        // 2c. Update packet stream
+      // 2. 更新封包串流、聊天室未讀狀態與選中節點封包
+      if (packetsToProcess.length > 0) {
         const mqttPackets = packetsToProcess.filter(p => !p.source);
         if (mqttPackets.length > 0 && !filterActiveRef.current) {
           setPackets(prev => {
@@ -1699,14 +1686,13 @@ function App() {
           });
         }
 
-        // 2d. Handle chat alerts & selected node packets list
         packetsToProcess.forEach(packet => {
           const fromId = packet.node_id || packet.from;
           const isText = (PORTNUM_NAMES[packet.portnum] === 'TEXT_MESSAGE' || packet.portnum === '1' || packet.portnum === 1);
           if (isText && packet.payload_json?.text && packet.payload_json?.channel_name) {
             const msgChan = packet.payload_json.channel_name;
             if (activeTabRef.current !== 'chat' || currentChatChannelRef.current !== msgChan) {
-              setUnreadChannels(prev => ({ ...prev, [msgChan]: true }));
+              setUnreadChannels(prev => (prev[msgChan] ? prev : { ...prev, [msgChan]: true }));
             }
           }
           if (selectedNodeIdRef.current && fromId === selectedNodeIdRef.current) {
@@ -1717,24 +1703,22 @@ function App() {
 
       // 3. Flush MQTT Status
       if (pendingMqttConnected !== null) {
-        setMqttConnected(pendingMqttConnected);
+        const nextStatus = pendingMqttConnected;
         pendingMqttConnected = null;
+        setMqttConnected(prev => (prev === nextStatus ? prev : nextStatus));
       }
     }, 1500);
 
-    // 🚀 Register socket listeners that push to buffer queues
-    socket.on('mqtt_status', (data) => {
+    const onMqttStatus = (data: any) => {
       pendingMqttConnected = data.connected;
-    });
-
-    socket.on('node_seen', (updatedNode) => {
+    };
+    const onNodeSeen = (updatedNode: any) => {
       if (updatedNode && updatedNode.node_id) {
         const existing = pendingNodeUpdates.get(updatedNode.node_id) || {};
         pendingNodeUpdates.set(updatedNode.node_id, { ...existing, ...updatedNode });
       }
-    });
-
-    socket.on('node_seen_batch', (updates) => {
+    };
+    const onNodeSeenBatch = (updates: any[]) => {
       if (updates) {
         updates.forEach(updatedNode => {
           if (updatedNode && updatedNode.node_id) {
@@ -1743,15 +1727,11 @@ function App() {
           }
         });
       }
-    });
-
-    socket.on('raw_packet_batch', (packets) => {
-      if (packets) {
-        pendingPackets.push(...packets);
-      }
-    });
-
-    socket.on('telemetry_update', (data) => {
+    };
+    const onRawPacketBatch = (pkts: any[]) => {
+      if (pkts) pendingPackets.push(...pkts);
+    };
+    const mergeTelemetry = (data: any) => {
       if (data && data.node_id) {
         const existing = pendingNodeUpdates.get(data.node_id) || {};
         pendingNodeUpdates.set(data.node_id, {
@@ -1768,68 +1748,65 @@ function App() {
           humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : existing.humidity
         });
       }
-    });
+    };
+    const onTelemetryBatch = (updates: any[]) => {
+      if (updates) updates.forEach(mergeTelemetry);
+    };
 
-    socket.on('telemetry_batch', (updates) => {
-      if (updates) {
-        updates.forEach(data => {
-          if (data && data.node_id) {
-            const existing = pendingNodeUpdates.get(data.node_id) || {};
-            pendingNodeUpdates.set(data.node_id, {
-              ...existing,
-              node_id: data.node_id,
-              battery_level: data.battery_level !== undefined && data.battery_level !== null ? data.battery_level : existing.battery_level,
-              voltage: data.voltage !== undefined && data.voltage !== null ? data.voltage : existing.voltage,
-              current: data.current !== undefined && data.current !== null ? data.current : existing.current,
-              snr: data.snr !== undefined && data.snr !== null ? data.snr : existing.snr,
-              rssi: data.rssi !== undefined && data.rssi !== null ? data.rssi : existing.rssi,
-              air_util_tx: data.air_util_tx !== undefined && data.air_util_tx !== null ? data.air_util_tx : existing.air_util_tx,
-              channel_utilization: data.channel_utilization !== undefined && data.channel_utilization !== null ? data.channel_utilization : existing.channel_utilization,
-              temperature: data.temperature !== undefined && data.temperature !== null ? data.temperature : existing.temperature,
-              humidity: data.humidity !== undefined && data.humidity !== null ? data.humidity : existing.humidity
-            });
-          }
-        });
-      }
-    });
-
-    // 抓取網格化聚合數據
-    fetchCoverageGridData(coverageStartTime, coverageEndTime);
-
-    // 抓取 Traceroute 數據（多路徑版）
-    const fetchTraceroutePaths = () => fetch('/api/traceroute/paths')
-      .then(res => res.json())
-      .then(data => setTraceroutePaths(Array.isArray(data) ? data : []))
-      .catch(() => {});
-    // 同時保留 latest 以作 fallback
-    const fetchTraceroute = () => fetch('/api/traceroute/latest').then(res => res.json()).then(setTraceroutePath);
-    fetchTraceroutePaths();
-    fetchTraceroute();
-
-    const sysInterval = setInterval(refreshDashboardData, 30000);
-    const coverageInterval = setInterval(() => {
-      fetchCoverageGridData(coverageStartTime, coverageEndTime);
-    }, 120000); // 每 2 分鐘更新一次地圖背景點位
-    const tracerouteInterval = setInterval(fetchTraceroute, 60000);
-    const traceroutePathsInterval = setInterval(fetchTraceroutePaths, 30000); // 每 30 秒更新多路徑
+    socket.on('mqtt_status', onMqttStatus);
+    socket.on('node_seen', onNodeSeen);
+    socket.on('node_seen_batch', onNodeSeenBatch);
+    socket.on('raw_packet_batch', onRawPacketBatch);
+    socket.on('telemetry_update', mergeTelemetry);
+    socket.on('telemetry_batch', onTelemetryBatch);
 
     return () => {
       clearInterval(flushInterval);
-      clearInterval(sysInterval);
+      socket.off('mqtt_status', onMqttStatus);
+      socket.off('node_seen', onNodeSeen);
+      socket.off('node_seen_batch', onNodeSeenBatch);
+      socket.off('raw_packet_batch', onRawPacketBatch);
+      socket.off('telemetry_update', mergeTelemetry);
+      socket.off('telemetry_batch', onTelemetryBatch);
+    };
+  }, []);
+
+  // 🚀 Phase 4: 地圖覆蓋網格與 Traceroute 僅於進入地圖/拓撲分頁時延遲載入，避免阻塞首頁初始化
+  useEffect(() => {
+    if (activeTab !== 'map' && activeTab !== 'topology') return;
+    const controller = new AbortController();
+
+    fetchCoverageGridData(coverageStartTime, coverageEndTime, controller.signal);
+
+    const fetchTraceroutePaths = () => fetchJsonCached<any[]>('/api/traceroute/paths', { ttlMs: 25 * 1000, signal: controller.signal })
+      .then(data => { if (!controller.signal.aborted) setTraceroutePaths(Array.isArray(data) ? data : []); })
+      .catch(() => {});
+    const fetchTraceroute = () => fetchJsonCached<any>('/api/traceroute/latest', { ttlMs: 25 * 1000, signal: controller.signal })
+      .then(data => { if (!controller.signal.aborted) setTraceroutePath(data); })
+      .catch(() => {});
+
+    fetchTraceroutePaths();
+    fetchTraceroute();
+
+    const coverageInterval = setInterval(() => {
+      fetchCoverageGridData(coverageStartTime, coverageEndTime, controller.signal);
+    }, 120000);
+    const tracerouteInterval = setInterval(fetchTraceroute, 60000);
+    const traceroutePathsInterval = setInterval(fetchTraceroutePaths, 30000);
+
+    return () => {
+      controller.abort();
       clearInterval(coverageInterval);
       clearInterval(tracerouteInterval);
       clearInterval(traceroutePathsInterval);
-      socket.off('mqtt_status');
-      socket.off('node_seen');
-      socket.off('node_seen_batch');
-      socket.off('raw_packet_batch');
-      socket.off('telemetry_update');
-      socket.off('telemetry_batch');
     };
-  }, [fetchGlobalPackets, fetchFavoritePackets, loadNetworkStats, refreshDashboardData, globalPacketsCurrentPage, globalFilter, favPacketsCurrentPage, favLogFilter]);
+  }, [activeTab, coverageStartTime, coverageEndTime, fetchCoverageGridData]);
 
+  // 🚀 全域封包列表：獨立 Effect + AbortController 取消過期請求，消除重複初始化
   useEffect(() => {
-    fetchGlobalPackets(globalPacketsCurrentPage, globalFilter);
+    const controller = new AbortController();
+    fetchGlobalPackets(globalPacketsCurrentPage, globalFilter, controller.signal);
+    return () => controller.abort();
   }, [fetchGlobalPackets, globalPacketsCurrentPage, globalFilter]);
 
   useEffect(() => {
@@ -1848,16 +1825,26 @@ function App() {
   }, [activeTab, selectedNodeId]);
 
   useEffect(() => {
-    if (selectedNodeId) {
-      fetchNodeSpecificPackets(selectedNodeId, nodePacketsCurrentPage, nodeLogFilter);
-    }
+    if (!selectedNodeId) return;
+    const controller = new AbortController();
+    fetchNodeSpecificPackets(selectedNodeId, nodePacketsCurrentPage, nodeLogFilter, controller.signal);
+    return () => controller.abort();
   }, [selectedNodeId, nodePacketsCurrentPage, nodeLogFilter, fetchNodeSpecificPackets]);
 
+  // 🚀 最愛節點封包定時更新：使用 nodesRef，避免每次 WebSocket 更新都重建 interval
   useEffect(() => {
-    if (nodes.length === 0) return;
-    const favInterval = setInterval(() => fetchFavoritePackets(favPacketsCurrentPage, favLogFilter, nodes), 60000);
-    return () => clearInterval(favInterval);
-  }, [fetchFavoritePackets, favPacketsCurrentPage, favLogFilter, nodes]);
+    if (favoriteIdSet.size === 0) return;
+    const controller = new AbortController();
+    const favInterval = setInterval(() => {
+      if (nodesRef.current.length > 0) {
+        fetchFavoritePackets(favPacketsCurrentPage, favLogFilter, nodesRef.current, controller.signal);
+      }
+    }, 60000);
+    return () => {
+      controller.abort();
+      clearInterval(favInterval);
+    };
+  }, [fetchFavoritePackets, favPacketsCurrentPage, favLogFilter, favoriteIdSet]);
 
   const fetchFusionEdges = useCallback(async () => {
     try {
@@ -2037,18 +2024,7 @@ function App() {
         </div>
       </div>
 
-      {appLoading && (
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-slate-950/90 backdrop-blur-sm text-white">
-          <div className="flex flex-col items-center">
-            <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-cyan-500"></div>
-            <p className="mt-4 text-lg font-bold text-cyan-400">載入中，請稍候...</p>
-            <p className="text-sm text-slate-400">正在初始化雷達站數據</p>
-          </div>
-        </div>
-      )}
-
-      {!appLoading && (
-        <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col">
           {/* 📢 站長即時動態公告橫幅 (Top Announcement Banner) */}
           {announcementConfig?.banner?.enabled && !isBannerDismissed && announcementConfig.banner.text && (() => {
             const b = announcementConfig.banner;
@@ -2118,161 +2094,24 @@ function App() {
             )}
 
             {activeTab === 'nodes' && (
-              <div className="max-w-7xl mx-auto p-6 space-y-6 text-sm">
-                <div className="flex flex-col lg:flex-row gap-4 mb-4">
-                  <div className="relative flex-1 max-w-md">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-                    <input
-                      type="text"
-                      placeholder="快速搜尋節點 ID / 名稱..."
-                      className={`w-full pl-10 pr-4 py-2 rounded-lg shadow-sm focus:ring-2 focus:ring-cyan-500 outline-none text-sm transition-colors ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300'}`}
-                      value={nodeListSearchQuery}
-                      onChange={(e) => setNodeListSearchQuery(e.target.value)}
-                    />
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <select
-                      value={nodeFilter.role}
-                      onChange={(e) => setNodeFilter({ ...nodeFilter, role: e.target.value })}
-                      className={`px-3 py-2 rounded-lg border text-xs font-bold outline-none shadow-sm ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-300' : 'bg-white border-slate-300 text-slate-600'}`}
-                    >
-                      <option value="ALL">👤 所有角色</option>
-                      {uniqueRoles.map(r => <option key={r} value={r}>{r}</option>)}
-                    </select>
-                    <select
-                      value={nodeFilter.hardware}
-                      onChange={(e) => setNodeFilter({ ...nodeFilter, hardware: e.target.value })}
-                      className={`px-3 py-2 rounded-lg border text-xs font-bold outline-none shadow-sm ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-300' : 'bg-white border-slate-300 text-slate-600'}`}
-                    >
-                      <option value="ALL">💻 所有硬體</option>
-                      {uniqueHardware.map(h => <option key={h} value={h}>{h}</option>)}
-                    </select>
-                    <select
-                      value={nodeFilter.timePreset}
-                      onChange={(e) => setNodeFilter({ ...nodeFilter, timePreset: e.target.value })}
-                      className={`px-3 py-2 rounded-lg border text-xs font-bold outline-none shadow-sm ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-300' : 'bg-white border-slate-300 text-slate-600'}`}
-                    >
-                      <option value="ALL">⏱️ 不限時間</option>
-                      <option value="1h">1 小時內活躍</option>
-                      <option value="6h">6 小時內活躍</option>
-                      <option value="24h">24 小時內活躍</option>
-                      <option value="7d">7 天內活躍</option>
-                    </select>
-                  </div>
-                </div>
-                <div className={`rounded-xl shadow-sm border overflow-hidden ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
-                  <table className="w-full text-left border-collapse">
-                    <thead className={`${darkMode ? 'bg-slate-800/50 text-slate-400' : 'bg-slate-50 text-slate-500'} border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
-                      <tr className="text-[10px] font-black uppercase tracking-widest">
-                        <th className="px-6 py-4">最愛</th>
-                        <th className="px-6 py-4">Node ID</th>
-                        <th className="px-6 py-4">角色</th>
-                        <th className="px-6 py-4">節點名稱 (Short)</th>
-                        <th className="px-6 py-4">硬體型號</th>
-                        <th className="px-6 py-4">頻道</th>
-                        <th className="px-6 py-4">24h 密度</th>
-                        <th className="px-6 py-4 whitespace-nowrap">最後活動</th>
-                      </tr>
-                    </thead>
-                    <tbody className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                      {filteredNodes.map((node, idx) => (
-                        <tr
-                          key={node.node_id}
-                          onClick={() => { setSelectedNodeId(node.node_id); setActiveTab('details'); }}
-                          className={`cursor-pointer transition-colors group text-sm ${darkMode ? 'hover:bg-slate-800/50' : 'hover:bg-slate-50'}`}
-                        >
-                          <td className="px-6 py-4 relative" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={() => setGroupDropdownNodeId(groupDropdownNodeId === node.node_id ? null : node.node_id)}
-                              className={`p-1.5 rounded-full transition-all ${node.is_favorite ? 'text-yellow-500 hover:bg-yellow-500/20' : 'text-slate-300 hover:text-slate-500 hover:bg-slate-200'}`}
-                            >
-                              <Star fill={node.is_favorite ? "currentColor" : "none"} size={18} />
-                            </button>
-                            {groupDropdownNodeId === node.node_id && (
-                              <div className={`absolute ${idx >= filteredNodes.length - 3 ? 'bottom-full mb-1' : 'top-full mt-1'} left-4 w-32 rounded-lg shadow-xl border z-50 overflow-hidden ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
-                                <div className="max-h-48 overflow-y-auto">
-                                  {favConfig.groups.map(g => (
-                                    <div key={g.id} onClick={(e) => { e.stopPropagation(); assignNodeToGroup(node.node_id, g.id); setGroupDropdownNodeId(null); }} className={`px-3 py-2 text-xs cursor-pointer flex items-center gap-2 transition-colors ${darkMode ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-50 text-slate-700'}`}>
-                                      <span className="w-2 h-2 rounded-full" style={{ backgroundColor: getColorMeta(g.color).bg }}></span>
-                                      {g.name}
-                                    </div>
-                                  ))}
-                                  <div onClick={(e) => { e.stopPropagation(); assignNodeToGroup(node.node_id, 'ungrouped'); setGroupDropdownNodeId(null); }} className={`px-3 py-2 text-xs cursor-pointer transition-colors border-t ${darkMode ? 'hover:bg-slate-700 text-slate-300 border-slate-700' : 'hover:bg-slate-50 text-slate-700 border-slate-100'}`}>
-                                    未分組
-                                  </div>
-                                  {node.is_favorite ? (
-                                    <div onClick={(e) => { e.stopPropagation(); toggleFavorite(node.node_id); setGroupDropdownNodeId(null); }} className={`px-3 py-2 text-xs cursor-pointer transition-colors border-t text-red-500 ${darkMode ? 'hover:bg-slate-700 border-slate-700' : 'hover:bg-slate-50 border-slate-100'}`}>
-                                      ❌ 移除最愛
-                                    </div>
-                                  ) : null}
-                                </div>
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-6 py-4 font-mono font-bold text-cyan-600 text-xs">
-                            {node.node_id}
-                          </td>
-                            {(() => {
-                              const roleStr = String(node.role || '');
-                              const isRouter = roleStr.includes('ROUTER');
-                              const isBase = roleStr.includes('BASE');
-                              const isRepeater = roleStr.includes('REPEATER');
-                              const isTracker = roleStr.includes('TRACKER');
-                              return (
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                  isRouter ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' :
-                                  isBase ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' :
-                                  isRepeater ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' :
-                                  isTracker ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' :
-                                  darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'
-                                }`}>
-                                  {typeof node.role === 'string' ? node.role.replace('_', ' ') : String(node.role || 'CLIENT')}
-                                </span>
-                              );
-                            })()}
-                          <td className="px-6 py-4 text-xs">
-                            <div className="flex items-center gap-1.5">
-                              <span className={`font-black truncate max-w-[120px] ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{node.long_name || 'Unknown'}</span>
-                              <span className="text-[10px] font-bold text-cyan-500 bg-cyan-500/10 px-1 rounded">({node.short_name || 'N/A'})</span>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            <span className={`px-2 py-0.5 rounded text-[9px] font-mono border uppercase tracking-tighter ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-400' : 'bg-slate-50 border-slate-200 text-slate-500'}`}>
-                              {typeof node.hw_model === 'string' ? node.hw_model.replace(/_/g, ' ') : String(node.hw_model || 'UNKNOWN')}
-                            </span>
-                          </td>
-                          <td className="px-6 py-4 text-xs">
-                            <div className={`text-[10px] max-w-[120px] truncate font-bold ${darkMode ? 'text-cyan-400/80' : 'text-cyan-700'}`} title={node.last_topic}>
-                              {(() => {
-                                const rawChannel = node.channel || '';
-                                const isInvalid = /^\d+$/.test(rawChannel) || ['c', 'json', 'e', 'stat', ''].includes(rawChannel);
-                                const channelName = isInvalid ? (() => {
-                                  const parts = (node.last_topic || '').split('/');
-                                  return parts.find(p => !/^\d+$/.test(p) && !['msh', 'TW', 'c', 'json', 'e', 'stat', ''].includes(p) && !p.startsWith('!')) || '-';
-                                })() : rawChannel;
-                                return channelName === 'MediumFast' ? '⚡ ' + channelName : channelName;
-                              })()}
-                            </div>
-                          </td>
-                          <td className="px-6 py-4">
-                            <div className="flex flex-col">
-                              <span className={`text-[11px] font-black ${nodeActivity[node.node_id] > 50 ? 'text-orange-500' : 'text-slate-400'}`}>
-                                {nodeActivity[node.node_id] || 0} <span className="text-[9px] font-normal opacity-60">pkts</span>
-                              </span>
-                              <div className="w-12 h-1 bg-slate-200 dark:bg-slate-800 rounded-full mt-1 overflow-hidden">
-                                <div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, (nodeActivity[node.node_id] || 0) * 2)}%` }}></div>
-                              </div>
-                            </div>
-                          </td>
-                          <td className="px-6 py-4 text-xs font-medium text-slate-500 whitespace-nowrap text-right">
-                            {new Date(node.last_seen).toLocaleString()}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+              <NodeList
+                nodes={nodes}
+                nodesLoading={nodesLoading}
+                favoriteIdSet={favoriteIdSet}
+                nodeActivity={nodeActivity}
+                darkMode={darkMode}
+                searchQuery={nodeListSearchQuery}
+                onSearchQueryChange={setNodeListSearchQuery}
+                nodeFilter={nodeFilter}
+                onNodeFilterChange={setNodeFilter}
+                uniqueRoles={uniqueRoles}
+                uniqueHardware={uniqueHardware}
+                favGroups={favConfig.groups}
+                getColorMeta={getColorMeta}
+                onSelectNode={handleSelectNodeFromList}
+                onAssignGroup={assignNodeToGroup}
+                onToggleFavorite={toggleFavorite}
+              />
             )}
 
             {activeTab === 'chat' && (
@@ -2953,17 +2792,23 @@ function App() {
 
                       {/* 📱 尋找失聯節點 QR Code 產生器 */}
                       <section>
-                        <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
+                        <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入模組中...</div>}>
+                          <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
+                        </React.Suspense>
                       </section>
 
                       {/* ☀️ 太陽能發電試算 */}
                       <section>
-                        <SolarForecastCard node={selectedNode} darkMode={darkMode} />
+                        <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入太陽能預測模組中...</div>}>
+                          <SolarForecastCard node={selectedNode} darkMode={darkMode} />
+                        </React.Suspense>
                       </section>
 
                       {/* 📡 3D 地形電波覆蓋模擬 (Site Planner) */}
                       <section>
-                        <RFCoverageCard node={selectedNode} darkMode={darkMode} />
+                        <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入電波覆蓋模組中...</div>}>
+                          <RFCoverageCard node={selectedNode} darkMode={darkMode} />
+                        </React.Suspense>
                       </section>
 
                       <section>
@@ -3021,10 +2866,12 @@ function App() {
                             {packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').length === 0 && <div className="text-xs text-slate-300 italic mt-2">無資料</div>}
                           </div>
                           <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-100'}`}>
-                            <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
-                              ...ps,
-                              portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
-                            }))} />
+                            <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入圖表中...</div>}>
+                              <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
+                                ...ps,
+                                portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
+                              }))} />
+                            </React.Suspense>
                           </div>
                         </div>
                       </section>
@@ -3769,7 +3616,9 @@ function App() {
 
                     {/* 📱 尋找失聯節點 QR Code 產生器 */}
                     <section>
-                      <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
+                      <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入模組中...</div>}>
+                        <NodeRecoveryQR nodeId={selectedNode.node_id} longName={selectedNode.long_name} shortName={selectedNode.short_name} darkMode={darkMode} />
+                      </React.Suspense>
                     </section>
 
                     <section>
@@ -3825,10 +3674,12 @@ function App() {
                           </table>
                         </div>
                         <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-100'}`}>
-                          <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
-                            ...ps,
-                            portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
-                          }))} />
+                          <React.Suspense fallback={<div className="p-4 text-center text-slate-400 font-mono">載入圖表中...</div>}>
+                            <PacketTypePieChart packetStats={packetStats.filter(ps => ps.portnum !== 'ENCRYPTED').map(ps => ({
+                              ...ps,
+                              portnum: PORTNUM_NAMES[ps.portnum] || ps.portnum
+                            }))} />
+                          </React.Suspense>
                         </div>
                       </div>
                     </section>
@@ -4520,15 +4371,14 @@ function App() {
               <div className="flex items-center gap-6">
                 <div className="flex items-center gap-1.5 uppercase tracking-widest">
                   <Activity size={12} className="text-orange-500" />
-                  連續運行時間: {displayedUptime != null ? `${Math.floor(displayedUptime / 3600)}h ${Math.floor((displayedUptime % 3600) / 60)}m ${Math.floor(displayedUptime % 60)}s` : '--'}
+                  <SystemUptime initialUptime={initialUptime} />
                 </div>
                 <div className="hidden sm:block opacity-30 tracking-[0.2em]">MESHTASTIC RADAR ENGINE v3.1</div>
               </div>
             </div>
           </footer>
         </div>
-      )}
-      {!appLoading && showAnnouncement && announcementConfig?.modal?.enabled !== false && (
+      {showAnnouncement && announcementConfig?.modal?.enabled !== false && (
         <div className="fixed inset-0 z-[3000] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setShowAnnouncement(false)}></div>
           <div className={`relative w-full max-w-lg rounded-2xl shadow-2xl border p-6 flex flex-col gap-4 ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
