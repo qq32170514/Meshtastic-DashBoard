@@ -274,16 +274,33 @@ export async function runCoverageBake(options = {}) {
         stations: simulatedStationsMeta
     };
 
-    // 儲存至公共目錄供前端與 API 存取
-    const outDirs = [
+    // 儲存至公共目錄供前端與 API 存取（先寫入暫存檔再原子覆寫，避免讀到半套檔案）
+    const envOutDir = process.env.COVERAGE_OUTPUT_DIR ? [path.resolve(process.env.COVERAGE_OUTPUT_DIR)] : null;
+    const outDirs = options.outDirs || envOutDir || [
         path.join(__dirname, '../public/coverage'),
         path.join(__dirname, '../frontend/public/coverage')
     ];
 
+    const jsonPayload = JSON.stringify(metadata, null, 2);
+    const tmpSuffix = `.tmp.${process.pid}.${Date.now()}`;
+
     for (const d of outDirs) {
         if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-        fs.writeFileSync(path.join(d, 'taiwan_coverage.png'), png);
-        fs.writeFileSync(path.join(d, 'taiwan_coverage.json'), JSON.stringify(metadata, null, 2));
+        const pngTarget = path.join(d, 'taiwan_coverage.png');
+        const jsonTarget = path.join(d, 'taiwan_coverage.json');
+        const pngTmp = `${pngTarget}${tmpSuffix}`;
+        const jsonTmp = `${jsonTarget}${tmpSuffix}`;
+
+        try {
+            fs.writeFileSync(pngTmp, png);
+            fs.writeFileSync(jsonTmp, jsonPayload, 'utf8');
+            fs.renameSync(pngTmp, pngTarget);
+            fs.renameSync(jsonTmp, jsonTarget);
+        } catch (writeErr) {
+            try { if (fs.existsSync(pngTmp)) fs.unlinkSync(pngTmp); } catch (_) {}
+            try { if (fs.existsSync(jsonTmp)) fs.unlinkSync(jsonTmp); } catch (_) {}
+            throw writeErr;
+        }
     }
 
     console.log(`🎉 [全台 RF 覆蓋圖層烘焙完成] 成功模擬 ${simulatedStationsMeta.length} 站！總耗時: ${((Date.now() - startTime) / 1000).toFixed(1)}s！`);

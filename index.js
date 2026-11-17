@@ -329,64 +329,12 @@ function batchEmit(type, data) {
 
 // ==========================================
 // 🚀 有界 LRU API 快取層 (Bounded LRU Cache with Route-Specific TTL)
-// 包含最大容量 (MAX_CACHE_ENTRIES)、過期自動清理與 Query Key 規範化
+// 包含最大容量 (MAX_CACHE_ENTRIES)、過期自動清理與 Query Key 規範化 (4.0.3.1: 完整保留所有 Query Params)
 // ==========================================
-class BoundedLRUCache {
-    constructor(maxEntries = 300) {
-        this.maxEntries = maxEntries;
-        this.cache = new Map(); // key -> { data, expiredAt }
-    }
-
-    get(key) {
-        const item = this.cache.get(key);
-        if (!item) return null;
-        if (Date.now() > item.expiredAt) {
-            this.cache.delete(key);
-            return null;
-        }
-        // LRU 移至最新
-        this.cache.delete(key);
-        this.cache.set(key, item);
-        return item.data;
-    }
-
-    set(key, data, ttlMs) {
-        if (this.cache.has(key)) {
-            this.cache.delete(key);
-        } else if (this.cache.size >= this.maxEntries) {
-            const oldestKey = this.cache.keys().next().value;
-            this.cache.delete(oldestKey);
-        }
-        this.cache.set(key, { data, expiredAt: Date.now() + ttlMs });
-    }
-
-    delete(key) {
-        return this.cache.delete(key);
-    }
-
-    clearPrefix(prefix) {
-        for (const key of this.cache.keys()) {
-            if (key.startsWith(prefix)) {
-                this.cache.delete(key);
-            }
-        }
-    }
-
-    pruneExpired() {
-        const now = Date.now();
-        for (const [key, item] of this.cache.entries()) {
-            if (now > item.expiredAt) {
-                this.cache.delete(key);
-            }
-        }
-    }
-
-    get size() {
-        return this.cache.size;
-    }
-}
+const { BoundedLRUCache, normalizeCacheKey, createWithCache } = require('./src/utils/api-cache');
 
 const apiCache = new BoundedLRUCache(300);
+const withCache = createWithCache(apiCache);
 
 // 🚀 定期每 60 秒清理過期的 API 快取與重複封包快取
 setInterval(() => {
@@ -442,45 +390,6 @@ setInterval(() => {
 
     console.log(`📊 [PERF_METRICS] MEM: ${rssMb}MB (Heap: ${heapMb}MB) | MQTT: ${mqttPktPerSec} pkt/s | DB_Q: ${dbQueue.length} (committed: ${dbQueueMetrics.totalCommitted}) | Clients: ${socketClients} | LoopLag: ${lagMs}ms`);
 }, 30 * 1000);
-
-/**
- * 規範化 Cache Key：保留標準合法 query keys 並排序，防止 Cache Explosion 攻擊
- */
-function normalizeCacheKey(req) {
-    const url = new URL(req.originalUrl || req.url, 'http://localhost');
-    const allowed = ['limit', 'page', 'range', 'days', 'node_id', 'portnum', 'gateway_id', 'exclude_tunnel', 'cursor'];
-    const searchParams = new URLSearchParams();
-    for (const key of allowed) {
-        const val = url.searchParams.get(key);
-        if (val !== null && val !== '') searchParams.set(key, val);
-    }
-    const qs = searchParams.toString();
-    return qs ? `${url.pathname}?${qs}` : url.pathname;
-}
-
-/**
- * Express 中間件：自動快取 GET 回應
- * 快取命中時直接回傳，不碰 DB
- */
-function withCache(ttlMs = 10 * 1000) {
-    return (req, res, next) => {
-        const key = normalizeCacheKey(req);
-        const cachedData = apiCache.get(key);
-        if (cachedData !== null && cachedData !== undefined) {
-            res.setHeader('X-Cache', 'HIT');
-            return res.json(cachedData);
-        }
-        const origJson = res.json.bind(res);
-        res.json = (data) => {
-            if (res.statusCode >= 200 && res.statusCode < 300 && data) {
-                apiCache.set(key, data, ttlMs);
-            }
-            res.setHeader('X-Cache', 'MISS');
-            origJson(data);
-        };
-        next();
-    };
-}
 
 function invalidatePacketCache() {
     apiCache.clearPrefix('/api/packets');
@@ -1442,15 +1351,51 @@ app.get('/api/coverage/itm-info', (req, res) => {
     }
 });
 
-// 📡 API: 手動或背景排程觸發重新烘焙全台覆蓋圖
-app.post('/api/coverage/rebuild', (req, res) => {
-    const { exec } = require('child_process');
-    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
-    exec(`node "${bakeScript}" 500`, (err, stdout, stderr) => {
-        if (err) console.error('❌ 全台覆蓋烘焙失敗:', err.message);
-        else console.log('✅ 全台覆蓋烘焙排程完成！');
+const { createRequireCoverageAdmin, CoverageJobController } = require('./src/utils/coverage-controller');
+const requireCoverageAdmin = createRequireCoverageAdmin();
+const coverageJobController = new CoverageJobController({
+    bakeScriptPath: path.join(__dirname, 'rf-engine/bake.mjs'),
+    lockFilePath: path.join(__dirname, 'public/coverage/.coverage_bake.lock')
+});
+
+// 📡 API: 取得全台覆蓋烘焙任務目前狀態
+app.get('/api/coverage/status', (req, res) => {
+    res.json(coverageJobController.getStatus());
+});
+
+// 📡 API: 手動觸發重新烘焙全台覆蓋圖 (需管理員授權 + 單一執行鎖保護)
+app.post('/api/coverage/rebuild', requireCoverageAdmin, (req, res) => {
+    const requestedLimit = req.body && req.body.limit !== undefined ? req.body.limit : req.query.limit;
+    const launch = coverageJobController.startBake({
+        trigger: 'manual',
+        limit: requestedLimit
     });
-    res.json({ success: true, message: '全台電波覆蓋烘焙排程已在背景啟動' });
+
+    if (!launch.started) {
+        if (launch.reason === 'invalid_limit') {
+            return res.status(400).json({ success: false, error: launch.error });
+        }
+        return res.status(409).json({
+            success: false,
+            error: '全台電波覆蓋烘焙任務正在執行中，請勿重複觸發',
+            status: coverageJobController.getStatus()
+        });
+    }
+
+    launch.completion.then((result) => {
+        if (result.status === 'completed') {
+            console.log(`✅ 全台覆蓋烘焙排程完成 (jobId=${result.jobId}, duration=${result.durationMs}ms)`);
+            apiCache.clearPrefix('/api/coverage');
+        } else {
+            console.error(`❌ 全台覆蓋烘焙失敗 (jobId=${result.jobId}, status=${result.status}):`, result.error);
+        }
+    });
+
+    res.status(202).json({
+        success: true,
+        message: '全台電波覆蓋烘焙排程已在背景啟動',
+        job: launch.job
+    });
 });
 
 // 📢 動態公告與即時橫幅 (支援 announcement.json 存檔免重開熱更新)
@@ -2764,11 +2709,18 @@ cron.schedule('*/15 * * * *', () => {
 // ⏰ 每日凌晨 04:00 自動重新烘焙全台 3D 地形電波覆蓋圖 (Longley-Rice ITM)
 cron.schedule('0 4 * * *', () => {
     console.log('⏰ [排程觸發] 開始每日全台電波覆蓋 (ITM) 自動烘焙...');
-    const { exec } = require('child_process');
-    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
-    exec(`node "${bakeScript}" 500`, (err, stdout) => {
-        if (err) console.error('❌ 排程烘焙失敗:', err.message);
-        else console.log('✅ 每日排程烘焙成功完成！');
+    const launch = coverageJobController.startBake({ trigger: 'cron', limit: 500 });
+    if (!launch.started) {
+        console.warn(`⚠️ [排程略過] 覆蓋烘焙任務已在執行中 (${launch.reason})，略過本次排程`);
+        return;
+    }
+    launch.completion.then((result) => {
+        if (result.status === 'completed') {
+            console.log(`✅ 每日排程烘焙成功完成 (jobId=${result.jobId}, duration=${result.durationMs}ms)`);
+            apiCache.clearPrefix('/api/coverage');
+        } else {
+            console.error(`❌ 排程烘焙失敗 (jobId=${result.jobId}, status=${result.status}):`, result.error);
+        }
     });
 });
 
@@ -2877,9 +2829,9 @@ app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
 });
 
 // ==========================================
-// 📊 API 2.1: 跳數傳播深度分佈 (Hop Count Distribution & 診斷)
+// 📊 API 2.1: 跳數傳播深度分佈診斷 (Hop Analysis & 診斷)
 // ==========================================
-app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
+app.get('/api/analytics/hop-analysis', withCache(60 * 1000), (req, res) => {
     const sqlActual = `
         SELECT 
             COALESCE(hops_away, (hop_start - hop_limit)) as hop,
@@ -3757,87 +3709,38 @@ app.get('/api/analytics/county-weather-trends', withCache(300 * 1000), (req, res
     });
 });
 // ==========================================
-// 🚀 API Bundle: 一鍵打包全網宏觀戰情中心所有數據 (極速快取 10分鐘 + 背景預熱)
+// 🚀 API Bundle: 一鍵打包全網宏觀戰情中心所有數據 (4.0.3.1: 有界併發 + 部分失敗保護 + 短 TTL 降級)
 // ==========================================
+const { buildAnalyticsBundle } = require('./src/utils/analytics-bundle');
 const bundleCacheMap = {};
 
 app.get('/api/analytics/bundle', async (req, res) => {
-    const range = req.query.range || '7d';
-    const now = Date.now();
-
-    // 🚀 快取延長至 10 分鐘，結合背景 setInterval 自動更新，用戶點擊 NOC 達成 0ms 載入
-    if (bundleCacheMap[range] && (now - bundleCacheMap[range].timestamp < 10 * 60 * 1000)) {
-        return res.json(bundleCacheMap[range].data);
-    }
-
+    const rawRange = String(req.query.range || '7d');
+    const range = ['24h', '7d', '30d'].includes(rawRange) ? rawRange : '7d';
     const currentPort = server.address()?.port || PORT;
     const baseUrl = `http://127.0.0.1:${currentPort}`;
 
     try {
-        const endpoints = [
-            `/api/analytics/kpi?range=${range}`,
-            `/api/analytics/trends?range=${range}`,
-            '/api/analytics/roles',
-            `/api/analytics/traffic?range=${range}`,
-            `/api/analytics/signal-health?range=${range}`,
-            `/api/analytics/hop-distribution?range=${range}`,
-            '/api/analytics/hop-distribution',
-            `/api/analytics/hourly-activity?range=${range}`,
-            '/api/analytics/hourly-peak-stacked',
-            '/api/analytics/cu-distribution',
-            '/api/analytics/hardware-models',
-            '/api/analytics/firmware-versions',
-            `/api/analytics/environment-trends?range=${range}`,
-            '/api/analytics/cwa-comparison',
-            '/api/analytics/cwa-node-comparison',
-            '/api/analytics/air-util-distribution',
-            `/api/analytics/top-gateways?range=${range}`,
-            '/api/analytics/duplicate-stats',
-            '/api/analytics/power-health',
-            '/api/analytics/mesh-interconnectivity',
-            '/api/analytics/weak-signal-alerts',
-            '/api/analytics/solar-charging-health',
-            '/api/analytics/county-weather-trends'
-        ];
+        const result = await buildAnalyticsBundle({
+            baseUrl,
+            range,
+            concurrency: 4,
+            cacheMap: bundleCacheMap,
+            ttlMs: 10 * 60 * 1000,
+            partialTtlMs: 15 * 1000
+        });
 
-        const results = [];
-        for (const ep of endpoints) {
-            try {
-                const r = await fetch(`${baseUrl}${ep}`);
-                results.push(r.ok ? await r.json() : null);
-            } catch (e) {
-                results.push(null);
-            }
+        if (result.status !== 200) {
+            return res.status(result.status).json({
+                error: result.error,
+                failedEndpoints: result.failedEndpoints
+            });
         }
 
-        const payload = {
-            kpi: results[0],
-            trends: results[1],
-            roles: results[2],
-            traffic: results[3],
-            signalHealth: results[4],
-            hopDist: results[5],
-            hopAnalysis: results[6],
-            hourlyActivity: results[7],
-            hourlyStacked: results[8],
-            cuDist: results[9],
-            hwModels: results[10],
-            firmwareVersions: results[11],
-            envTrends: results[12],
-            cwaComparison: results[13],
-            cwaNodeComparison: results[14],
-            airUtilDist: results[15],
-            topGateways: results[16],
-            duplicateStats: results[17],
-            powerHealth: results[18],
-            meshInterconnectivity: results[19],
-            weakSignalAlerts: results[20],
-            solarChargingHealth: results[21],
-            countyWeatherTrends: results[22]
-        };
-
-        bundleCacheMap[range] = { data: payload, timestamp: now };
-        res.json(payload);
+        if (result.partialFailure) {
+            res.setHeader('X-Bundle-Partial', '1');
+        }
+        return res.json(result.data);
     } catch (err) {
         if (bundleCacheMap[range]) return res.json(bundleCacheMap[range].data);
         res.status(500).json({ error: err.message });

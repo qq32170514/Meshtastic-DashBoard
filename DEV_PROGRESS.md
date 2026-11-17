@@ -4,6 +4,17 @@
 
 ---
 
+## 📌 4.0.3.1 後端可靠性與 API 正確性更新摘要
+- **API Cache Key 完整規範化 (`src/utils/api-cache.js`)**：`normalizeCacheKey` 改為保留所有 Query Parameters（含 `sender`、`node_ids`、`timeStart`、`timeEnd`、`minSnr`、`minRssi` 與多值參數排序），消除不同篩選條件共用快取的污染問題。
+- **Coverage Rebuild 授權與單一執行控制 (`src/utils/coverage-controller.js`, `rf-engine/bake.mjs`)**：
+  - `POST /api/coverage/rebuild` 強制驗證 `COVERAGE_ADMIN_TOKEN`（預設拒絕 `503`），並新增 `GET /api/coverage/status`。
+  - 手動觸發與每日 `04:00` 排程共用 `CoverageJobController`（`spawn` 無 Shell 注入、單一執行鎖、超時終止、`.tmp` 原子覆寫）。
+- **Hop 路由分離**：保留 `GET /api/analytics/hop-distribution`，將跳數診斷拆分為 `GET /api/analytics/hop-analysis`，同步修正 `/api/analytics/bundle` 與 `NetworkAnalytics.tsx`。
+- **Analytics Bundle 與前端快取 (`src/utils/analytics-bundle.js`, `frontend/src/apiCache.ts`)**：Bundle 改用有界併發 (`concurrency=4`) 與部分失敗短 TTL 保護；前端 `fetchJsonCached` 具 LRU 上限 (`100`)、過期清理與參考計數 `AbortController`。
+- 詳見 [BACKEND_RELIABILITY_REPORT.md](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/BACKEND_RELIABILITY_REPORT.md)。
+
+---
+
 ## 📌 當前開發環境與規則
 
 1. **環境嚴格隔離**：

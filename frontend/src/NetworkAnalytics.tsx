@@ -423,7 +423,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fetch(`/api/analytics/traffic?range=${range}`),
         fetch(`/api/analytics/signal-health?range=${range}`),
         fetch(`/api/analytics/hop-distribution?range=${range}`),
-        fetch('/api/analytics/hop-distribution'),
+        fetch('/api/analytics/hop-analysis'),
         fetch(`/api/analytics/hourly-activity?range=${range}`),
         fetch('/api/analytics/hourly-peak-stacked'),
         fetch('/api/analytics/cu-distribution'),
