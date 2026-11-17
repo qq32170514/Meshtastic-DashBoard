@@ -4381,12 +4381,16 @@ function handleShutdown(signal) {
     }
 }
 
-process.on('SIGINT', () => handleShutdown('SIGINT'));
-process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-process.on('message', async (msg) => {
-    if (msg === 'shutdown') {
-        handleShutdown('PM2_SHUTDOWN');
-    } else if (msg && msg.type === 'TEST_FLUSH_DB_QUEUE') {
+// ==========================================
+// 🧪 測試專用 IPC Hooks 開關 (4.0.2 最終驗收前修正 P2)
+// 預設關閉；僅當環境變數 MESHTASTIC_ENABLE_TEST_HOOKS === '1' 時，才允許處理 TEST_* IPC 控制訊息。
+// 此開關絕不可寫入一般 .env 或 Production 設定；僅供整合測試子程序於 spawn 時明確注入。
+// ==========================================
+const TEST_HOOKS_ENABLED = process.env.MESHTASTIC_ENABLE_TEST_HOOKS === '1';
+const TEST_HOOK_MESSAGE_TYPES = new Set(['TEST_FLUSH_DB_QUEUE', 'TEST_INJECT_MQTT_PACKET']);
+
+async function handleTestHookMessage(msg) {
+    if (msg.type === 'TEST_FLUSH_DB_QUEUE') {
         try {
             await flushDbQueue();
             if (typeof process.send === 'function') {
@@ -4397,7 +4401,7 @@ process.on('message', async (msg) => {
                 process.send({ type: 'TEST_DB_QUEUE_FLUSHED', requestId: msg.requestId || null, ok: false, error: err.message });
             }
         }
-    } else if (msg && msg.type === 'TEST_INJECT_MQTT_PACKET' && mqttClient) {
+    } else if (msg.type === 'TEST_INJECT_MQTT_PACKET' && mqttClient) {
         try {
             mqttClient.emit('message', msg.topic, Buffer.from(msg.payloadHex, 'hex'));
             if (db && typeof db.flushDbQueue === 'function') {
@@ -4411,6 +4415,23 @@ process.on('message', async (msg) => {
                 process.send({ type: 'TEST_MQTT_PACKET_FLUSHED', requestId: msg.requestId || null, ok: false, error: err.message });
             }
         }
+    }
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('message', async (msg) => {
+    if (msg === 'shutdown') {
+        handleShutdown('PM2_SHUTDOWN');
+        return;
+    }
+    if (msg && typeof msg === 'object' && TEST_HOOK_MESSAGE_TYPES.has(msg.type)) {
+        if (!TEST_HOOKS_ENABLED) {
+            // 安全拒絕：未啟用測試模式時一律忽略測試控制訊息，不執行、不回覆
+            console.warn(`🚫 [TEST_HOOKS_DISABLED] 已忽略測試控制訊息 ${msg.type} (未設定 MESHTASTIC_ENABLE_TEST_HOOKS=1)`);
+            return;
+        }
+        await handleTestHookMessage(msg);
     }
 });
 

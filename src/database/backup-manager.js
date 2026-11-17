@@ -2072,22 +2072,53 @@ class BackupManager {
 const APP_BACKUP_CRON_EXPRESSION = '0 0 * * 0';
 
 /**
- * 建立 index.js 與測試共用的自動備份排程政策 (4.0.2 共用政策函式，避免主程式與測試重複維護不同邏輯):
- * - 必須已設定 `envSource.BACKUP_PATH`
- * - 必須通過 `dbTarget.isBootstrapReady()`
- * - 保留既有實際 Cron 表達式 `'0 0 * * 0'`
- * - 每次排程觸發皆動態讀取當下 `BACKUP_PATH` 與 `dbTarget.isBootstrapReady()` 狀態
+ * 建立 index.js 與測試共用的自動備份排程政策 (4.0.2 共用政策函式，避免主程式與測試重複維護不同邏輯)。
+ *
+ * 嚴格 Fail-Closed：只有同時滿足以下全部條件時 `shouldRun()` 才回傳 true，其餘一律拒絕：
+ * 1. `envSource.BACKUP_PATH` 已設定 (非空)
+ * 2. `dbTarget` 存在
+ * 3. `dbTarget.isBootstrapReady` 為 function (缺少時視為「無法確認 Schema Ready」而拒絕，絕不預設放行)
+ * 4. `dbTarget.isBootstrapReady()` 執行未拋出例外，且回傳值嚴格等於 `true`
+ *
+ * - `isBootstrapReady()` 拋出例外時安全拒絕，並以 `[BACKUP_SCHEDULE_POLICY_ERROR]` 留下診斷紀錄。
+ * - 每次排程觸發皆即時讀取當下 `BACKUP_PATH` 與 `isBootstrapReady()` 狀態，不快取任何舊狀態。
+ * - 保留既有實際 Cron 表達式 `'0 0 * * 0'`。
+ *
+ * @param {object|null} dbTarget
+ * @param {object} envSource 預設 process.env
+ * @param {{ logger?: { error?: Function } }} [options]
  */
-function createAppBackupSchedulePolicy(dbTarget, envSource = process.env) {
+function createAppBackupSchedulePolicy(dbTarget, envSource = process.env, options = {}) {
+    const logger = (options && options.logger) || console;
+
+    const reportPolicyError = (message) => {
+        try {
+            if (logger && typeof logger.error === 'function') {
+                logger.error(message);
+            }
+        } catch (_) {
+            // 診斷輸出失敗不得影響 fail-closed 判斷
+        }
+    };
+
     return {
         cronExpression: APP_BACKUP_CRON_EXPRESSION,
         shouldRun: () => {
             const googleDrivePath = envSource ? envSource.BACKUP_PATH : undefined;
             if (!googleDrivePath) return false;
-            if (dbTarget && typeof dbTarget.isBootstrapReady === 'function' && !dbTarget.isBootstrapReady()) {
+
+            if (!dbTarget || typeof dbTarget.isBootstrapReady !== 'function') {
                 return false;
             }
-            return true;
+
+            try {
+                return dbTarget.isBootstrapReady() === true;
+            } catch (err) {
+                reportPolicyError(
+                    `❌ [BACKUP_SCHEDULE_POLICY_ERROR] isBootstrapReady() 執行失敗，依 Fail-Closed 原則拒絕本次自動備份: ${err && err.message ? err.message : err}`
+                );
+                return false;
+            }
         },
         fileNameProvider: () => {
             const dateStr = new Date().toISOString().slice(0, 10);

@@ -2343,7 +2343,8 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
                     MQTT_PIPE_PATH: mockBroker.pipePath,
                     MQTT_USER: 'test_user',
                     MQTT_PASSWORD: 'test_password',
-                    MQTT_TOPICS: 'msh/TW/#'
+                    MQTT_TOPICS: 'msh/TW/#',
+                    MESHTASTIC_ENABLE_TEST_HOOKS: '1'
                 },
                 stdio: ['ignore', 'pipe', 'pipe', 'ipc']
             });
@@ -2801,5 +2802,534 @@ describe('Meshtastic-DashBoard 4.0.2 — Packet Transaction Boundary, Error Clas
             }
             await mockBroker.close();
         }
+    });
+
+    // =========================================================================
+    // 25 ~ 30. Backup Scheduler Policy 嚴格 Fail-Closed 測試 (最終驗收前修正 P2，Tests A ~ F)
+    // 全部直接呼叫與 index.js 共用的 createAppBackupSchedulePolicy / registerAppBackupSchedule
+    // =========================================================================
+    it('Test 4.0.2-25 — Backup Policy Fail-Closed Test A (No dbTarget): 沒有 dbTarget 時即使已設定 BACKUP_PATH 也必須拒絕', () => {
+        const env = { BACKUP_PATH: '/tmp/some_backup_dir' };
+        assert.equal(createAppBackupSchedulePolicy(null, env).shouldRun(), false, 'dbTarget = null 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy(undefined, env).shouldRun(), false, 'dbTarget = undefined 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy(undefined).shouldRun(), false, '缺少 dbTarget 與 envSource 參數時必須拒絕');
+    });
+
+    it('Test 4.0.2-26 — Backup Policy Fail-Closed Test B (Missing / Non-Function isBootstrapReady): 缺少 isBootstrapReady() 或其非 function 時必須拒絕，且排程 tick 不呼叫 performBackup', async () => {
+        const env = { BACKUP_PATH: '/tmp/some_backup_dir' };
+        assert.equal(createAppBackupSchedulePolicy({}, env).shouldRun(), false, '空物件 dbTarget (無 isBootstrapReady) 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy({ isBootstrapReady: true }, env).shouldRun(), false, 'isBootstrapReady 為布林值而非 function 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy({ isBootstrapReady: 'yes' }, env).shouldRun(), false, 'isBootstrapReady 為字串而非 function 必須拒絕');
+
+        // 端對端：真實 BackupManager + 缺少 isBootstrapReady 的 dbTarget，透過共用 registerAppBackupSchedule 註冊後觸發排程 tick
+        const dbPath = createTempPath('policy_failclosed_b');
+        const backupDir = createTempPath('policy_failclosed_b_backups', '');
+        fs.mkdirSync(backupDir, { recursive: true });
+        const db = await createDatabaseSubsystem({ dbPath, backupDir, bootstrapSchema: true });
+        try {
+            let performBackupCallCount = 0;
+            const origPerformBackup = db.backupManager.performBackup.bind(db.backupManager);
+            db.backupManager.performBackup = async (...args) => {
+                performBackupCallCount++;
+                return origPerformBackup(...args);
+            };
+
+            let scheduledTickFn = null;
+            const fakeCron = {
+                validate: () => true,
+                schedule: (expr, tickCallback) => {
+                    scheduledTickFn = tickCallback;
+                    return { stop: () => {} };
+                }
+            };
+
+            const dbTargetWithoutReadyFn = { backupManager: db.backupManager };
+            const registration = registerAppBackupSchedule(dbTargetWithoutReadyFn, fakeCron, { BACKUP_PATH: backupDir });
+            assert.ok(registration);
+            assert.equal(registration.cronExpression, '0 0 * * 0');
+            assert.equal(registration.policy.shouldRun(), false);
+
+            const tickResult = await scheduledTickFn();
+            assert.equal(tickResult.skipped, true, '缺少 isBootstrapReady 時排程 tick 必須略過');
+            assert.equal(performBackupCallCount, 0, '缺少 isBootstrapReady 時不得呼叫 performBackup()');
+            assert.equal(fs.readdirSync(backupDir).length, 0, '缺少 isBootstrapReady 時不得產生備份檔案');
+        } finally {
+            db.backupManager.stopSchedule();
+            await db.close();
+            cleanupDbFiles(dbPath);
+            cleanupDirRecursive(backupDir);
+        }
+    });
+
+    it('Test 4.0.2-27 — Backup Policy Fail-Closed Test C (isBootstrapReady() Returns False / Non-True): isBootstrapReady() 回傳 false 或任何非 true 值時必須拒絕', () => {
+        const env = { BACKUP_PATH: '/tmp/some_backup_dir' };
+        for (const notReadyValue of [false, undefined, null, 0, 1, 'true', {}]) {
+            const dbTarget = { isBootstrapReady: () => notReadyValue };
+            assert.equal(
+                createAppBackupSchedulePolicy(dbTarget, env).shouldRun(),
+                false,
+                `isBootstrapReady() 回傳 ${String(notReadyValue)} (非嚴格 true) 時必須拒絕`
+            );
+        }
+    });
+
+    it('Test 4.0.2-28 — Backup Policy Fail-Closed Test D (Ready + BACKUP_PATH Allows Run, Missing BACKUP_PATH Still Rejects): isBootstrapReady() === true 且有 BACKUP_PATH 才允許執行，並維持 Cron 與目的地政策', () => {
+        const readyDb = { isBootstrapReady: () => true };
+
+        const allowedPolicy = createAppBackupSchedulePolicy(readyDb, { BACKUP_PATH: '/tmp/backup_dest' });
+        assert.equal(allowedPolicy.shouldRun(), true, 'BACKUP_PATH 有效且 isBootstrapReady() === true 時必須允許');
+        assert.equal(allowedPolicy.cronExpression, '0 0 * * 0', 'Cron 表達式必須維持 0 0 * * 0');
+        assert.equal(APP_BACKUP_CRON_EXPRESSION, '0 0 * * 0');
+        assert.deepEqual(allowedPolicy.optionsProvider(), { backupDir: '/tmp/backup_dest' }, '備份目的地政策必須維持使用 BACKUP_PATH');
+        assert.match(allowedPolicy.fileNameProvider(), /^meshtastic_backup_\d{4}-\d{2}-\d{2}\.db$/);
+
+        assert.equal(createAppBackupSchedulePolicy(readyDb, {}).shouldRun(), false, '未設定 BACKUP_PATH 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy(readyDb, { BACKUP_PATH: '' }).shouldRun(), false, '空字串 BACKUP_PATH 必須拒絕');
+        assert.equal(createAppBackupSchedulePolicy(readyDb, null).shouldRun(), false, '缺少 envSource 必須拒絕');
+    });
+
+    it('Test 4.0.2-29 — Backup Policy Fail-Closed Test E (isBootstrapReady() Throws): isBootstrapReady() 拋出例外時安全拒絕並留下診斷紀錄，且不向排程呼叫端拋出', () => {
+        const diagnostics = [];
+        const throwingDb = {
+            isBootstrapReady: () => {
+                throw new Error('SIMULATED_IS_BOOTSTRAP_READY_FAILURE');
+            }
+        };
+        const policy = createAppBackupSchedulePolicy(
+            throwingDb,
+            { BACKUP_PATH: '/tmp/backup_dest' },
+            { logger: { error: (msg) => diagnostics.push(msg) } }
+        );
+
+        let result;
+        assert.doesNotThrow(() => {
+            result = policy.shouldRun();
+        }, 'shouldRun() 不得將 isBootstrapReady() 例外向外拋出');
+        assert.equal(result, false, '拋出例外時必須安全拒絕');
+        assert.equal(diagnostics.length, 1, '必須留下 1 筆診斷紀錄');
+        assert.match(diagnostics[0], /BACKUP_SCHEDULE_POLICY_ERROR/);
+        assert.match(diagnostics[0], /SIMULATED_IS_BOOTSTRAP_READY_FAILURE/);
+
+        // logger 本身損壞時仍須 fail-closed
+        const brokenLoggerPolicy = createAppBackupSchedulePolicy(
+            throwingDb,
+            { BACKUP_PATH: '/tmp/backup_dest' },
+            { logger: { error: () => { throw new Error('LOGGER_BROKEN'); } } }
+        );
+        assert.equal(brokenLoggerPolicy.shouldRun(), false, 'logger 失敗時仍須拒絕');
+
+        // 未設定 BACKUP_PATH 時不應呼叫 isBootstrapReady()，因此無診斷
+        const noPathDiagnostics = [];
+        const noPathPolicy = createAppBackupSchedulePolicy(
+            throwingDb,
+            {},
+            { logger: { error: (msg) => noPathDiagnostics.push(msg) } }
+        );
+        assert.equal(noPathPolicy.shouldRun(), false);
+        assert.equal(noPathDiagnostics.length, 0);
+    });
+
+    it('Test 4.0.2-30 — Backup Policy Fail-Closed Test F (Live State On Every Trigger): 每次排程觸發都重新判斷 BACKUP_PATH 與 Bootstrap 狀態，不使用過期快取', () => {
+        let readyState = false;
+        let readyCallCount = 0;
+        const dbTarget = {
+            isBootstrapReady: () => {
+                readyCallCount++;
+                return readyState;
+            },
+            backupManager: {
+                startSchedule(cronExpr, cronLib, taskOptions) {
+                    this.captured = { cronExpr, cronLib, taskOptions };
+                    return { stop: () => {} };
+                }
+            }
+        };
+        const env = {};
+
+        const registration = registerAppBackupSchedule(dbTarget, { schedule: () => ({ stop: () => {} }) }, env);
+        assert.ok(registration);
+        assert.equal(dbTarget.backupManager.captured.cronExpr, '0 0 * * 0', '實際傳入 startSchedule 的 Cron 必須為 0 0 * * 0');
+        const shouldRun = dbTarget.backupManager.captured.taskOptions.shouldRun;
+
+        // 註冊當下 (初始化時) 的狀態：未 Ready、無 BACKUP_PATH
+        assert.equal(shouldRun(), false);
+
+        // BACKUP_PATH 設定後但 Bootstrap 仍未 Ready
+        env.BACKUP_PATH = '/tmp/live_state_dest';
+        assert.equal(shouldRun(), false);
+
+        // Bootstrap 變為 Ready -> 立即允許
+        readyState = true;
+        assert.equal(shouldRun(), true, '狀態變為 Ready 後必須立即允許');
+        assert.equal(shouldRun(), true);
+
+        // Bootstrap 又變為不 Ready -> 立即拒絕 (不得沿用上一次 true)
+        readyState = false;
+        assert.equal(shouldRun(), false, '狀態變回未 Ready 後必須立即拒絕，不得使用快取');
+
+        // 再次 Ready 但 BACKUP_PATH 被移除 -> 拒絕
+        readyState = true;
+        delete env.BACKUP_PATH;
+        assert.equal(shouldRun(), false, 'BACKUP_PATH 被移除後必須立即拒絕');
+
+        // 還原 BACKUP_PATH -> 允許
+        env.BACKUP_PATH = '/tmp/live_state_dest';
+        assert.equal(shouldRun(), true);
+
+        // 每次已設定 BACKUP_PATH 的判斷都實際呼叫 isBootstrapReady()，證明沒有快取
+        assert.equal(readyCallCount, 5, 'isBootstrapReady() 應於每次已設定 BACKUP_PATH 的判斷時各呼叫 1 次 (共 5 次；未設定 BACKUP_PATH 的 2 次判斷在更早階段即拒絕)');
+    });
+
+    // =========================================================================
+    // 31 ~ 35. 測試用 IPC Hooks 隔離測試 (最終驗收前修正 P2，Tests A ~ E)
+    // 以真實 index.js 子程序驗證 MESHTASTIC_ENABLE_TEST_HOOKS 開關
+    // =========================================================================
+    async function loadMeshProtoTypesForHooks() {
+        const protoRoot = new protobuf.Root();
+        protoRoot.resolvePath = (origin, target) => path.resolve(__dirname, '..', '..', 'protobufs', target);
+        await protoRoot.load([
+            'meshtastic/mqtt.proto',
+            'meshtastic/telemetry.proto',
+            'meshtastic/portnums.proto',
+            'meshtastic/mesh.proto',
+            'meshtastic/channel.proto',
+            'meshtastic/config.proto'
+        ], { keepCase: true });
+        return {
+            ServiceEnvelope: protoRoot.lookupType('meshtastic.ServiceEnvelope'),
+            User: protoRoot.lookupType('meshtastic.User')
+        };
+    }
+
+    function buildNodeInfoEnvelopeBytes(protoTypes, { nodeNum, longName, shortName, gatewayId, packetId }) {
+        const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+        const userPayload = protoTypes.User.encode(protoTypes.User.create({
+            id: nodeId,
+            long_name: longName,
+            short_name: shortName,
+            hw_model: 4,
+            role: 0
+        })).finish();
+        const envelopeBytes = protoTypes.ServiceEnvelope.encode(protoTypes.ServiceEnvelope.create({
+            channel_id: 'MediumFast',
+            gateway_id: gatewayId,
+            packet: {
+                from: nodeNum,
+                to: 0xffffffff,
+                id: packetId,
+                rx_snr: 8.5,
+                rx_rssi: -70,
+                hop_limit: 3,
+                hop_start: 3,
+                decoded: { portnum: 4, payload: userPayload }
+            }
+        })).finish();
+        return { nodeId, envelopeBuffer: Buffer.from(envelopeBytes) };
+    }
+
+    /**
+     * 啟動隔離的真實 index.js 子程序 (臨時 DB + 本機 Mock Broker)。
+     * 只有 enableTestHooks === true 時才會在該子程序環境明確設定 MESHTASTIC_ENABLE_TEST_HOOKS=1；
+     * 其餘情況一律從繼承環境中移除該變數，確保預設未啟用。
+     */
+    async function startIndexChildForHooks({ enableTestHooks = false } = {}) {
+        const dbPath = createTempPath('idx_hooks');
+        const eventLogPath = createTempPath('idx_hooks_events', '.json');
+        const mockBroker = await startLocalMockMqttBroker({ usePipe: true });
+        const httpPort = await getFreeTcpPort();
+        const appEntryPath = path.resolve(__dirname, '..', '..', 'index.js');
+
+        const env = {
+            ...process.env,
+            PORT: String(httpPort),
+            DB_PATH: dbPath,
+            EVENT_LOG_PATH: eventLogPath,
+            BACKUP_PATH: '',
+            TURSO_URL: '',
+            DISABLE_RF_TUNNEL: 'true',
+            CWA_API_KEY: '',
+            MQTT_BROKER: mockBroker.url,
+            MQTT_PIPE_PATH: mockBroker.pipePath,
+            MQTT_USER: 'test_user',
+            MQTT_PASSWORD: 'test_password',
+            MQTT_TOPICS: 'msh/TW/#'
+        };
+        delete env.MESHTASTIC_ENABLE_TEST_HOOKS;
+        if (enableTestHooks) {
+            env.MESHTASTIC_ENABLE_TEST_HOOKS = '1';
+        }
+
+        const state = { output: '', ipcMessages: [], exited: false, exitCode: null };
+        const child = spawn(process.execPath, [appEntryPath], {
+            cwd: path.resolve(__dirname, '..', '..'),
+            env,
+            stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+        });
+        child.stdout.on('data', (d) => { state.output += d.toString('utf8'); });
+        child.stderr.on('data', (d) => { state.output += d.toString('utf8'); });
+        child.on('message', (m) => state.ipcMessages.push(m));
+        child.on('exit', (code) => {
+            state.exited = true;
+            state.exitCode = code;
+        });
+
+        const pollUntil = (predicate, description, timeoutMs = 6000) => new Promise((resolve, reject) => {
+            const startedAt = Date.now();
+            const timer = setInterval(() => {
+                const hit = predicate();
+                if (hit) {
+                    clearInterval(timer);
+                    resolve(hit);
+                } else if (Date.now() - startedAt > timeoutMs) {
+                    clearInterval(timer);
+                    reject(new Error(`Timeout waiting for ${description}. output:\n${state.output}`));
+                } else if (state.exited) {
+                    clearInterval(timer);
+                    reject(new Error(`index.js child exited (code=${state.exitCode}) while waiting for ${description}. output:\n${state.output}`));
+                }
+            }, 20);
+        });
+
+        const handle = {
+            dbPath,
+            mockBroker,
+            state,
+            send: (msg) => child.send(msg),
+            waitForOutput: (regex, timeoutMs) => pollUntil(() => regex.test(state.output), `output ${regex}`, timeoutMs),
+            waitForIpc: (type, timeoutMs) => pollUntil(
+                () => state.ipcMessages.find((m) => m && m.type === type),
+                `IPC message ${type}`,
+                timeoutMs
+            ),
+            async shutdownAndCleanup() {
+                try {
+                    if (!state.exited) {
+                        child.send('shutdown');
+                        await pollUntil(() => state.exited, 'child exit after shutdown', 6000).catch(() => {
+                            try { child.kill('SIGKILL'); } catch (_) {}
+                        });
+                    }
+                } finally {
+                    await mockBroker.close();
+                }
+            },
+            cleanup() {
+                cleanupDbFiles(dbPath);
+                cleanupDbFiles(eventLogPath);
+            }
+        };
+
+        try {
+            await Promise.all([
+                handle.waitForOutput(/API 伺服器已啟動/, 8000),
+                handle.waitForOutput(/訂閱成功/, 8000),
+                mockBroker.waitForSubscription()
+            ]);
+        } catch (err) {
+            await handle.shutdownAndCleanup();
+            handle.cleanup();
+            throw err;
+        }
+        return handle;
+    }
+
+    it('Test 4.0.2-31 — IPC Test Hooks Test A (Disabled By Default): 未設定 MESHTASTIC_ENABLE_TEST_HOOKS 時 TEST_FLUSH_DB_QUEUE 不會執行', async () => {
+        assert.notEqual(process.env.MESHTASTIC_ENABLE_TEST_HOOKS, '1', '主測試程序本身不得啟用測試 Hooks');
+
+        const app = await startIndexChildForHooks({ enableTestHooks: false });
+        try {
+            app.send({ type: 'TEST_FLUSH_DB_QUEUE', requestId: 'hooks_off_flush' });
+            await app.waitForOutput(/\[TEST_HOOKS_DISABLED\] 已忽略測試控制訊息 TEST_FLUSH_DB_QUEUE/, 4000);
+            await new Promise((r) => setTimeout(r, 400));
+
+            assert.equal(
+                app.state.ipcMessages.filter((m) => m && m.type === 'TEST_DB_QUEUE_FLUSHED').length,
+                0,
+                '預設未啟用時不得執行 TEST_FLUSH_DB_QUEUE 或回覆 TEST_DB_QUEUE_FLUSHED'
+            );
+        } finally {
+            await app.shutdownAndCleanup();
+            app.cleanup();
+        }
+    });
+
+    it('Test 4.0.2-32 — IPC Test Hooks Test B (Explicitly Enabled): 明確設定 MESHTASTIC_ENABLE_TEST_HOOKS=1 時 TEST_FLUSH_DB_QUEUE 可正常執行', async () => {
+        const app = await startIndexChildForHooks({ enableTestHooks: true });
+        try {
+            app.send({ type: 'TEST_FLUSH_DB_QUEUE', requestId: 'hooks_on_flush' });
+            const reply = await app.waitForIpc('TEST_DB_QUEUE_FLUSHED', 4000);
+            assert.equal(reply.ok, true);
+            assert.equal(reply.requestId, 'hooks_on_flush');
+            assert.ok(!/\[TEST_HOOKS_DISABLED\]/.test(app.state.output), '啟用時不得輸出 TEST_HOOKS_DISABLED 拒絕訊息');
+        } finally {
+            await app.shutdownAndCleanup();
+            app.cleanup();
+        }
+    });
+
+    it('Test 4.0.2-33 — IPC Test Hooks Test C (TEST_INJECT_MQTT_PACKET Gated): 未啟用時 TEST_INJECT_MQTT_PACKET 不執行 (0 筆寫入)，啟用時維持既有注入用途', async () => {
+        const protoTypes = await loadMeshProtoTypesForHooks();
+        const topic = 'msh/TW/2/e/MediumFast/!gw_inject';
+
+        // --- 未啟用：注入訊息必須被拒絕，DB 不得出現該節點 ---
+        const disabledPacket = buildNodeInfoEnvelopeBytes(protoTypes, {
+            nodeNum: 0xa1b2c301, longName: 'InjectedWhileDisabled', shortName: 'OFF1', gatewayId: '!gw_inject', packetId: 910001
+        });
+        const offApp = await startIndexChildForHooks({ enableTestHooks: false });
+        let offDbPath;
+        try {
+            offDbPath = offApp.dbPath;
+            offApp.send({
+                type: 'TEST_INJECT_MQTT_PACKET',
+                requestId: 'inject_off',
+                topic,
+                payloadHex: disabledPacket.envelopeBuffer.toString('hex')
+            });
+            await offApp.waitForOutput(/\[TEST_HOOKS_DISABLED\] 已忽略測試控制訊息 TEST_INJECT_MQTT_PACKET/, 4000);
+            await new Promise((r) => setTimeout(r, 400));
+            assert.equal(
+                offApp.state.ipcMessages.filter((m) => m && m.type === 'TEST_MQTT_PACKET_FLUSHED').length,
+                0,
+                '未啟用時不得回覆 TEST_MQTT_PACKET_FLUSHED'
+            );
+            assert.ok(!/更新: OFF1/.test(offApp.state.output), '未啟用時注入封包不得被處理');
+        } finally {
+            await offApp.shutdownAndCleanup(); // 優雅關閉會排空 WriteQueue，若封包曾被處理必然已落盤
+        }
+        try {
+            const verifyOff = await createDatabaseSubsystem({ dbPath: offDbPath, bootstrapSchema: false });
+            try {
+                const ghost = await verifyOff.get('SELECT * FROM nodes WHERE node_id = ?', [disabledPacket.nodeId]);
+                assert.ok(!ghost, '未啟用測試 Hooks 時，TEST_INJECT_MQTT_PACKET 絕不可寫入任何節點資料');
+            } finally {
+                await verifyOff.close();
+            }
+        } finally {
+            offApp.cleanup();
+        }
+
+        // --- 啟用：既有注入用途維持正常 ---
+        const enabledPacket = buildNodeInfoEnvelopeBytes(protoTypes, {
+            nodeNum: 0xa1b2c302, longName: 'InjectedWhileEnabled', shortName: 'ON01', gatewayId: '!gw_inject', packetId: 910002
+        });
+        const onApp = await startIndexChildForHooks({ enableTestHooks: true });
+        try {
+            onApp.send({
+                type: 'TEST_INJECT_MQTT_PACKET',
+                requestId: 'inject_on',
+                topic,
+                payloadHex: enabledPacket.envelopeBuffer.toString('hex')
+            });
+            const reply = await onApp.waitForIpc('TEST_MQTT_PACKET_FLUSHED', 5000);
+            assert.equal(reply.ok, true);
+            assert.equal(reply.requestId, 'inject_on');
+        } finally {
+            await onApp.shutdownAndCleanup();
+        }
+        try {
+            const verifyOn = await createDatabaseSubsystem({ dbPath: onApp.dbPath, bootstrapSchema: false });
+            try {
+                const node = await verifyOn.get('SELECT * FROM nodes WHERE node_id = ?', [enabledPacket.nodeId]);
+                assert.ok(node, '啟用測試 Hooks 時，注入封包必須完整寫入 nodes 表');
+                assert.equal(node.long_name, 'InjectedWhileEnabled');
+                const logs = await verifyOn.all('SELECT * FROM packet_logs WHERE node_id = ?', [enabledPacket.nodeId]);
+                assert.equal(logs.length, 1);
+            } finally {
+                await verifyOn.close();
+            }
+        } finally {
+            onApp.cleanup();
+        }
+    });
+
+    it('Test 4.0.2-34 — IPC Test Hooks Test D (Normal MQTT Flow Regression): 測試 Hooks 未啟用時，真實 Broker 傳入的 PUBLISH 封包仍正常寫入，正常 message handler 不依賴 Hook 開關', async () => {
+        const protoTypes = await loadMeshProtoTypesForHooks();
+        const packet = buildNodeInfoEnvelopeBytes(protoTypes, {
+            nodeNum: 0xb2c3d401, longName: 'NormalFlowBrokerNode', shortName: 'NRM1', gatewayId: '!gw_normal', packetId: 920001
+        });
+
+        const app = await startIndexChildForHooks({ enableTestHooks: false });
+        try {
+            app.mockBroker.publish('msh/TW/2/e/MediumFast/!gw_normal', packet.envelopeBuffer);
+
+            // 不使用任何 TEST_* IPC 控制訊息，依賴 WriteQueue 自然 Flush 與正常 message handler
+            await app.waitForOutput(/更新: NRM1 角色:/, 8000);
+
+            assert.ok(!/\[TEST_HOOKS_DISABLED\]/.test(app.state.output), '正常 MQTT 流程不得觸發任何測試 Hook 拒絕訊息');
+            assert.equal(
+                app.state.ipcMessages.filter((m) => m && typeof m.type === 'string' && m.type.startsWith('TEST_')).length,
+                0,
+                '正常 MQTT 流程不得產生任何 TEST_* IPC 回覆'
+            );
+        } finally {
+            await app.shutdownAndCleanup();
+        }
+        try {
+            const verifyDb = await createDatabaseSubsystem({ dbPath: app.dbPath, bootstrapSchema: false });
+            try {
+                const node = await verifyDb.get('SELECT * FROM nodes WHERE node_id = ?', [packet.nodeId]);
+                assert.ok(node, '正常 Broker PUBLISH 封包必須寫入 nodes 表');
+                assert.equal(node.long_name, 'NormalFlowBrokerNode');
+                assert.equal(node.short_name, 'NRM1');
+                const logs = await verifyDb.all('SELECT * FROM packet_logs WHERE node_id = ?', [packet.nodeId]);
+                assert.equal(logs.length, 1);
+                assert.equal(logs[0].gateway_id, '!gw_normal');
+            } finally {
+                await verifyDb.close();
+            }
+        } finally {
+            app.cleanup();
+        }
+    });
+
+    it('Test 4.0.2-35 — IPC Test Hooks Test E (Environment Isolation): 只有明確設定環境變數的子程序啟用 Hooks，主測試程序、一般設定檔與其他子程序不會繼承測試模式', async () => {
+        // 1. 主測試程序不得持有測試模式
+        assert.notEqual(process.env.MESHTASTIC_ENABLE_TEST_HOOKS, '1', '主測試程序不得啟用測試模式');
+
+        // 2. 一般 .env / .env.example / PM2 設定檔不得包含測試模式開關
+        const repoRoot = path.resolve(__dirname, '..', '..');
+        for (const configName of ['.env', '.env.example', 'ecosystem.config.js', 'ecosystem.config.cjs', 'package.json']) {
+            const configPath = path.join(repoRoot, configName);
+            if (fs.existsSync(configPath)) {
+                const content = fs.readFileSync(configPath, 'utf8');
+                assert.ok(
+                    !content.includes('MESHTASTIC_ENABLE_TEST_HOOKS'),
+                    `${configName} 不得包含 MESHTASTIC_ENABLE_TEST_HOOKS`
+                );
+            }
+        }
+
+        // 3. 同時啟動「明確啟用」與「預設」兩個子程序，驗證互不影響
+        const enabledApp = await startIndexChildForHooks({ enableTestHooks: true });
+        let defaultApp = null;
+        try {
+            defaultApp = await startIndexChildForHooks({ enableTestHooks: false });
+
+            enabledApp.send({ type: 'TEST_FLUSH_DB_QUEUE', requestId: 'iso_enabled' });
+            defaultApp.send({ type: 'TEST_FLUSH_DB_QUEUE', requestId: 'iso_default' });
+
+            const enabledReply = await enabledApp.waitForIpc('TEST_DB_QUEUE_FLUSHED', 4000);
+            assert.equal(enabledReply.ok, true);
+            assert.equal(enabledReply.requestId, 'iso_enabled');
+
+            await defaultApp.waitForOutput(/\[TEST_HOOKS_DISABLED\] 已忽略測試控制訊息 TEST_FLUSH_DB_QUEUE/, 4000);
+            await new Promise((r) => setTimeout(r, 400));
+            assert.equal(
+                defaultApp.state.ipcMessages.filter((m) => m && m.type === 'TEST_DB_QUEUE_FLUSHED').length,
+                0,
+                '未明確設定環境變數的子程序不得啟用 Hooks'
+            );
+            assert.ok(!/\[TEST_HOOKS_DISABLED\]/.test(enabledApp.state.output), '啟用的子程序不應輸出拒絕訊息');
+        } finally {
+            if (defaultApp) {
+                await defaultApp.shutdownAndCleanup();
+                defaultApp.cleanup();
+            }
+            await enabledApp.shutdownAndCleanup();
+            enabledApp.cleanup();
+        }
+
+        // 4. 測試完成後主程序環境仍未被汙染
+        assert.notEqual(process.env.MESHTASTIC_ENABLE_TEST_HOOKS, '1', '測試結束後主測試程序環境不得被改變');
     });
 });

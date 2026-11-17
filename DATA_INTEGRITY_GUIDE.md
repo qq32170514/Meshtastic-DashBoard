@@ -49,7 +49,7 @@
 | 關機排空與 Checkpoint | 具備 `ShutdownHandler`（排空 `WriteQueue` + `wal_checkpoint(TRUNCATE)`） | 無本地 WAL 檔案或 `ShutdownHandler` |
 
 ### 1.3 備份排程政策確認（`BACKUP_PATH` 與 Cron 設定）
-- **`BACKUP_PATH` 啟用條件**：在 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L4519-L4535) 中，`db.backupManager.startSchedule('0 0 * * 0', cron, ...)` 傳入 `shouldRun: () => Boolean(process.env.BACKUP_PATH) && db.isBootstrapReady()`：
+- **`BACKUP_PATH` 與 Bootstrap Ready 啟用條件（嚴格 Fail-Closed）**：在 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 中，透過共用的 `registerAppBackupSchedule(db, cron, process.env)`（內部呼叫 `db.backupManager.startSchedule('0 0 * * 0', cron, policy)`），`policy.shouldRun()` 僅在「已設定 `BACKUP_PATH`」且「`db.isBootstrapReady` 為 function 並回傳嚴格 `true`」時才回傳 `true`（詳見第 6.2 節第 5 項）：
   - 當未設定 `BACKUP_PATH` 時：排程器雖有註冊，但每次觸發時 `shouldRun()` 回傳 `false`（記錄 `SKIPPED_CONDITION_FALSE`），**不會在未授權路徑自動產生備份檔案**。
   - 當設定 `BACKUP_PATH` 且 `db.isBootstrapReady() === true` 時：排程器正常執行 `performBackup(process.env.BACKUP_PATH)`。
 - **排程頻率差異說明**：
@@ -252,11 +252,14 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test I — Backup Integrity Failure** | 真實 0-byte 檔案測試 + Verification Failure Injection | 1. 對真實 0-byte 空檔案執行 `verifyIntegrity()` 驗證回傳 `CORRUPTED`；2. 透過 stubbing `verifyIntegrity` 模擬損壞結果，驗證 `performBackup()` 拒絕標記成功並清理 staging。 |
 | **Test J — Incomplete Backup Cleanup** | Mid-Backup I/O Failure Simulation + Real Retry | 攔截第一次 `VACUUM INTO` 寫入半成品 staging 檔案後拋出模擬 I/O 錯誤，驗證 `.staging-*` 被徹底清除，且第二次真實 `VACUUM INTO` 備份成功。 |
 | **Test K — Backup Retention** | 真實 SQLite Backup + Filesystem mtime Test | 建立 3 份真實備份並調整 `utimesSync` 與置入未驗證壞檔，驗證按順序刪除最舊備份、忽略未驗證檔，且當僅剩 1 份有效備份時即使過期 365 天也絕不刪除。 |
+
+> Tests L – AA 之測試矩陣詳見第 7.2 節。
+
 ---
 
-## 5. 4.0.2 Packet Transaction Boundary（單一封包不可拆分交易邊界）
+## 6. 4.0.2 Packet Transaction Boundary（單一封包不可拆分交易邊界）
 
-### 5.1 實際封包寫入流程盤點與分類
+### 6.1 實際封包寫入流程盤點與分類
 經盤點 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 與 [`src/database/packet-transaction.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/packet-transaction.js)，系統中所有資料庫寫入明確區分為「**同一邏輯封包事件（Local SQLite 下為同一個原子交易）**」與「**獨立背景批次工作（保持各自獨立交易）**」。
 
 > **事件名稱核對說明**：`src/database/packet-transaction.js` 透過 `batchEmit` 發出的事件類型嚴格僅有 `'node_seen'`、`'raw_packet'` 與 `'telemetry_update'` 三種（於 `index.js` 的 `flushPendingBatch()` 彙整發送為 `'node_seen_batch'`、`'raw_packet_batch'`、`'telemetry_batch'`）。
@@ -274,7 +277,7 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **RF TCP Tunnel 座標封包 (`setupRFListener`)** | 1. `packet_logs` (`POSITION`, `source`) Insert<br>2. `nodes` (`last_seen`, `last_gateway`) Update | 2 | `batchEmit('raw_packet', packetData)` |
 | **獨立背景工作（不與單一封包合併）** | `flushLiveAnalytics()` (`daily_analytics_summary`)、`computeAndSaveDaySummary()`、`fetchAndSaveCWAData()` (`cwa_weather_stations`)、`cleanupOldData()` (90 天定期清理) | 各自獨立 | 由定時器獨立排入 `WriteQueue`，不阻塞或干擾即時封包交易 |
 
-### 5.2 交易邊界、錯誤分類、Post-Commit 保護與 Turso Fallback 保證
+### 6.2 交易邊界、錯誤分類、Post-Commit 保護與 Turso Fallback 保證
 1. **不可拆分之封包交易單位 (`isTransactionUnit: true`)**：
    - [`WriteQueue.enqueuePacketTransaction(statements, callback, options)`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/write-queue.js#L372-L379) 與 `db.queuePacketTransaction(...)` 將單一封包的所有 SQL 語句封裝為單一佇列項目（`item.isTransactionUnit = true`、`item.statements = [...]`）。
    - 在 `_commitOrIsolate(batch)` 中，同一個 `batch` 內的所有佇列項目在同一個 `adapter.transaction(async (tx) => ...)` 內依序執行；若任一封包單位內任一語句拋錯，整個 `adapter.transaction` 立即 `ROLLBACK`，絕不留下半套寫入。
@@ -292,17 +295,26 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
    - 當同一個 `dbQueue` 中混合一般單筆 `queueDbOp()` 與多語句 `queuePacketTransaction()` 時，嚴格維持 FIFO 執行順序與各自獨立的 `exactly-once` callback 行為。
    - 若中途任一條 SQL 失敗，立即停止該交易單位後續 SQL、透過 callback 回報錯誤一次（附帶 `failedStatementIndex`、`failedStatementSql`、`transactionLabel`），且不執行成功的 post-commit effects，同時不破壞佇列中後續獨立項目的執行。
    - **誠實語意限制**：Turso fallback 僅提供多語句順序執行與中斷回報，**不具備 Local SQLite Adapter 的單連線原子交易回滾保證**。
-5. **Backup Scheduler Policy 共用政策函式（4.0.2 收尾強化）**：
-   - [`src/database/backup-manager.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js#L2072-L2120) 匯出 `APP_BACKUP_CRON_EXPRESSION ('0 0 * * 0')`、`createAppBackupSchedulePolicy(dbTarget, envSource)` 與 `registerAppBackupSchedule(dbTarget, cronLib, envSource)`，並由 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js#L4352-L4354) 與測試直接共用同一份實作。
-   - 每次排程觸發皆動態評估當下 `envSource.BACKUP_PATH` 與 `dbTarget.isBootstrapReady()`，不快取初始化舊狀態，並保留既有 `'0 0 * * 0'` 排程設定。
+5. **Backup Scheduler Policy 共用政策函式與嚴格 Fail-Closed（4.0.2 收尾強化與最終驗收前修正 P2）**：
+   - [`src/database/backup-manager.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/database/backup-manager.js) 匯出 `APP_BACKUP_CRON_EXPRESSION ('0 0 * * 0')`、`createAppBackupSchedulePolicy(dbTarget, envSource, options)` 與 `registerAppBackupSchedule(dbTarget, cronLib, envSource)`，並由 [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 與測試直接共用同一份實作。
+   - **嚴格 Fail-Closed**：`shouldRun()` 僅在下列條件全部成立時回傳 `true`，其餘一律拒絕：(1) 已設定 `envSource.BACKUP_PATH`；(2) `dbTarget` 存在；(3) `dbTarget.isBootstrapReady` 為 function（缺少時視為無法確認 Schema Ready 而拒絕，不再預設放行）；(4) `isBootstrapReady()` 未拋出例外且回傳值嚴格等於 `true`。
+   - `isBootstrapReady()` 拋出例外時安全拒絕並以 `[BACKUP_SCHEDULE_POLICY_ERROR]` 輸出診斷（可由 `options.logger` 注入；logger 自身失敗亦不影響拒絕結果），絕不將例外拋入 cron 排程回呼。
+   - 每次排程觸發皆即時評估當下 `envSource.BACKUP_PATH` 與 `dbTarget.isBootstrapReady()`，不快取任何舊狀態，並保留既有 `'0 0 * * 0'` 排程、`BACKUP_PATH` 目的地與檔名政策不變。
 6. **`package.json` 與 `package-lock.json` 版本 Metadata 同步**：
    - 根目錄 `package.json` 與 `package-lock.json`（含 `packages[""]`）統一對齊為 `3.1.0`；`frontend/package.json` 與 `frontend/package-lock.json`（含 `packages[""]`）亦統一對齊為 `3.1.0`，且保留 `sqlite3 ^5.1.6` 與既有依賴鎖定版本不變。
+7. **測試專用 IPC Hooks 隔離（最終驗收前修正 P2）**：
+   - [`index.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js) 以集中式常數 `TEST_HOOKS_ENABLED = (process.env.MESHTASTIC_ENABLE_TEST_HOOKS === '1')` 控制 `TEST_FLUSH_DB_QUEUE` 與 `TEST_INJECT_MQTT_PACKET` 兩種測試 IPC 控制訊息，**預設關閉**。
+   - 未啟用時：收到上述訊息一律不執行、不回覆，僅輸出 `[TEST_HOOKS_DISABLED]` 警示日誌；啟用時行為與先前完全一致。`'shutdown'` 等一般 IPC 訊息與 MQTT `message` handler、`WriteQueue` 路徑完全不受此開關影響。
+   - 此開關**不得**寫入一般 `.env`、`.env.example`、PM2 設定或 Production 設定；整合測試子程序於 spawn 時明確注入 `MESHTASTIC_ENABLE_TEST_HOOKS=1`（其餘子程序明確移除該變數），並由 `Test 4.0.2-35` 驗證主測試程序與一般設定檔不含此開關。
+   - **已知限制**：`MQTT_PIPE_PATH`（讓 `index.js` 以本機 Named Pipe / Unix Socket 取代網路 MQTT 連線）為另一個既有的測試用環境變數，預設不設定，**不在本輪「測試 IPC Hooks」收斂範圍內**，亦不受 `MESHTASTIC_ENABLE_TEST_HOOKS` 控制；Production 不得設定此變數。
+8. **文件章節編號整理（最終驗收前修正 P3）**：
+   - 將原本重複的 `## 5.`（測試覆蓋與分類 / 4.0.2 Packet Transaction Boundary）與 `## 6.`（測試驗證矩陣）重新編號為連續的 `## 5.`、`## 6.`、`## 7.`，各章子節同步更新（6.1、6.2、7.1 ～ 7.4）；原錯置於第 7.2 節且缺少表格標頭之 Tests L – AA 表格補上標頭並與第 5.1 節（Tests A – K）互相標註，未刪除任何既有內容。
 
 ---
 
-## 6. 測試驗證矩陣（共 97 項 `it()` 測試案例）
+## 7. 測試驗證矩陣（共 108 項 `it()` 測試案例）
 
-### 6.1 [`tests/database/packet_transaction_4_0_2.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（24 項 4.0.2 `it()` 測試案例）
+### 7.1 [`tests/database/packet_transaction_4_0_2.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/packet_transaction_4_0_2.test.js)（35 項 4.0.2 `it()` 測試案例）
 
 | 測試編號與名稱 | 測試性質 | 驗證重點 |
 |---|---|---|
@@ -330,8 +342,24 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test 4.0.2-22 — MQTT Mock Broker Stream Parser Test E (Multiple Complete Packets Coalesced)** | 本機 Mock MQTT Broker 黏包解析測試 | 將 3 個完整 MQTT `PUBLISH` 封包合併為單一 chunk 一次寫入，確認依序完整解析全部 3 筆訊息。 |
 | **Test 4.0.2-23 — MQTT Mock Broker Stream Parser Test F (Complete + Incomplete Packet, Multi-Socket Isolation & Close Cleanup)** | 本機 Mock MQTT Broker 複合緩衝與多連線隔離測試 | 一次傳送「完整第 1 包 + 未完成第 2 包前半段」，確認第 1 包立即解析、第 2 包保留於該 Socket 獨立 `receiveBuffer`、另一條並發 Socket 傳送不受干擾、補齊第 2 包後半段後正常解析，且連線關閉時徹底清除對應 Socket 緩衝狀態。 |
 | **Test 4.0.2-24 — MQTT Mock Broker Stream Parser Test G (Abnormal Remaining Length & Buffer Size Limit Protection)** | 本機 Mock MQTT Broker 異常長度與記憶體上限保護測試 | 驗證 5-byte 非法 Remaining Length varint、超過 `maxRemainingLength` 的封包宣告，以及超過 `maxBufferSize` 的資料湧入均被立即攔截記錄於 `protocolErrors`、清空該 Socket 緩衝並關閉異常連線，不影響其他正常連線。 |
+| **Test 4.0.2-25 — Backup Policy Fail-Closed Test A (No dbTarget)** | 共用排程政策函式單元測試 | 直接呼叫 `createAppBackupSchedulePolicy(null / undefined, env)`，即使已設定 `BACKUP_PATH` 仍必須 `shouldRun() === false`。 |
+| **Test 4.0.2-26 — Backup Policy Fail-Closed Test B (Missing / Non-Function isBootstrapReady)** | 共用排程政策單元測試 + 真實 `BackupManager` 排程 tick 整合測試 | 驗證 `dbTarget` 缺少 `isBootstrapReady`、或其為布林/字串（非 function）時必須拒絕；並以真實 `BackupManager` 搭配缺少 `isBootstrapReady` 的 `dbTarget` 經 `registerAppBackupSchedule` 觸發排程 tick，確認回傳 `skipped`、`performBackup()` 呼叫 0 次、備份目錄 0 檔案。 |
+| **Test 4.0.2-27 — Backup Policy Fail-Closed Test C (isBootstrapReady() Returns False / Non-True)** | 共用排程政策單元測試 | `isBootstrapReady()` 回傳 `false`、`undefined`、`null`、`0`、`1`、`'true'`、`{}` 等任何非嚴格 `true` 值皆必須拒絕。 |
+| **Test 4.0.2-28 — Backup Policy Fail-Closed Test D (Ready + BACKUP_PATH Allows Run)** | 共用排程政策單元測試 | `BACKUP_PATH` 有效且 `isBootstrapReady() === true` 時允許執行；同時驗證 Cron 仍為 `'0 0 * * 0'`、`optionsProvider()` 仍使用 `BACKUP_PATH`、檔名格式不變，且未設定 / 空字串 `BACKUP_PATH` 或缺少 `envSource` 皆拒絕。 |
+| **Test 4.0.2-29 — Backup Policy Fail-Closed Test E (isBootstrapReady() Throws)** | 共用排程政策單元測試（例外注入） | `isBootstrapReady()` 拋出例外時 `shouldRun()` 回傳 `false`、不向呼叫端拋出、並以 `[BACKUP_SCHEDULE_POLICY_ERROR]` 留下含原始錯誤訊息的診斷紀錄；`logger` 自身損壞時仍 Fail-Closed；未設定 `BACKUP_PATH` 時不會呼叫 `isBootstrapReady()`。 |
+| **Test 4.0.2-30 — Backup Policy Fail-Closed Test F (Live State On Every Trigger)** | 共用排程政策單元測試（狀態切換） | 透過 `registerAppBackupSchedule` 取得實際傳入 `startSchedule` 的 `shouldRun`，連續切換 `BACKUP_PATH` 與 `isBootstrapReady()` 狀態 (`未Ready -> Ready -> 未Ready -> 移除路徑 -> 還原`)，驗證每次判斷皆使用即時狀態，且 `isBootstrapReady()` 實際被逐次呼叫 5 次（證明無快取）。 |
+| **Test 4.0.2-31 — IPC Test Hooks Test A (Disabled By Default)** | 真實 `index.js` 子程序 + Mock Broker 整合測試 | 子程序環境明確移除 `MESHTASTIC_ENABLE_TEST_HOOKS`，送出 `TEST_FLUSH_DB_QUEUE` 後，驗證輸出 `[TEST_HOOKS_DISABLED]` 拒絕訊息且不回覆 `TEST_DB_QUEUE_FLUSHED`。 |
+| **Test 4.0.2-32 — IPC Test Hooks Test B (Explicitly Enabled)** | 真實 `index.js` 子程序 + Mock Broker 整合測試 | 子程序明確設定 `MESHTASTIC_ENABLE_TEST_HOOKS=1`，`TEST_FLUSH_DB_QUEUE` 正常執行並回覆 `{ ok: true, requestId }`，且無拒絕訊息。 |
+| **Test 4.0.2-33 — IPC Test Hooks Test C (TEST_INJECT_MQTT_PACKET Gated)** | 真實 `index.js` 子程序 + 優雅關機後 DB 驗證 | 未啟用時注入合法 `NODEINFO` 封包被拒絕、無回覆、優雅關機（會排空 `WriteQueue`）後 `nodes` 表仍無該節點；啟用時注入成功回覆 `ok: true`，且節點與 `packet_logs` 完整寫入。 |
+| **Test 4.0.2-34 — IPC Test Hooks Test D (Normal MQTT Flow Regression)** | 真實 `index.js` 子程序 + 本機 Wire-Level Broker `PUBLISH` 回歸測試 | 測試 Hooks 未啟用時，由 Mock Broker 發送真實 `PUBLISH (0x30)` `NODEINFO` 封包，不使用任何 `TEST_*` IPC，仍由正常 `message` handler 與自然 `WriteQueue` Flush 寫入 `nodes` / `packet_logs`，且無任何 `TEST_*` IPC 回覆或拒絕訊息。 |
+| **Test 4.0.2-35 — IPC Test Hooks Test E (Environment Isolation)** | 真實 `index.js` 雙子程序並行環境隔離測試 | 驗證主測試程序未持有 `MESHTASTIC_ENABLE_TEST_HOOKS`、`.env` / `.env.example` / `ecosystem.config.*` / `package.json` 皆不含該開關；同時啟動「明確啟用」與「預設」兩個子程序，確認僅前者執行 `TEST_FLUSH_DB_QUEUE`，後者拒絕；測試結束後主程序環境未被改變。 |
 
-### 6.2 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（27 項 4.0.1 – 4.0.1.4 `it()` 測試案例，Tests A – AA）
+### 7.2 [`tests/database/data_integrity_4_0_1.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/data_integrity_4_0_1.test.js)（27 項 4.0.1 – 4.0.1.4 `it()` 測試案例，Tests A – AA）
+
+> Tests A – K 之測試分類與驗證方式詳見第 5.1 節表格；以下為 Tests L – AA 之測試矩陣。
+
+| 測試編號與名稱 | 測試性質 | 驗證重點 |
+|---|---|---|
 | **Test L — Backup Restore Verification** | 真實 SQLite End-to-End Backup & Restore Test | 對真實臨時 DB 備份後，呼叫 `restoreFromBackup(..., { offlineConfirmed: true })` 還原至第二個獨立臨時 DB，並以新 `createDatabaseSubsystem` 開啟驗證資料一致性與後續讀寫。 |
 | **Test M — Backup Scheduler Non-Overlap & Shutdown Race** | 真實 SQLite + `ShutdownHandler.handle()` Integration Test | 驗證重疊排程自動跳過；並測試在 `VACUUM INTO` 執行期間觸發真實 `ShutdownHandler.handle('SIGTERM')`（涵蓋「於 Deadline 內完成並安全關閉」與「超過 Deadline 時拒絕呼叫 `db.close()` 保護活動連線」兩種情境）。 |
 | **Test N — P1 Backup Scheduler Isolation** | 真實 SQLite Integration + Rename Failure Injection | 在 `VACUUM INTO` 完成後、`verifyIntegrity` 開始前（`afterVacuumBeforeVerify` Gate），驗證 `maintenanceInProgress === false` 且 `WriteQueue` 可立即寫入主 DB；同時以 `renameImpl` 注入錯誤驗證同名舊有效備份不會因新備份安裝失敗而損毀。 |
@@ -349,10 +377,11 @@ SQLite 的 `CREATE INDEX IF NOT EXISTS` 若遇到同名但定義錯誤的既有�
 | **Test Z — Backup Replacement `.prev-*` Cleanup & Rollback Error Diagnostics (4.0.1.4 P2)** | **真實 SQLite Backup 替換 + `.prev-*` Unlink/Lstat/Rename 錯誤注入測試** | (Z-1/Z-2) 新備份安裝成功後刪除舊 `.prev-*` 失敗時，驗證新備份維持有效且回傳 `COMPLETED`、`cleanupComplete === false`、`cleanupWarnings` / `cleanupFailures` 記錄完整路徑與錯誤碼，並依 `PRESENT` / `ABSENT` / `UNKNOWN` 精確更新 `preservedPrevBackupPaths`、`remainingPaths` 與 `unverifiablePaths`；(Z-3) 新備份安裝 `rename` 失敗且舊 `.prev-*` 還原 `rename` 亦失敗時，驗證保留原始安裝錯誤、記錄 `previousBackupRestoreError` 與 `rollbackErrors`、並將舊有效備份安全保留於 `preservedPrevBackupPaths`。 |
 | **Test AA — Pre-Cleanup Verification Before VACUUM INTO & Restore Staging (4.0.1.4 P2)** | **真實 SQLite Backup & Restore 前置 Cleanup 阻斷與通過整合測試** | 驗證 `performBackup()`（`VACUUM INTO` 前）與 `restoreFromBackup()`（建立還原 staging 前）在前置 `_cleanupFileAndSidecars()` 回傳 `complete === false`（含 `unlink` 失敗殘留檔案與 `lstat` `EACCES` 狀態 `UNKNOWN`）時立即中止，絕不執行 `VACUUM INTO` 或建立還原 staging，且完整保留 `cleanupResult`、`remainingPaths`、`unverifiablePaths` 與原始錯誤；並在前置清理成功（`complete === true`）時正常完成備份與還原。 |
 
-### 6.3 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線 `it()` 測試案例）
+### 7.3 [`tests/database/sqlite_reliability.test.js`](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/tests/database/sqlite_reliability.test.js)（46 項既有基線 `it()` 測試案例）
 - 完整保留 v2.7.7 結案之 46 項測試（包含真實 SQLite 交易/鎖定測試，以及針對罕見底層情境如 Delayed Native Close Callback / Callback Error Injection 的模擬測試），**0 刪除、0 跳過、0 修改**。
 
-### 6.4 測試邊界與環境限制誠實聲明
+### 7.4 測試邊界與環境限制誠實聲明
 - **SQLite WAL Process Death Test (`Test 4.0.2-14`) vs. Application Packet Transaction Process Death Test (`Test 4.0.2-15`)**：`Test 4.0.2-14` 直接使用 `sqlite3` 驗證 SQLite WAL 引擎在程序被強制終止後的回滾能力；`Test 4.0.2-15` 則透過專案 `createDatabaseSubsystem` + `WriteQueue` + `executePacketTransactionPlan` 驗證應用程式封包交易在中段（已執行 3/4 條 SQL）與 `COMMIT` 後遭遇 `SIGKILL` 的恢復行為。兩者皆屬**跨程序異常終止 (`SIGKILL`) 測試，不等同於實體主機斷電（Power Loss）、作業系統核心崩潰（Kernel Panic）或磁碟硬體扇區損毀測試**。
 - **本機測試 Broker Wire-Level MQTT 傳輸與 Stream Parser (`Test 4.0.2-16` & `Test 4.0.2-18 ~ 24`)**：使用本機 `net.Server` 測試 Broker（於 Windows 環境透過 Named Pipe 避免沙盒阻擋 Loopback TCP），為每個 Socket 維護獨立 `receiveBuffer`、多位元組 MQTT Remaining Length 解碼、拆包/黏包重組與超限記憶體保護，完成真實 MQTT `CONNECT -> CONNACK -> SUBSCRIBE -> SUBACK` 並發送 Wire-Level `PUBLISH (0x30)` 封包，不連接外部正式環境 MQTT Broker。
-- **正式環境零接觸**：全部 **97 項 `it()` 測試**（`46 + 27 + 24 = 97`）均於 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫執行，並於測試結束後完整清除，完全不讀取、不修改、不壓測正式環境 `d:\meshtastic\Meshtastic-DashBoard-Prod`。
+- **正式環境零接觸**：全部 **108 項 `it()` 測試**（`46 + 27 + 35 = 108`）均於 `os.tmpdir()` 下的獨立臨時 SQLite 資料庫執行，並於測試結束後完整清除，完全不讀取、不修改、不壓測正式環境 `d:\meshtastic\Meshtastic-DashBoard-Prod`。
+- **測試 IPC Hooks 子程序整合測試 (`Test 4.0.2-31 ~ 35`)**：每個測試子程序均於 spawn 時由測試明確注入（或明確移除）`MESHTASTIC_ENABLE_TEST_HOOKS`，絕不修改主測試程序環境、`.env` 或任何 Production 設定；`index.js` 子程序使用獨立臨時 DB 與本機 Named Pipe Mock Broker。`MQTT_PIPE_PATH`（將 MQTT 傳輸改為本機 Pipe）仍為獨立之測試用環境變數，預設不設定、不受 `MESHTASTIC_ENABLE_TEST_HOOKS` 控制（詳見第 6.2 節第 7 項「已知限制」）。
