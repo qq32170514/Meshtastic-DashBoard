@@ -1,62 +1,83 @@
-# Meshtastic-DashBoard 4.0.3.1 — Backend Reliability & API Correctness Report
+# Meshtastic-DashBoard 4.0.3.2 — Backend Reliability & Safety Report
 
 **Status**: `READY FOR PRODUCTION REVIEW`  
-**Baseline**: `Meshtastic-DashBoard 4.0.3` (`develop` @ `a0c97a8`)  
+**Baseline**: `Meshtastic-DashBoard 4.0.3.1` (`develop` @ `7afa727`)  
 **Environment**: `D:\meshtastic\Meshtastic-DashBoard-Dev` (Node `v24.16.0`, npm `11.13.0`, Production untouched)
 
 ---
 
 ## 1. Executive Summary
 
-Meshtastic-DashBoard **4.0.3.1** addresses four backend/API reliability and correctness issues while preserving all **4.0.2** SQLite reliability/transaction/backup modules and **4.0.3** frontend performance & Leaflet lazy-loading optimizations:
+Meshtastic-DashBoard **4.0.3.2** resolves the four reliability, output consistency, information-disclosure, and analytics staleness issues identified in the 4.0.3.1 review, along with Hop Analysis SQL error handling and API Cache repeated-parameter ordering semantics:
 
-1. **P1 — API Cache Key Correctness** (`src/utils/api-cache.js`, `index.js`)
-2. **P1 — Coverage Rebuild Admin Authorization, Single-Flight Controller & Atomic Output** (`src/utils/coverage-controller.js`, `index.js`, `rf-engine/bake.mjs`, `.env.example`)
-3. **P2 — Hop Distribution vs. Hop Analysis Route Conflict** (`index.js`, `frontend/src/NetworkAnalytics.tsx`)
-4. **P2 / P3 — Analytics Bundle Bounded Concurrency & Frontend API Cache** (`src/utils/analytics-bundle.js`, `index.js`, `frontend/src/apiCache.ts`)
+1. **P1 — Coverage Job Cross-Process Locking & Crash Recovery** (`src/utils/coverage-lock.js`, `src/utils/coverage-runner.js`, `src/utils/coverage-controller.js`)
+2. **P1 — Coverage PNG / JSON Generation & Manifest Atomic Consistency** (`src/utils/coverage-storage.js`, `rf-engine/bake.mjs`, `index.js`)
+3. **P2 — Coverage Status API Information Isolation** (`src/utils/coverage-controller.js`, `index.js`)
+4. **P2 — Analytics Bundle Maximum Stale Age & Hop Analysis SQL Error Handling** (`src/utils/analytics-bundle.js`, `src/utils/hop-analysis.js`, `index.js`)
+5. **P3 — API Cache Repeated Query Parameter Ordering Semantics** (`src/utils/api-cache.js`)
 
-**Explicitly Excluded**: RF Tunnel TCP (`setupRFListener`) was left completely untouched per scope rules.
-
----
-
-## 2. Detailed Changes
-
-### 2.1 P1 — API Cache Key Correctness (`src/utils/api-cache.js`, `index.js`)
-- **Problem**: `normalizeCacheKey(req)` previously filtered query parameters through a static 9-key whitelist (`limit`, `page`, `range`, `days`, `node_id`, `portnum`, `gateway_id`, `exclude_tunnel`, `cursor`), silently dropping `sender`, `node_ids`, `timeStart`, `timeEnd`, `minSnr`, `minRssi`, and any other query parameter, causing cross-query cache collisions.
-- **Fix**:
-  - Extracted `BoundedLRUCache`, `normalizeCacheKey(req)`, and `createWithCache(apiCache)` into [api-cache.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/api-cache.js).
-  - Canonicalizes `<METHOD>:<normalizedPath>?<sortedQuery>` across **all** query parameters (preserving multi-value keys, URL-encoded values, empty values, and unknown parameters while canonicalizing parameter/value order and trailing slashes).
-  - Updated `BoundedLRUCache.clearPrefix(prefix)` to strip any `METHOD:` prefix so `invalidatePacketCache()` continues to invalidate `/api/packets`, `/api/node/`, and `/api/coverage` entries.
-
-### 2.2 P1 — Coverage Rebuild Authorization & Job Controller (`src/utils/coverage-controller.js`, `rf-engine/bake.mjs`, `index.js`)
-- **Problem**: `POST /api/coverage/rebuild` had no admin authorization, used `child_process.exec` without concurrency control, could overlap with the `0 4 * * *` cron job, and wrote output files directly in place.
-- **Fix**:
-  - Added `createRequireCoverageAdmin()` in [coverage-controller.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/coverage-controller.js): default-deny (`503`) when `COVERAGE_ADMIN_TOKEN` / `ADMIN_API_TOKEN` is unset, `401` when missing, `403` when invalid, using SHA-256 + `crypto.timingSafeEqual` on `Authorization: Bearer <token>` or `X-Admin-Token`.
-  - Added `CoverageJobController` shared by `POST /api/coverage/rebuild` (`202 Accepted` / `409 Conflict` when busy), `GET /api/coverage/status`, and the `0 4 * * *` cron job.
-  - Uses `spawn(process.execPath, [bakeScriptPath, String(safeLimit)], { shell: false })` with bounded limit validation (`1..1000`), cross-process lock file (`public/coverage/.coverage_bake.lock`) with stale-PID reclamation, stdout/stderr tail capture, and `SIGTERM`/`SIGKILL` timeout cleanup.
-  - Updated [bake.mjs](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/rf-engine/bake.mjs) to write PNG/JSON to `.tmp.<pid>.<ts>` staging files and atomically `renameSync` into place, plus optional `COVERAGE_OUTPUT_DIR` override for isolated testing.
-
-### 2.3 P2 — Hop Distribution & Hop Analysis Route Separation (`index.js`, `frontend/src/NetworkAnalytics.tsx`)
-- **Problem**: Two `GET /api/analytics/hop-distribution` handlers existed in `index.js`, shadowing the Hop Analysis diagnostic endpoint.
-- **Fix**:
-  - Kept `GET /api/analytics/hop-distribution` for the range-filtered hop count distribution array.
-  - Moved the hop diagnostic payload to `GET /api/analytics/hop-analysis` in [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js).
-  - Updated `/api/analytics/bundle` and [NetworkAnalytics.tsx](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/NetworkAnalytics.tsx) fallback to call `/api/analytics/hop-analysis`.
-
-### 2.4 P2 / P3 — Analytics Bundle & Frontend API Cache (`src/utils/analytics-bundle.js`, `frontend/src/apiCache.ts`)
-- **Analytics Bundle**: Replaced the 23-endpoint sequential `for...of` loop in `/api/analytics/bundle` with `buildAnalyticsBundle` (`concurrency = 4`), tracking `_meta.partialFailure` and `_meta.failedEndpoints`, using a 15-second TTL for partial bundles instead of 10 minutes, and returning `502` (or stale cache fallback) if all sub-endpoints fail.
-- **Frontend API Cache**: Updated [apiCache.ts](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/frontend/src/apiCache.ts) with bounded `MAX_CACHE_ENTRIES = 100` LRU eviction, `pruneExpiredApiCache()`, and subscriber ref-counted `AbortController` passed to `fetch(url, { signal })` so one caller aborting does not cancel other active subscribers, while aborting all subscribers cancels the underlying `fetch`.
+**Explicitly Excluded**: RF Tunnel TCP (`setupRFListener`), SQLite Reliability v2.7.7 core, 4.0.2 Packet Transaction, 4.0.3 Frontend Virtualization / Leaflet Lazy Loading.
 
 ---
 
-## 3. Verification Results
+## 2. Architecture & Design Details
 
-Full test output is archived at [4.0.3.1-test.log](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/artifacts/test-results/4.0.3.1-test.log).
+### 2.1 Coverage Cross-Process Lock & Dedicated Runner
+- **Atomic Lock Directory**: Uses `fs.mkdirSync(lockDirPath)` (atomic on Windows NTFS & POSIX) containing `owner.json` (`jobId`, `ownerToken`, `hostname`, `serverPid`, `runnerPid`, `bakePid`, `trigger`, `limit`, `state`, `createdAt`, `startedAt`, `heartbeatAt`, `maxDurationMs`).
+- **Dedicated Runner Supervision**: `CoverageJobController` spawns [coverage-runner.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/coverage-runner.js) (`detached: true`, `stdio: 'ignore'`), which spawns `rf-engine/bake.mjs`, records `runnerPid` and `bakePid`, and updates `heartbeatAt` on interval.
+  - **Scenario A (Server killed while Runner+Bake alive)**: Runner continues updating `heartbeatAt`; any restarted Server inspects `heartbeatAt`, `runnerPid`, and `bakePid` and refuses to steal the lock.
+  - **Scenario B/E (Dead processes & concurrent stale recovery)**: `acquireCoverageLock` atomically renames the stale directory (`fs.renameSync(lockDirPath, reclaimPath)`) so at most one racing process can win recovery.
+  - **Scenario D (Corrupted metadata)**: Fail-closed (`lock_corrupted`); never unlinks `owner.json` automatically.
+  - **Owner-verified release**: `releaseCoverageLock` verifies both `jobId` and constant-time `ownerToken` before removing the lock.
+  - **Process tree cleanup**: `killProcessTree` uses `taskkill /PID <pid> /T /F` (with `SIGKILL` fallback) on Windows and process-group `-pid` `SIGTERM`/`SIGKILL` on POSIX, verifying `!isPidAlive(bakePid)` before releasing the lock.
 
-| Check | Command | Result |
-| --- | --- | --- |
-| Phase 1–4 API & Cache Suite | `node --test tests/api/*.test.js` | **11/11 passed** (`0` failed) |
-| Database Reliability Suite | `npm run test:database` | **108/108 passed** across 3 suites (`0` failed) |
-| Backend Syntax Check | `node -c index.js` | Passed (`exit 0`) |
-| Frontend Production Build | `npm --prefix frontend run build` | Passed (`3403 modules`, `14.48s`) |
+### 2.2 Coverage Generation / Manifest Output Consistency
+- Implemented in [coverage-storage.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/coverage-storage.js) and integrated into [bake.mjs](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/rf-engine/bake.mjs) and [index.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/index.js):
+  - Layout: `generations/<generationId>/taiwan_coverage.{png,json}` + `current.json` manifest.
+  - Staging directory `.staging-<generationId>` validates PNG signature (`\x89PNG\r\n\x1a\n`) and JSON `generationId` match before renaming to `generations/<generationId>` and atomically replacing `current.json`.
+  - Both `public/coverage` and `frontend/public/coverage` receive the same `generationId`.
+  - Express `GET /coverage/taiwan_coverage.png`, `GET /coverage/taiwan_coverage.json`, and `GET /api/coverage/itm-info` resolve through `resolveCurrentCoverage()` so partial/mismatched generations are never served.
 
+### 2.3 Coverage Status API Isolation
+- **Public (`GET /api/coverage/status`)**:
+  ```json
+  {
+    "running": false,
+    "status": "COMPLETED",
+    "startedAt": "2026-11-19T06:00:00.000Z",
+    "finishedAt": "2026-11-19T06:01:12.000Z",
+    "durationMs": 72000,
+    "activeJob": null,
+    "lastJob": { "jobId": "...", "trigger": "manual", "limit": 500, "status": "completed", "startedAt": "...", "finishedAt": "...", "durationMs": 72000 }
+  }
+  ```
+  Strictly excludes `stdout`, `stderr`, stack traces, local DB/lock file paths, tokens, and PIDs.
+- **Admin (`GET /api/coverage/diagnostics`)**: Protected by `requireCoverageAdmin` (`Authorization: Bearer` / `X-Admin-Token`) and redacts local filesystem paths & Bearer tokens.
+
+### 2.4 Analytics Maximum Stale Age & Hop Analysis SQL Error Handling
+- **Analytics Bundle** ([analytics-bundle.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/analytics-bundle.js)):
+  - `DEFAULT_TTL_MS = 10 * 60 * 1000` (10 min), `DEFAULT_PARTIAL_TTL_MS = 15 * 1000` (15 sec), `DEFAULT_MAX_STALE_AGE_MS = 30 * 60 * 1000` (30 min).
+  - If all sub-endpoints fail within `maxStaleAgeMs`: returns HTTP `200` with `X-Bundle-Stale: 1`, `X-Bundle-Stale-Age-Ms`, and a cloned payload with `_meta.staleFallback = true` (never mutating the cached object).
+  - If all sub-endpoints fail beyond `maxStaleAgeMs` (e.g. 24h): evicts stale entry and returns HTTP `503` (`staleExpired: true`).
+  - Partial failure results never overwrite a valid complete cache within `maxStaleAgeMs`.
+- **Hop Analysis** ([hop-analysis.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/hop-analysis.js)):
+  - Checks both `sqlActual` and `sqlConfigured` errors with a single-callback guard; any SQL failure returns HTTP `500` instead of a false `"✅ 網路診斷良好"` payload.
+
+### 2.5 API Cache Repeated Query Parameter Semantics
+- `normalizeCacheKey(req)` in [api-cache.js](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/src/utils/api-cache.js) preserves repeated-parameter value order by default (`?sort=timestamp&sort=snr` !== `?sort=snr&sort=timestamp`), only sorting values for confirmed set-type parameters (`node_ids`).
+
+---
+
+## 3. Verification Summary
+
+Full log: [4.0.3.2-test.log](file:///d:/meshtastic/Meshtastic-DashBoard-Dev/artifacts/test-results/4.0.3.2-test.log)
+
+| Suite | Command | PASS | FAIL | BLOCKED | NOT TESTED | SKIPPED |
+| --- | --- | --- | --- | --- | --- | --- |
+| API, Cross-Process Lock, Storage, Analytics & Cache | `node --test tests/api/*.test.js` | 22 | 0 | 0 | 0 | 0 |
+| Database Reliability (4.0.2 / 4.0.3.1) | `npm run test:database` | 108 | 0 | 0 | 0 | 0 |
+| Backend Syntax & Frontend Build | `node -c index.js` & `npm --prefix frontend run build` | 2 | 0 | 0 | 0 | 0 |
+| **Total** | | **132** | **0** | **0** | **0** | **0** |
+
+**Known Residual Notes**:
+- Pre-existing `current.json` will be generated on the first `bake.mjs` run; until then `resolveCurrentCoverage()` safely serves existing legacy `public/coverage/taiwan_coverage.{png,json}` files.

@@ -1,6 +1,8 @@
 /**
- * Bounded-concurrency Analytics Bundle fetcher with partial-failure tracking
- * and short-TTL protection so incomplete bundles are not cached long-term.
+ * Bounded-concurrency Analytics Bundle fetcher with:
+ * - Separate Cache TTL, Stale Fallback, and Maximum Stale Age (default 30m)
+ * - Partial-failure protection (does not overwrite a valid complete cache)
+ * - Immutable response copy when adding stale metadata
  */
 
 async function runWithConcurrency(items, concurrency, workerFn) {
@@ -49,20 +51,31 @@ const BUNDLE_ENDPOINT_KEYS = [
     { key: 'countyWeatherTrends', path: () => '/api/analytics/county-weather-trends' }
 ];
 
+const DEFAULT_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_PARTIAL_TTL_MS = 15 * 1000;
+const DEFAULT_MAX_STALE_AGE_MS = 30 * 60 * 1000;
+
 async function buildAnalyticsBundle({
     baseUrl,
     range = '7d',
     fetcher = fetch,
     concurrency = 4,
     cacheMap = {},
-    ttlMs = 10 * 60 * 1000,
-    partialTtlMs = 15 * 1000,
+    ttlMs = DEFAULT_TTL_MS,
+    partialTtlMs = DEFAULT_PARTIAL_TTL_MS,
+    maxStaleAgeMs = DEFAULT_MAX_STALE_AGE_MS,
     now = Date.now()
 } = {}) {
     const cached = cacheMap[range];
     const effectiveTtl = cached && cached.partialFailure ? partialTtlMs : ttlMs;
     if (cached && (now - cached.timestamp < effectiveTtl)) {
-        return { status: 200, fromCache: true, data: cached.data };
+        return {
+            status: 200,
+            fromCache: true,
+            staleFallback: false,
+            partialFailure: Boolean(cached.partialFailure),
+            data: cached.data
+        };
     }
 
     const startMs = Date.now();
@@ -90,11 +103,44 @@ async function buildAnalyticsBundle({
 
     if (successCount === 0) {
         if (cached) {
-            return { status: 200, fromCache: true, staleFallback: true, data: cached.data };
+            const staleAgeMs = Math.max(0, now - cached.timestamp);
+            if (staleAgeMs <= maxStaleAgeMs) {
+                // Return a safe shallow clone with updated _meta; never mutate cached.data
+                const clonedPayload = {
+                    ...cached.data,
+                    _meta: {
+                        ...(cached.data && cached.data._meta ? cached.data._meta : {}),
+                        staleFallback: true,
+                        partialFailure: true,
+                        generatedAt: (cached.data && cached.data._meta && cached.data._meta.cachedAt) || new Date(cached.timestamp).toISOString(),
+                        staleAgeMs
+                    }
+                };
+                return {
+                    status: 200,
+                    fromCache: true,
+                    staleFallback: true,
+                    partialFailure: true,
+                    staleAgeMs,
+                    data: clonedPayload
+                };
+            }
+            // Over maxStaleAgeMs: evict expired stale cache and return 503
+            delete cacheMap[range];
+            return {
+                status: 503,
+                fromCache: false,
+                staleExpired: true,
+                staleAgeMs,
+                error: 'Analytics data unavailable: all sub-endpoints failed and cached data exceeded maximum stale age',
+                failedEndpoints
+            };
         }
+
         return {
-            status: 502,
+            status: 503,
             fromCache: false,
+            staleExpired: false,
             error: 'All analytics sub-endpoints failed',
             failedEndpoints
         };
@@ -106,24 +152,36 @@ async function buildAnalyticsBundle({
     }
 
     const partialFailure = failedEndpoints.length > 0;
+    const generatedAt = new Date(now).toISOString();
     payload._meta = {
         partialFailure,
+        staleFallback: false,
         failedEndpoints,
         successCount,
         totalCount,
         durationMs,
-        cachedAt: new Date(now).toISOString()
+        generatedAt,
+        cachedAt: generatedAt
     };
 
-    cacheMap[range] = {
-        data: payload,
-        timestamp: now,
-        partialFailure
-    };
+    // Never overwrite a still-within-maxStaleAge complete cache with a partial failure result
+    const hasValidCompleteCache = Boolean(
+        cached &&
+        !cached.partialFailure &&
+        (now - cached.timestamp <= maxStaleAgeMs)
+    );
+    if (!partialFailure || !hasValidCompleteCache) {
+        cacheMap[range] = {
+            data: payload,
+            timestamp: now,
+            partialFailure
+        };
+    }
 
     return {
         status: 200,
         fromCache: false,
+        staleFallback: false,
         partialFailure,
         data: payload
     };
@@ -132,6 +190,8 @@ async function buildAnalyticsBundle({
 module.exports = {
     runWithConcurrency,
     BUNDLE_ENDPOINT_KEYS,
+    DEFAULT_TTL_MS,
+    DEFAULT_PARTIAL_TTL_MS,
+    DEFAULT_MAX_STALE_AGE_MS,
     buildAnalyticsBundle
 };
-

@@ -141,7 +141,7 @@ test('Phase 2.2: Single-flight lock prevents concurrent manual + cron bakes and 
     });
     const crossProc = otherController.startBake({ trigger: 'manual', limit: 25 });
     assert.equal(crossProc.started, false);
-    assert.equal(crossProc.reason, 'locked_by_other_process');
+    assert.ok(['active_heartbeat', 'active_process', 'initializing'].includes(crossProc.reason));
 
     const result = await first.completion;
     assert.equal(result.status, 'completed');
@@ -189,18 +189,25 @@ test('Phase 2.3: Timeout terminates child process, releases lock, and allows rec
 test('Phase 2.4: Stale lock from dead PID is automatically reclaimed', async () => {
     const tmpDir = makeTempDir('cov-stale-');
     const mockScript = path.join(tmpDir, 'fast-bake.mjs');
-    const lockFile = path.join(tmpDir, '.coverage_bake.lock');
+    const lockDir = path.join(tmpDir, '.coverage_bake.lockdir');
 
     fs.writeFileSync(mockScript, 'process.exit(0);', 'utf8');
-    fs.writeFileSync(lockFile, JSON.stringify({
-        pid: 999999,
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({
         jobId: 'stale-job',
-        startedAt: new Date(Date.now() - 10000).toISOString()
+        ownerToken: 'stale-token',
+        serverPid: 999999,
+        runnerPid: 999998,
+        bakePid: 999997,
+        startedAt: new Date(Date.now() - 60000).toISOString(),
+        heartbeatAt: new Date(Date.now() - 60000).toISOString()
     }), 'utf8');
 
     const controller = new CoverageJobController({
         bakeScriptPath: mockScript,
-        lockFilePath: lockFile
+        lockDirPath: lockDir,
+        heartbeatMs: 50,
+        heartbeatGraceMs: 1000
     });
 
     const launch = controller.startBake({ trigger: 'cron', limit: 50 });

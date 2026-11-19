@@ -97,11 +97,15 @@ test('Phase 1.2: normalizeCacheKey canonicalizes param order, repeated params, U
     const enc2 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?sender=!abcd' });
     assert.equal(enc1, enc2);
 
-    const multi1 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?tag=z&tag=a' });
-    const multi2 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?tag=a&tag=z' });
-    const multiSingle = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?tag=a' });
+    const multi1 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?node_ids=!z&node_ids=!a' });
+    const multi2 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?node_ids=!a&node_ids=!z' });
+    const multiSingle = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?node_ids=!a' });
     assert.equal(multi1, multi2);
     assert.notEqual(multi1, multiSingle);
+
+    const ordered1 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?sort=timestamp&sort=snr' });
+    const ordered2 = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?sort=snr&sort=timestamp' });
+    assert.notEqual(ordered1, ordered2);
 
     const emptyParam = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets?sender=' });
     const noParam = normalizeCacheKey({ method: 'GET', originalUrl: '/api/packets' });

@@ -109,7 +109,7 @@ test('Phase 4.1: buildAnalyticsBundle enforces bounded concurrency and distingui
     assert.equal(healed.fromCache, false);
     assert.equal(healed.partialFailure, false);
 
-    // Total failure with empty cache -> 502
+    // Total failure with empty cache -> 503
     const totalFail = await buildAnalyticsBundle({
         baseUrl: 'http://127.0.0.1:3000',
         range: '30d',
@@ -117,7 +117,7 @@ test('Phase 4.1: buildAnalyticsBundle enforces bounded concurrency and distingui
         cacheMap: {},
         now: 40000
     });
-    assert.equal(totalFail.status, 502);
+    assert.equal(totalFail.status, 503);
 });
 
 test('Phase 4.2: frontend/src/apiCache.ts bounds capacity, prunes expired entries, and ref-counts AbortSignal', async () => {

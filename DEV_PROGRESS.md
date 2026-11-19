@@ -4,6 +4,13 @@
 
 ---
 
+## 📌 4.0.3.2 Coverage 工作安全性、輸出一致性與分析可靠性更新
+- **跨程序鎖定與獨立監督 Runner (`src/utils/coverage-lock.js`, `src/utils/coverage-runner.js`, `src/utils/coverage-controller.js`)**：改用原子鎖定目錄 (`.coverage_bake.lockdir/owner.json`) 與獨立監督 Runner 維持 `heartbeatAt`，Server 異常終止時不會遺失鎖定保護；支援原子 Stale Lock 回收與 `ownerToken` 驗證釋放。
+- **Coverage Generation / Manifest 原子發布 (`src/utils/coverage-storage.js`, `rf-engine/bake.mjs`)**：每次烘焙產生唯一 `generationId`，於 `generations/<id>/` 驗證 PNG 簽章與 JSON `generationId` 一致後才原子替換 `current.json`，`/coverage/taiwan_coverage.{png,json}` 與 `/api/coverage/itm-info` 統一由 `resolveCurrentCoverage()` 解析。
+- **Status API 資訊隔離**：公開 `GET /api/coverage/status` 移除 `stdout`/`stderr`/路徑/Token；管理員診斷改至 `GET /api/coverage/diagnostics`（需 `requireCoverageAdmin` 且遮蔽敏感路徑）。
+- **Analytics Maximum Stale Age 與 Hop Analysis SQL 錯誤處理 (`src/utils/analytics-bundle.js`, `src/utils/hop-analysis.js`)**：區分 TTL (10m) 與最大 Stale Age (30m)，逾時回傳 `503` 且加上 `X-Bundle-Stale: 1`；`hop-analysis` 任一 SQL 錯誤皆回傳 `500`。
+- **API Cache 重複參數語意 (`src/utils/api-cache.js`)**：預設保留重複 Query Parameter 的原始順序（如 `sort`），僅對已確認之集合型參數 (`node_ids`) 排序。
+
 ## 📌 4.0.3.1 後端可靠性與 API 正確性更新摘要
 - **API Cache Key 完整規範化 (`src/utils/api-cache.js`)**：`normalizeCacheKey` 改為保留所有 Query Parameters（含 `sender`、`node_ids`、`timeStart`、`timeEnd`、`minSnr`、`minRssi` 與多值參數排序），消除不同篩選條件共用快取的污染問題。
 - **Coverage Rebuild 授權與單一執行控制 (`src/utils/coverage-controller.js`, `rf-engine/bake.mjs`)**：

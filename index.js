@@ -1334,33 +1334,52 @@ app.get('/api/traceroute/paths', withCache(30 * 1000), (req, res) => {
     });
 });
 
-// 📡 靜態服務：全島 ITM 電波覆蓋烘焙圖資
-app.use('/coverage', express.static(path.join(__dirname, 'public/coverage')));
+// 📡 靜態服務：全島 ITM 電波覆蓋烘焙圖資 (4.0.3.2: 透過 current.json Manifest 統一解析目前有效 Generation，確保 PNG/JSON 整組一致)
+const COVERAGE_BASE_DIR = path.join(__dirname, 'public/coverage');
+const { resolveCurrentCoverage } = require('./src/utils/coverage-storage');
+
+app.get('/coverage/taiwan_coverage.png', (req, res, next) => {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) return next();
+    if (resolved.generationId) res.setHeader('X-Coverage-Generation', resolved.generationId);
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.sendFile(resolved.pngPath);
+});
+
+app.get('/coverage/taiwan_coverage.json', (req, res, next) => {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) return next();
+    if (resolved.generationId) res.setHeader('X-Coverage-Generation', resolved.generationId);
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.json(resolved.metadata);
+});
+
+app.use('/coverage', express.static(COVERAGE_BASE_DIR));
 
 // 📡 API: 取得全台 3D 地形電波覆蓋圖 (ITM) 資訊
 app.get('/api/coverage/itm-info', (req, res) => {
-    const metaPath = path.join(__dirname, 'public/coverage/taiwan_coverage.json');
-    if (!fs.existsSync(metaPath)) {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) {
         return res.json({ available: false });
     }
-    try {
-        const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-        res.json({ available: true, ...data });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to read coverage metadata' });
-    }
+    return res.json({ available: true, ...resolved.metadata });
 });
 
 const { createRequireCoverageAdmin, CoverageJobController } = require('./src/utils/coverage-controller');
 const requireCoverageAdmin = createRequireCoverageAdmin();
 const coverageJobController = new CoverageJobController({
     bakeScriptPath: path.join(__dirname, 'rf-engine/bake.mjs'),
-    lockFilePath: path.join(__dirname, 'public/coverage/.coverage_bake.lock')
+    lockDirPath: path.join(COVERAGE_BASE_DIR, '.coverage_bake.lockdir')
 });
 
-// 📡 API: 取得全台覆蓋烘焙任務目前狀態
+// 📡 API: 取得全台覆蓋烘焙任務公開狀態 (4.0.3.2: 不公開 stdout/stderr/內部路徑)
 app.get('/api/coverage/status', (req, res) => {
     res.json(coverageJobController.getStatus());
+});
+
+// 📡 API: 管理員專屬診斷資訊 (需 Admin Authorization，且遮蔽敏感路徑)
+app.get('/api/coverage/diagnostics', requireCoverageAdmin, (req, res) => {
+    res.json(coverageJobController.getAdminDiagnostics());
 });
 
 // 📡 API: 手動觸發重新烘焙全台覆蓋圖 (需管理員授權 + 單一執行鎖保護)
@@ -2831,63 +2850,14 @@ app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
 // ==========================================
 // 📊 API 2.1: 跳數傳播深度分佈診斷 (Hop Analysis & 診斷)
 // ==========================================
+const { computeHopAnalysis } = require('./src/utils/hop-analysis');
+
 app.get('/api/analytics/hop-analysis', withCache(60 * 1000), (req, res) => {
-    const sqlActual = `
-        SELECT 
-            COALESCE(hops_away, (hop_start - hop_limit)) as hop,
-            COUNT(*) as count
-        FROM packet_logs
-        WHERE timestamp >= datetime('now', '-24 hours')
-          AND (hops_away IS NOT NULL OR (hop_start IS NOT NULL AND hop_limit IS NOT NULL))
-          AND COALESCE(hops_away, (hop_start - hop_limit)) >= 0
-        GROUP BY hop
-        ORDER BY hop ASC
-    `;
-
-    const sqlConfigured = `
-        SELECT 
-            hop_limit as hop,
-            COUNT(*) as count
-        FROM nodes
-        WHERE hop_limit IS NOT NULL AND hop_limit > 0
-          AND last_seen >= datetime('now', '-7 days')
-        GROUP BY hop_limit
-        ORDER BY hop_limit ASC
-    `;
-
-    db.all(sqlActual, [], (err, actualRows) => {
-        db.all(sqlConfigured, [], (cErr, configuredRows) => {
-            let actualTotal = 0, actualSum = 0;
-            (actualRows || []).forEach(r => {
-                actualTotal += r.count;
-                actualSum += r.hop * r.count;
-            });
-            const avgActualHops = actualTotal > 0 ? Math.round((actualSum / actualTotal) * 10) / 10 : 0;
-
-            let confTotal = 0, confSum = 0;
-            (configuredRows || []).forEach(r => {
-                confTotal += r.count;
-                confSum += r.hop * r.count;
-            });
-            const avgConfiguredHops = confTotal > 0 ? Math.round((confSum / confTotal) * 10) / 10 : 0;
-
-            const diff = Math.round((avgConfiguredHops - avgActualHops) * 10) / 10;
-            let recommendation = null;
-            if (avgConfiguredHops > 0 && avgActualHops > 0 && diff >= 1.2) {
-                recommendation = `💡 網路診斷提醒：全網封包實際傳播深度平均僅 ${avgActualHops} 跳，但節點預設的 Hop Limit 限額平均高達 ${avgConfiguredHops} 跳（相差 ${diff} 跳）。建議引導用戶將 Hop Limit 降低至 2~3，以大幅減少無謂重複廣播與頻道碰撞，有效節省 Mesh 頻寬！`;
-            } else {
-                recommendation = `✅ 網路診斷良好：封包實際跳轉數 (${avgActualHops} 跳) 與節點 Hop 限額設定 (${avgConfiguredHops} 跳) 匹配良好，頻寬利用順暢。`;
-            }
-
-            res.json({
-                actualHops: actualRows || [],
-                configuredHops: configuredRows || [],
-                avgActualHops,
-                avgConfiguredHops,
-                diff,
-                recommendation
-            });
-        });
+    computeHopAnalysis(db, (err, payload) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        return res.json(payload);
     });
 });
 
@@ -3727,18 +3697,25 @@ app.get('/api/analytics/bundle', async (req, res) => {
             concurrency: 4,
             cacheMap: bundleCacheMap,
             ttlMs: 10 * 60 * 1000,
-            partialTtlMs: 15 * 1000
+            partialTtlMs: 15 * 1000,
+            maxStaleAgeMs: 30 * 60 * 1000
         });
 
         if (result.status !== 200) {
             return res.status(result.status).json({
                 error: result.error,
+                staleExpired: Boolean(result.staleExpired),
+                staleAgeMs: result.staleAgeMs ?? null,
                 failedEndpoints: result.failedEndpoints
             });
         }
 
         if (result.partialFailure) {
             res.setHeader('X-Bundle-Partial', '1');
+        }
+        if (result.staleFallback) {
+            res.setHeader('X-Bundle-Stale', '1');
+            res.setHeader('X-Bundle-Stale-Age-Ms', String(result.staleAgeMs ?? 0));
         }
         return res.json(result.data);
     } catch (err) {

@@ -1,17 +1,14 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-
-/**
- * Constant-time token comparison using SHA-256 digests.
- */
-function safeTokenEqual(provided, expected) {
-    if (typeof provided !== 'string' || typeof expected !== 'string') return false;
-    const hashA = crypto.createHash('sha256').update(provided, 'utf8').digest();
-    const hashB = crypto.createHash('sha256').update(expected, 'utf8').digest();
-    return crypto.timingSafeEqual(hashA, hashB);
-}
+const {
+    safeTokenEqual,
+    acquireCoverageLock,
+    releaseCoverageLock,
+    evaluateLockState
+} = require('./coverage-lock');
 
 /**
  * Extract admin token from Authorization: Bearer <token> or X-Admin-Token header.
@@ -33,7 +30,7 @@ function extractAdminToken(req) {
 }
 
 /**
- * Express middleware enforcing real admin authorization for Coverage Rebuild.
+ * Express middleware enforcing real admin authorization for Coverage Rebuild & Diagnostics.
  * Default-deny: if no admin token is configured, returns 503 rather than allowing unauthenticated access.
  */
 function createRequireCoverageAdmin(getExpectedToken = () => process.env.COVERAGE_ADMIN_TOKEN || process.env.ADMIN_API_TOKEN || '') {
@@ -41,7 +38,7 @@ function createRequireCoverageAdmin(getExpectedToken = () => process.env.COVERAG
         const expected = String(getExpectedToken() || '').trim();
         if (!expected) {
             return res.status(503).json({
-                error: 'Coverage rebuild endpoint is disabled: admin token is not configured'
+                error: 'Coverage admin endpoint is disabled: admin token is not configured'
             });
         }
 
@@ -62,24 +59,38 @@ function createRequireCoverageAdmin(getExpectedToken = () => process.env.COVERAG
     };
 }
 
-function isPidAlive(pid) {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch (err) {
-        return err && err.code === 'EPERM';
-    }
+function redactPathsAndSecrets(text) {
+    if (!text) return '';
+    return String(text)
+        .replace(/[A-Za-z]:\\[^\s'"]+/g, '<REDACTED_PATH>')
+        .replace(/\/(?:Users|home|var|tmp|opt|srv|etc|app)[^\s'"]+/g, '<REDACTED_PATH>')
+        .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1<REDACTED>');
+}
+
+function toPublicJobSummary(job) {
+    if (!job) return null;
+    return {
+        jobId: job.jobId,
+        trigger: job.trigger,
+        limit: job.limit,
+        status: job.status,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt || null,
+        durationMs: job.durationMs ?? null
+    };
 }
 
 /**
- * Unified single-flight controller for manual and scheduled ITM coverage baking.
+ * Unified cross-process controller for manual and scheduled ITM coverage baking.
  */
 class CoverageJobController {
     constructor(options = {}) {
         this.bakeScriptPath = options.bakeScriptPath || path.join(__dirname, '../../rf-engine/bake.mjs');
-        this.lockFilePath = options.lockFilePath || path.join(__dirname, '../../public/coverage/.coverage_bake.lock');
+        this.runnerScriptPath = options.runnerScriptPath || path.join(__dirname, 'coverage-runner.js');
+        this.lockDirPath = options.lockDirPath || options.lockFilePath || path.join(__dirname, '../../public/coverage/.coverage_bake.lockdir');
         this.defaultTimeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 15 * 60 * 1000;
+        this.heartbeatMs = Number.isFinite(options.heartbeatMs) ? options.heartbeatMs : 1000;
+        this.heartbeatGraceMs = Number.isFinite(options.heartbeatGraceMs) ? options.heartbeatGraceMs : 15000;
         this.defaultLimit = Number.isFinite(options.defaultLimit) ? options.defaultLimit : 500;
         this.spawnFn = options.spawnFn || spawn;
         this.envOverrides = options.envOverrides || {};
@@ -87,66 +98,7 @@ class CoverageJobController {
         this.activeJob = null;
         this.activeChild = null;
         this.lastJob = null;
-    }
-
-    _acquireLock(jobMeta) {
-        const lockDir = path.dirname(this.lockFilePath);
-        if (!fs.existsSync(lockDir)) {
-            fs.mkdirSync(lockDir, { recursive: true });
-        }
-
-        const payload = JSON.stringify({
-            pid: process.pid,
-            jobId: jobMeta.jobId,
-            trigger: jobMeta.trigger,
-            startedAt: jobMeta.startedAt
-        });
-
-        try {
-            const fd = fs.openSync(this.lockFilePath, 'wx');
-            try {
-                fs.writeFileSync(fd, payload, 'utf8');
-            } finally {
-                fs.closeSync(fd);
-            }
-            return true;
-        } catch (err) {
-            if (err && err.code === 'EEXIST') {
-                // Check if lock is stale (dead process or expired past timeout + 60s)
-                try {
-                    const existing = JSON.parse(fs.readFileSync(this.lockFilePath, 'utf8'));
-                    const ageMs = Date.now() - Date.parse(existing.startedAt || 0);
-                    const staleByAge = Number.isFinite(ageMs) && ageMs > (this.defaultTimeoutMs + 60 * 1000);
-                    const staleByPid = existing.pid && existing.pid !== process.pid && !isPidAlive(existing.pid);
-                    if (staleByAge || staleByPid) {
-                        fs.unlinkSync(this.lockFilePath);
-                        const fd = fs.openSync(this.lockFilePath, 'wx');
-                        try {
-                            fs.writeFileSync(fd, payload, 'utf8');
-                        } finally {
-                            fs.closeSync(fd);
-                        }
-                        return true;
-                    }
-                } catch (_) {
-                    // Ignore parse/unlink races and treat lock as held
-                }
-                return false;
-            }
-            throw err;
-        }
-    }
-
-    _releaseLock(jobId) {
-        try {
-            if (!fs.existsSync(this.lockFilePath)) return;
-            const existing = JSON.parse(fs.readFileSync(this.lockFilePath, 'utf8'));
-            if (!existing.jobId || existing.jobId === jobId) {
-                fs.unlinkSync(this.lockFilePath);
-            }
-        } catch (_) {
-            try { fs.unlinkSync(this.lockFilePath); } catch (__) {}
-        }
+        this.lastDiagnostics = null;
     }
 
     _sanitizeLimit(rawLimit) {
@@ -160,19 +112,64 @@ class CoverageJobController {
         return parsed;
     }
 
+    /**
+     * Public status API payload — strictly excludes stdout, stderr, stack traces, paths, tokens, and PIDs.
+     */
     getStatus() {
+        const lockState = !this.activeJob ? evaluateLockState(this.lockDirPath, {
+            heartbeatGraceMs: this.heartbeatGraceMs
+        }) : { exists: false };
+
+        const externalRunning = Boolean(
+            !this.activeJob &&
+            lockState.exists &&
+            !lockState.reclaimable &&
+            ['active_heartbeat', 'active_process', 'initializing', 'server_starting_runner', 'locked_on_other_host'].includes(lockState.reason)
+        );
+
+        const running = Boolean(this.activeJob) || externalRunning;
+        const activeSummary = this.activeJob
+            ? toPublicJobSummary(this.activeJob)
+            : (externalRunning && lockState.meta ? {
+                jobId: lockState.meta.jobId,
+                trigger: lockState.meta.trigger,
+                limit: lockState.meta.limit ?? null,
+                status: 'running',
+                startedAt: lockState.meta.startedAt,
+                finishedAt: null,
+                durationMs: null
+            } : null);
+
+        const lastSummary = toPublicJobSummary(this.lastJob);
+        const topStatus = running
+            ? 'RUNNING'
+            : (lastSummary ? String(lastSummary.status || 'IDLE').toUpperCase() : 'IDLE');
+
         return {
-            running: Boolean(this.activeJob),
-            activeJob: this.activeJob ? { ...this.activeJob } : null,
-            lastJob: this.lastJob ? { ...this.lastJob } : null
+            running,
+            status: topStatus,
+            startedAt: activeSummary ? activeSummary.startedAt : (lastSummary ? lastSummary.startedAt : null),
+            finishedAt: activeSummary ? null : (lastSummary ? lastSummary.finishedAt : null),
+            durationMs: activeSummary ? null : (lastSummary ? lastSummary.durationMs : null),
+            activeJob: activeSummary,
+            lastJob: lastSummary
         };
     }
 
     /**
-     * Start a coverage bake job if none is currently running.
-     * Returns `{ started: true, job, completion }` or `{ started: false, reason, activeJob }`.
+     * Admin-only diagnostics with redacted paths/secrets.
      */
-    startBake({ trigger = 'manual', limit, timeoutMs } = {}) {
+    getAdminDiagnostics() {
+        return {
+            publicStatus: this.getStatus(),
+            lastDiagnostics: this.lastDiagnostics ? { ...this.lastDiagnostics } : null
+        };
+    }
+
+    /**
+     * Start a coverage bake job via supervised detached runner if lock can be atomically acquired.
+     */
+    startBake({ trigger = 'manual', limit, timeoutMs, heartbeatMs } = {}) {
         const safeLimit = this._sanitizeLimit(limit);
         if (safeLimit === null) {
             return {
@@ -186,40 +183,70 @@ class CoverageJobController {
             return {
                 started: false,
                 reason: 'already_running',
-                activeJob: { ...this.activeJob }
+                activeJob: toPublicJobSummary(this.activeJob)
             };
         }
 
         const jobId = `bake-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+        const ownerToken = crypto.randomBytes(24).toString('hex');
+        const effectiveTimeout = Number.isFinite(timeoutMs) ? timeoutMs : this.defaultTimeoutMs;
+        const effectiveHeartbeat = Number.isFinite(heartbeatMs) ? heartbeatMs : this.heartbeatMs;
+        const nowIso = new Date().toISOString();
+
+        const initialLockMeta = {
+            jobId,
+            ownerToken,
+            hostname: os.hostname(),
+            serverPid: process.pid,
+            runnerPid: null,
+            bakePid: null,
+            trigger,
+            limit: safeLimit,
+            state: 'acquiring',
+            createdAt: nowIso,
+            startedAt: nowIso,
+            heartbeatAt: nowIso,
+            maxDurationMs: effectiveTimeout
+        };
+
+        const lockResult = acquireCoverageLock(this.lockDirPath, initialLockMeta, {
+            heartbeatGraceMs: this.heartbeatGraceMs
+        });
+
+        if (!lockResult.acquired) {
+            return {
+                started: false,
+                reason: lockResult.reason || 'already_running',
+                activeJob: lockResult.activeJob || null
+            };
+        }
+
         const job = {
             jobId,
             trigger,
             limit: safeLimit,
             status: 'running',
-            startedAt: new Date().toISOString(),
+            startedAt: nowIso,
             finishedAt: null,
-            durationMs: null,
-            exitCode: null,
-            signal: null,
-            error: null
+            durationMs: null
         };
 
-        if (!this._acquireLock(job)) {
-            return {
-                started: false,
-                reason: 'locked_by_other_process',
-                activeJob: this.activeJob ? { ...this.activeJob } : null
-            };
-        }
-
         this.activeJob = job;
-        const effectiveTimeout = Number.isFinite(timeoutMs) ? timeoutMs : this.defaultTimeoutMs;
         const startMs = Date.now();
+
+        const runnerConfig = JSON.stringify({
+            lockDirPath: this.lockDirPath,
+            jobId,
+            ownerToken,
+            bakeScriptPath: this.bakeScriptPath,
+            limit: safeLimit,
+            timeoutMs: effectiveTimeout,
+            heartbeatMs: effectiveHeartbeat
+        });
 
         const completion = new Promise((resolve) => {
             let stdoutTail = '';
             let stderrTail = '';
-            let timedOut = false;
             let settled = false;
 
             const appendTail = (prev, chunk) => {
@@ -229,25 +256,32 @@ class CoverageJobController {
 
             let child;
             try {
-                child = this.spawnFn(process.execPath, [this.bakeScriptPath, String(safeLimit)], {
+                child = this.spawnFn(process.execPath, [this.runnerScriptPath], {
                     shell: false,
-                    stdio: ['ignore', 'pipe', 'pipe'],
+                    detached: true,
+                    stdio: ['ignore', 'ignore', 'ignore'],
                     windowsHide: true,
                     env: {
                         ...process.env,
-                        ...this.envOverrides
+                        ...this.envOverrides,
+                        COVERAGE_RUNNER_CONFIG: runnerConfig
                     }
                 });
             } catch (spawnErr) {
                 job.status = 'failed';
                 job.finishedAt = new Date().toISOString();
                 job.durationMs = Date.now() - startMs;
-                job.error = spawnErr.message;
                 this.lastJob = { ...job };
+                this.lastDiagnostics = {
+                    jobId,
+                    status: 'failed',
+                    exitCode: null,
+                    error: redactPathsAndSecrets(spawnErr.message)
+                };
                 this.activeJob = null;
                 this.activeChild = null;
-                this._releaseLock(jobId);
-                return resolve({ ...job, stdoutTail, stderrTail });
+                releaseCoverageLock(this.lockDirPath, jobId, ownerToken);
+                return resolve({ ...job, exitCode: null, error: spawnErr.message });
             }
 
             this.activeChild = child;
@@ -263,66 +297,55 @@ class CoverageJobController {
                 });
             }
 
-            let killGraceTimer = null;
-            const timeoutTimer = setTimeout(() => {
-                timedOut = true;
-                try {
-                    child.kill('SIGTERM');
-                } catch (_) {}
-                killGraceTimer = setTimeout(() => {
-                    try {
-                        child.kill('SIGKILL');
-                    } catch (_) {}
-                }, 1500);
-                if (typeof killGraceTimer.unref === 'function') killGraceTimer.unref();
-            }, effectiveTimeout);
-            if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
-
             const finalize = (code, signal, errMsg = null) => {
                 if (settled) return;
                 settled = true;
-                clearTimeout(timeoutTimer);
-                if (killGraceTimer) clearTimeout(killGraceTimer);
 
                 job.finishedAt = new Date().toISOString();
                 job.durationMs = Date.now() - startMs;
-                job.exitCode = code;
-                job.signal = signal || null;
 
-                if (timedOut) {
-                    job.status = 'timed_out';
-                    job.error = `Coverage bake timed out after ${effectiveTimeout}ms`;
-                } else if (errMsg) {
+                if (errMsg) {
                     job.status = 'failed';
-                    job.error = errMsg;
+                } else if (code === 124) {
+                    job.status = 'timed_out';
                 } else if (code === 0) {
                     job.status = 'completed';
-                    job.error = null;
                 } else {
                     job.status = 'failed';
-                    job.error = stderrTail.trim() || `Process exited with code ${code}`;
                 }
 
-                this.lastJob = { ...job, stdoutTail, stderrTail };
+                this.lastJob = { ...job };
+                this.lastDiagnostics = {
+                    jobId,
+                    status: job.status,
+                    exitCode: code,
+                    signal: signal || null,
+                    error: errMsg ? redactPathsAndSecrets(errMsg) : (code !== 0 ? redactPathsAndSecrets(stderrTail.trim() || `Exited with code ${code}`) : null),
+                    stdoutTail: redactPathsAndSecrets(stdoutTail),
+                    stderrTail: redactPathsAndSecrets(stderrTail)
+                };
                 this.activeJob = null;
                 this.activeChild = null;
-                this._releaseLock(jobId);
 
-                resolve({ ...job, stdoutTail, stderrTail });
+                // Runner normally releases lock; ensure release if runner crashed before releasing
+                releaseCoverageLock(this.lockDirPath, jobId, ownerToken);
+
+                resolve({
+                    ...job,
+                    exitCode: code,
+                    signal: signal || null,
+                    error: this.lastDiagnostics.error
+                });
             };
 
-            child.on('error', (err) => {
-                finalize(null, null, err.message);
-            });
-
-            child.on('close', (code, signal) => {
-                finalize(code, signal);
-            });
+            child.on('error', (err) => finalize(null, null, err.message));
+            child.on('close', (code, signal) => finalize(code, signal));
         });
 
         return {
             started: true,
-            job: { ...job },
+            recoveredStaleLock: lockResult.recovered,
+            job: toPublicJobSummary(job),
             completion
         };
     }
@@ -332,6 +355,6 @@ module.exports = {
     safeTokenEqual,
     extractAdminToken,
     createRequireCoverageAdmin,
-    CoverageJobController
+    CoverageJobController,
+    redactPathsAndSecrets
 };
-

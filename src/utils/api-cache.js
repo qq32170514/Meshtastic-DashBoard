@@ -63,16 +63,20 @@ class BoundedLRUCache {
     }
 }
 
+const DEFAULT_UNORDERED_SET_PARAMS = new Set(['node_ids']);
+
 /**
  * Normalize an Express request into a canonical cache key:
- * `<METHOD>:<normalizedPath>?<sortedQuery>`
+ * `<METHOD>:<normalizedPath>?<canonicalQuery>`
  *
- * Preserves ALL query parameters (including multi-value keys, unknown params,
- * URL-encoded values, and empty values) so distinct filters never collide.
+ * Preserves ALL query parameters and preserves repeated-parameter value order
+ * by default (e.g. `?sort=timestamp&sort=snr` !== `?sort=snr&sort=timestamp`),
+ * only sorting values for explicitly confirmed set-type parameters.
  */
-function normalizeCacheKey(req) {
+function normalizeCacheKey(req, options = {}) {
     const method = String((req && req.method) || 'GET').toUpperCase();
     const rawUrl = (req && (req.originalUrl || req.url)) || '/';
+    const unorderedSetParams = options.unorderedSetParams || DEFAULT_UNORDERED_SET_PARAMS;
 
     let url;
     try {
@@ -98,8 +102,9 @@ function normalizeCacheKey(req) {
     const canonicalParams = new URLSearchParams();
     const sortedKeys = Array.from(grouped.keys()).sort();
     for (const key of sortedKeys) {
-        const sortedValues = grouped.get(key).slice().sort();
-        for (const val of sortedValues) {
+        const rawValues = grouped.get(key);
+        const finalValues = unorderedSetParams.has(key) ? rawValues.slice().sort() : rawValues;
+        for (const val of finalValues) {
             canonicalParams.append(key, val);
         }
     }
