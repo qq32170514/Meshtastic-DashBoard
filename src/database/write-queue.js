@@ -1,0 +1,867 @@
+// src/database/write-queue.js
+const crypto = require('crypto');
+const { queue: defaultQueueConfig } = require('./sqlite.config');
+const { classifyError, calculateBackoffDelay, ERROR_TYPES } = require('./retry-policy');
+const { ADAPTER_STATES } = require('./sqlite.adapter');
+
+const QUEUE_STATES = {
+    NORMAL: 'NORMAL',
+    PAUSED_DISK_FULL: 'PAUSED_DISK_FULL',
+    PAUSED_ERROR: 'PAUSED_ERROR',
+    CLOSING: 'CLOSING',
+    CLOSED: 'CLOSED'
+};
+
+const ITEM_STATUS = {
+    QUEUED: 'QUEUED',
+    IN_FLIGHT: 'IN_FLIGHT',
+    RETRY_PENDING: 'RETRY_PENDING',
+    COMMITTED: 'COMMITTED',
+    QUARANTINED: 'QUARANTINED',
+    UNCOMMITTED_ERROR: 'UNCOMMITTED_ERROR'
+};
+
+const ALLOWED_ITEM_TRANSITIONS = {
+    [ITEM_STATUS.QUEUED]: [ITEM_STATUS.IN_FLIGHT, ITEM_STATUS.RETRY_PENDING, ITEM_STATUS.UNCOMMITTED_ERROR],
+    [ITEM_STATUS.IN_FLIGHT]: [ITEM_STATUS.COMMITTED, ITEM_STATUS.RETRY_PENDING, ITEM_STATUS.QUEUED, ITEM_STATUS.QUARANTINED, ITEM_STATUS.UNCOMMITTED_ERROR],
+    [ITEM_STATUS.RETRY_PENDING]: [ITEM_STATUS.QUEUED, ITEM_STATUS.UNCOMMITTED_ERROR],
+    [ITEM_STATUS.COMMITTED]: [],
+    [ITEM_STATUS.QUARANTINED]: [],
+    [ITEM_STATUS.UNCOMMITTED_ERROR]: []
+};
+
+class WriteQueue {
+    #inFlightItems = new Set();
+    #config;
+    #adapter;
+    #itemSeq = 0;
+    #currentFlushPromise = null;
+    #retryTimers = new Set();
+
+    constructor(adapter, config = {}) {
+        if (!adapter) {
+            throw new Error('[WRITE_QUEUE_INIT_ERROR] adapter 參數為必填');
+        }
+        this.#adapter = adapter;
+
+        const maxCapacity = config.maxCapacity || config.maxQueueSize || defaultQueueConfig.maxCapacity || 5000;
+        const batchSize = config.batchChunkSize || config.batchSize || defaultQueueConfig.batchChunkSize || 50;
+        const maxRetries = config.maxRetryAttempts || config.maxRetries || defaultQueueConfig.maxRetryAttempts || 5;
+
+        this.#config = {
+            ...defaultQueueConfig,
+            ...config,
+            batchSize,
+            maxQueueSize: maxCapacity,
+            maxRetries,
+            flushIntervalMs: config.flushIntervalMs || defaultQueueConfig.flushIntervalMs || 1000,
+            retryBaseDelayMs: config.retryBaseDelayMs || defaultQueueConfig.retryBaseDelayMs || 200,
+            retryMaxDelayMs: config.retryMaxDelayMs || defaultQueueConfig.retryMaxDelayMs || 5000
+        };
+
+        this.state = QUEUE_STATES.NORMAL;
+        this.queue = [];                      // QUEUED 容器
+        this.retryPendingItems = new Set();   // RETRY_PENDING 容器 (P0-2)
+        this.quarantinedItems = [];           // QUARANTINED 容器 (P0-4)
+        this.uncommittedErrors = [];          // UNCOMMITTED_ERROR 容器 (P0-4)
+
+        this.flushTimer = null;
+        this.isFlushing = false;
+        this.isDraining = false;
+        this.lastError = null;
+        this._shutdownGateClosed = false;
+
+        // Invariants & Accounting (P0-4)
+        this.totalAccepted = 0;
+        this.totalCommitted = 0;
+        this.totalRejected = 0;
+        this.totalQuarantined = 0;
+        this.totalUncommittedErrors = 0;
+
+        // P0-5: 註冊 Adapter 致命錯誤通知
+        if (typeof this.#adapter.onFatalError === 'function') {
+            this.#adapter.onFatalError((err) => this.handleAdapterFatalError(err));
+        }
+    }
+
+    get inFlightCount() {
+        return this.#inFlightItems.size;
+    }
+
+    get retryPendingCount() {
+        return this.retryPendingItems.size;
+    }
+
+    /**
+     * 🌟 唯讀查詢 Flush / Drain Worker 是否正在活動執行中 (v2.7.5 P1)
+     */
+    isFlushWorkerActive() {
+        return Boolean(this.isFlushing || this.isDraining || this.#currentFlushPromise !== null);
+    }
+
+    getMetrics() {
+        const queuedCount = this.queue.length;
+        const inFlightCount = this.#inFlightItems.size;
+        const retryPendingCount = this.retryPendingItems.size;
+        const uncommittedErrorCount = this.uncommittedErrors.length;
+        const totalPending = queuedCount + retryPendingCount + inFlightCount;
+        const totalUncommitted = totalPending + uncommittedErrorCount;
+        const flushWorkerActive = this.isFlushWorkerActive();
+
+        const totalTrackedAccepted = (
+            this.totalCommitted +
+            totalPending +
+            this.totalQuarantined +
+            uncommittedErrorCount
+        );
+
+        return {
+            state: this.state,
+            queuedCount,
+            retryPendingCount,
+            inFlightCount,
+            uncommittedErrorCount,
+            totalPending,
+            totalUncommitted,
+            flushWorkerActive,
+            totalAccepted: this.totalAccepted,
+            totalCommitted: this.totalCommitted,
+            totalRejected: this.totalRejected,
+            totalQuarantined: this.totalQuarantined,
+            totalUncommittedErrors: uncommittedErrorCount,
+            totalAbandoned: this.totalQuarantined + uncommittedErrorCount, // 向後相容指標
+            conservationCheck: (this.totalAccepted === totalTrackedAccepted),
+            shutdownGateClosed: this._shutdownGateClosed
+        };
+    }
+
+    /**
+     * 🌟 清除所有待處理之退避重試定時器 (P0-1)
+     */
+    _clearAllRetryTimers() {
+        for (const timerId of this.#retryTimers) {
+            clearTimeout(timerId);
+        }
+        this.#retryTimers.clear();
+    }
+
+    /**
+     * 🌟 安全呼叫入列拒絕回呼 (P1-1: 隔離回呼拋出之異常，保證 Exactly-Once 且不破壞佇列)
+     */
+    _safeRejectCallback(callback, err) {
+        if (typeof callback !== 'function') return;
+        try {
+            callback(err);
+        } catch (cbErr) {
+            console.error('❌ [ENQUEUE_CALLBACK_EXCEPTION] 入列拒絕回呼拋出異常:', cbErr.message);
+        }
+    }
+
+    /**
+     * 🌟 集中式 Callback Exactly-Once 防重調用 (P1-02)
+     */
+    _invokeCallback(item, err, result = null) {
+        if (!item || typeof item.callback !== 'function') return;
+        if (item.callbackInvoked) {
+            console.warn(`⚠️ [CALLBACK_DUPLICATE_SUPPRESSED] 項目 ${item.id} 已執行過回呼，忽略重複調用`);
+            return;
+        }
+        item.callbackInvoked = true;
+        try {
+            item.callback.call(result || {}, err, result);
+        } catch (cbErr) {
+            console.error(`❌ [CALLBACK_EXCEPTION] 使用者回呼拋出異常 (item ${item.id}):`, cbErr.message);
+        }
+    }
+
+    /**
+     * 🌟 原子單一狀態轉換與互斥容器管理 (P0-2, P0-4)
+     */
+    _transitionItem(item, nextStatus, error = null) {
+        if (item.status === nextStatus) return true;
+
+        const allowed = ALLOWED_ITEM_TRANSITIONS[item.status] || [];
+        if (!allowed.includes(nextStatus)) {
+            console.error(`🚨 [ITEM_STATE_VIOLATION] 無法從 ${item.status} 轉移至 ${nextStatus} (item ${item.id})`);
+            return false;
+        }
+
+        const prevStatus = item.status;
+
+        // 1. 從原容器移除 (保證互斥)
+        if (prevStatus === ITEM_STATUS.QUEUED) {
+            const idx = this.queue.indexOf(item);
+            if (idx !== -1) this.queue.splice(idx, 1);
+        } else if (prevStatus === ITEM_STATUS.IN_FLIGHT) {
+            this.#inFlightItems.delete(item);
+        } else if (prevStatus === ITEM_STATUS.RETRY_PENDING) {
+            this.retryPendingItems.delete(item);
+        }
+
+        // 2. 更新狀態與錯誤
+        item.status = nextStatus;
+        if (error) item.lastError = error;
+
+        // 3. 加入新容器與累加計數
+        if (nextStatus === ITEM_STATUS.QUEUED) {
+            // 注意：入列位置由調用端決定（如 push 或 prepend）
+        } else if (nextStatus === ITEM_STATUS.IN_FLIGHT) {
+            this.#inFlightItems.add(item);
+        } else if (nextStatus === ITEM_STATUS.RETRY_PENDING) {
+            this.retryPendingItems.add(item);
+        } else if (nextStatus === ITEM_STATUS.COMMITTED) {
+            this.totalCommitted++;
+        } else if (nextStatus === ITEM_STATUS.QUARANTINED) {
+            this.totalQuarantined++;
+            this.quarantinedItems.push({
+                id: item.id,
+                sql: item.sql,
+                transactionLabel: item.transactionLabel || item.sql || null,
+                params: item.params,
+                isTransactionUnit: Boolean(item.isTransactionUnit),
+                statements: item.statements || null,
+                packetMeta: item.packetMeta || null,
+                errorType: (error && error.errorType) || ERROR_TYPES.DATA_CONSTRAINT,
+                failedStatementIndex: error && typeof error.failedStatementIndex === 'number' ? error.failedStatementIndex : null,
+                failedStatementSql: error && error.failedStatementSql ? error.failedStatementSql : null,
+                attempt: item.attempt,
+                error: error ? error.message : 'QUARANTINED',
+                timestamp: Date.now()
+            });
+        } else if (nextStatus === ITEM_STATUS.UNCOMMITTED_ERROR) {
+            this.totalUncommittedErrors++;
+            this.uncommittedErrors.push({
+                id: item.id,
+                sql: item.sql,
+                transactionLabel: (error && error.transactionLabel) || item.transactionLabel || item.sql || null,
+                params: item.params,
+                isTransactionUnit: Boolean(item.isTransactionUnit),
+                statements: item.statements || null,
+                packetMeta: item.packetMeta || null,
+                errorType: (error && error.errorType) || (error ? classifyError(error) : ERROR_TYPES.UNKNOWN),
+                failedStatementIndex: error && typeof error.failedStatementIndex === 'number' ? error.failedStatementIndex : null,
+                failedStatementSql: error && error.failedStatementSql ? error.failedStatementSql : null,
+                seq: item.seq,
+                attempt: item.attempt,
+                error: error ? error.message : 'UNCOMMITTED_ERROR',
+                timestamp: Date.now()
+            });
+        }
+
+        return true;
+    }
+
+    /**
+     * P0-5: Adapter 發生致命錯誤時的集中處理
+     */
+    handleAdapterFatalError(err) {
+        this.state = QUEUE_STATES.PAUSED_ERROR;
+        this.lastError = err;
+        this._shutdownGateClosed = true;
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+    }
+
+    /**
+     * 寫入請求入列 (支援單筆 SQL 或 4.0.2 不可拆分之多語句封包交易單位 statements)
+     */
+    enqueue(sqlOrItem, paramsOrCb, maybeCb) {
+        let sql;
+        let params = [];
+        let callback = null;
+        let isTransactionUnit = false;
+        let statements = null;
+        let packetMeta = null;
+
+        if (typeof sqlOrItem === 'object' && sqlOrItem !== null && Array.isArray(sqlOrItem.statements)) {
+            callback = sqlOrItem.callback || (typeof paramsOrCb === 'function' ? paramsOrCb : (typeof maybeCb === 'function' ? maybeCb : null));
+            const rawStatements = sqlOrItem.statements;
+            if (
+                rawStatements.length === 0 ||
+                !rawStatements.every((s) => s && typeof s.sql === 'string' && s.sql.trim().length > 0)
+            ) {
+                this.totalRejected++;
+                const err = new Error('[INVALID_PACKET_TRANSACTION] statements 必須為非空陣列，且每筆皆須包含有效 SQL 字串');
+                this._safeRejectCallback(callback, err);
+                return false;
+            }
+            isTransactionUnit = true;
+            statements = rawStatements.map((s) => ({
+                sql: s.sql,
+                params: Array.isArray(s.params) ? s.params : []
+            }));
+            sql = typeof sqlOrItem.label === 'string' && sqlOrItem.label.trim().length > 0
+                ? sqlOrItem.label.trim()
+                : `[PACKET_TX:${statements.length}] ${statements[0].sql.trim()}`;
+            params = statements[0].params;
+            packetMeta = sqlOrItem.packetMeta || null;
+        } else if (typeof sqlOrItem === 'object' && sqlOrItem !== null && typeof sqlOrItem.sql === 'string') {
+            sql = sqlOrItem.sql;
+            params = sqlOrItem.params || [];
+            callback = sqlOrItem.callback || (typeof paramsOrCb === 'function' ? paramsOrCb : null);
+        } else {
+            sql = sqlOrItem;
+            if (typeof paramsOrCb === 'function') {
+                callback = paramsOrCb;
+            } else {
+                params = Array.isArray(paramsOrCb) ? paramsOrCb : [];
+                if (typeof maybeCb === 'function') callback = maybeCb;
+            }
+        }
+
+        // 檢查 Adapter 與 Queue 狀態 (P1-1: 包含 PAUSED_DISK_FULL)
+        const adapterStatus = typeof this.#adapter.getActiveStatus === 'function' ? this.#adapter.getActiveStatus() : null;
+        if (
+            this._shutdownGateClosed ||
+            (adapterStatus && !adapterStatus.acceptingNewTasks) ||
+            this.state === QUEUE_STATES.PAUSED_DISK_FULL ||
+            this.state === QUEUE_STATES.PAUSED_ERROR ||
+            this.state === QUEUE_STATES.CLOSED ||
+            this.#adapter.state === ADAPTER_STATES.ERROR ||
+            this.#adapter.state === ADAPTER_STATES.CLOSED
+        ) {
+            this.totalRejected++;
+            const reason = this.state === QUEUE_STATES.PAUSED_DISK_FULL ? '磁碟滿額暫停' : '錯誤或關閉狀態';
+            const err = new Error(`[QUEUE_REJECTED] 資料庫或寫入隊列處於${reason} (queue: ${this.state}, adapter: ${this.#adapter.state})`);
+            this._safeRejectCallback(callback, err);
+            return false;
+        }
+
+        if (this.state === QUEUE_STATES.CLOSING) {
+            this.totalRejected++;
+            const err = new Error('[QUEUE_REJECTED] 系統關閉中，拒絕新寫入');
+            this._safeRejectCallback(callback, err);
+            return false;
+        }
+
+        // 背壓檢查 (Backpressure)
+        if (this.queue.length + this.retryPendingItems.size >= this.#config.maxQueueSize) {
+            this.totalRejected++;
+            const err = new Error(`[BACKPRESSURE_REJECTED] 隊列已達上限 (${this.#config.maxQueueSize})，寫入拒絕`);
+            this._safeRejectCallback(callback, err);
+            return false;
+        }
+
+        const item = {
+            id: crypto.randomUUID(),
+            seq: ++this.#itemSeq,
+            sql,
+            params,
+            isTransactionUnit,
+            statements,
+            packetMeta,
+            callback,
+            callbackInvoked: false,
+            status: ITEM_STATUS.QUEUED,
+            attempt: 0,
+            enqueuedAt: Date.now()
+        };
+
+        this.totalAccepted++;
+        this.queue.push(item);
+
+        this._checkTriggerFlush();
+        return true;
+    }
+
+    /**
+     * 🌟 4.0.2 Packet Transaction Boundary: 將同一個邏輯封包的多筆 SQL 作為單一不可拆分交易單位入列
+     */
+    enqueuePacketTransaction(statements, callback = null, options = {}) {
+        return this.enqueue({
+            statements,
+            callback,
+            label: options && options.label ? options.label : undefined,
+            packetMeta: options && options.packetMeta ? options.packetMeta : undefined
+        });
+    }
+
+    _checkTriggerFlush() {
+        if (this._shutdownGateClosed) return;
+        if (this.state !== QUEUE_STATES.NORMAL && this.state !== QUEUE_STATES.CLOSING) {
+            return;
+        }
+
+        if (this.queue.length >= this.#config.batchSize) {
+            if (this.flushTimer) {
+                clearTimeout(this.flushTimer);
+                this.flushTimer = null;
+            }
+            this.flush();
+        } else if (!this.flushTimer && this.queue.length > 0) {
+            this.flushTimer = setTimeout(() => {
+                this.flushTimer = null;
+                this.flush();
+            }, this.#config.flushIntervalMs);
+        }
+    }
+
+    /**
+     * 🌟 保持批次內相對順序，一次性原子退回隊列頭部 (P0-1 FIFO Preservation)
+     */
+    _requeueRemainingBatchAtHead(batch) {
+        if (!batch || batch.length === 0) return;
+        // 嚴格依原始 seq 順序排序
+        const sorted = [...batch].sort((a, b) => a.seq - b.seq);
+        for (const item of sorted) {
+            this._transitionItem(item, ITEM_STATUS.QUEUED);
+        }
+        this.queue = [...sorted, ...this.queue];
+    }
+
+    /**
+     * 將項目排入重試等待隊列 (單一歸屬原則：不在 queue 中，只在 retryPendingItems) (P0-1)
+     */
+    _scheduleRetry(batch, delayMs, deadlineAt = null) {
+        const retryAt = Date.now() + delayMs;
+        for (const item of batch) {
+            item.attempt++;
+            item.retryAt = retryAt;
+        }
+
+        // P0-1, P0-3: 檢查剩餘排空期限預算
+        if (deadlineAt && (Date.now() + delayMs > deadlineAt)) {
+            console.warn(`⚠️ [RETRY_BUDGET_EXCEEDED] 退避延遲 (${delayMs}ms) 超過剩餘排空期限預算，轉為 UNCOMMITTED_ERROR`);
+            for (const item of batch) {
+                this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED]'));
+                this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 停機期限內無法容納重試延遲'));
+            }
+            return;
+        }
+
+        for (const item of batch) {
+            this._transitionItem(item, ITEM_STATUS.RETRY_PENDING);
+        }
+
+        let timerId = null;
+        timerId = setTimeout(() => {
+            this.#retryTimers.delete(timerId);
+            if (this.state === QUEUE_STATES.CLOSED || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                return;
+            }
+            // 從 retryPendingItems 轉移回 queue (僅提升到達重試時間之項目)
+            const toRequeue = [];
+            for (const item of batch) {
+                if (this.retryPendingItems.has(item) && Date.now() >= (item.retryAt || 0)) {
+                    toRequeue.push(item);
+                }
+            }
+            if (toRequeue.length > 0) {
+                this._requeueRemainingBatchAtHead(toRequeue);
+                this._checkTriggerFlush();
+            }
+        }, delayMs);
+        this.#retryTimers.add(timerId);
+    }
+
+    /**
+     * 觸發隊列 Flush
+     */
+    async flush(capability = null, deadlineAt = null) {
+        while (this.#currentFlushPromise) {
+            await this.#currentFlushPromise;
+        }
+
+        if (this.queue.length === 0 && this.retryPendingItems.size === 0) return;
+        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+            return;
+        }
+
+        this.isFlushing = true;
+        const flushPromise = (async () => {
+            try {
+                while (this.queue.length > 0) {
+                    if (this._shutdownGateClosed && !capability) break;
+                    if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                        break;
+                    }
+
+                    const batch = this.queue.splice(0, this.#config.batchSize);
+                    for (const item of batch) {
+                        this._transitionItem(item, ITEM_STATUS.IN_FLIGHT);
+                    }
+
+                    try {
+                        await this._executeTopLevelBatch(batch, capability, deadlineAt);
+                    } catch (batchErr) {
+                        break;
+                    }
+                }
+            } finally {
+                this.isFlushing = false;
+                this.#currentFlushPromise = null;
+            }
+        })();
+
+        this.#currentFlushPromise = flushPromise;
+        await flushPromise;
+    }
+
+    /**
+     * 🌟 最外層統一管理批次執行與集中式剩餘資料回退 (P0-1)
+     */
+    async _executeTopLevelBatch(batch, capability = null, deadlineAt = null) {
+        try {
+            await this._commitOrIsolate(batch, capability, deadlineAt);
+        } catch (err) {
+            // 找出此批次中「尚未提交且尚未隔離」的所有剩餘資料
+            const remaining = batch.filter(item => (
+                item.status !== ITEM_STATUS.COMMITTED &&
+                item.status !== ITEM_STATUS.QUARANTINED &&
+                item.status !== ITEM_STATUS.UNCOMMITTED_ERROR
+            ));
+
+            const errType = classifyError(err);
+            if (err && typeof err === 'object' && !err.errorType) {
+                err.errorType = errType;
+            }
+
+            if (errType === ERROR_TYPES.DISK_FULL) {
+                this.state = QUEUE_STATES.PAUSED_DISK_FULL;
+                if (this.flushTimer) {
+                    clearTimeout(this.flushTimer);
+                    this.flushTimer = null;
+                }
+                this._requeueRemainingBatchAtHead(remaining);
+                throw err;
+            } else if (err.message && err.message.includes('DEADLINE_EXPIRED')) {
+                // P0-2: Deadline 到期，剩餘尚未提交的子批次按原始 seq 完整原子退回隊列頭部
+                this._requeueRemainingBatchAtHead(remaining);
+                throw err;
+            } else if (errType === ERROR_TYPES.FATAL_CORRUPT || errType === ERROR_TYPES.ROLLBACK_FAILURE || errType === ERROR_TYPES.UNKNOWN) {
+                // P1-01: UNKNOWN 與致命損毀立即熔斷並保留所有未提資料（絕不可誤送入 Binary Isolation）
+                this.handleAdapterFatalError(err);
+                for (const item of remaining) {
+                    this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, err);
+                    this._invokeCallback(item, err);
+                }
+                throw err;
+            } else if (errType === ERROR_TYPES.RETRYABLE_BUSY || errType === ERROR_TYPES.IOERR_TRANSIENT) {
+                const maxAttempt = Math.max(...remaining.map(i => i.attempt));
+                if (maxAttempt >= this.#config.maxRetries) {
+                    for (const item of remaining) {
+                        this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, err);
+                        this._invokeCallback(item, new Error(`[ABANDONED_MAX_RETRIES] ${err.message}`));
+                    }
+                    return;
+                }
+                const delayMs = calculateBackoffDelay(maxAttempt + 1, this.#config.retryBaseDelayMs, this.#config.retryMaxDelayMs);
+                this._scheduleRetry(remaining, delayMs, deadlineAt);
+            } else {
+                for (const item of remaining) {
+                    this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, err);
+                    this._invokeCallback(item, err);
+                }
+            }
+        }
+    }
+
+    async _commitOrIsolate(batch, capability = null, deadlineAt = null) {
+        if (!batch || batch.length === 0) return;
+
+        // P0-2: 統一交易准入檢查 (Admission Check)
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限 (${deadlineAt}) 已到達，禁止啟動新交易`);
+        }
+        if (this._shutdownGateClosed && !capability) {
+            throw new Error('[GATE_CLOSED] 停機閘門已關閉，禁止啟動非 Drain 交易');
+        }
+        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+            throw new Error(`[QUEUE_PAUSED] 寫入隊列處於暫停狀態 (${this.state})，禁止啟動新交易`);
+        }
+
+        const isDrain = Boolean(capability);
+        const executeFn = (txFn) => {
+            return isDrain
+                ? this.#adapter.drainTransaction(txFn, capability)
+                : this.#adapter.transaction(txFn);
+        };
+
+        try {
+            const executionResults = new Map();
+            await executeFn(async (tx) => {
+                for (const item of batch) {
+                    if (item.isTransactionUnit && Array.isArray(item.statements)) {
+                        const statementResults = [];
+                        let lastID = undefined;
+                        let totalChanges = 0;
+                        for (let stepIdx = 0; stepIdx < item.statements.length; stepIdx++) {
+                            const stmt = item.statements[stepIdx];
+                            try {
+                                const res = await tx.execute(stmt.sql, stmt.params);
+                                statementResults.push(res);
+                                if (res && res.lastID !== undefined) {
+                                    lastID = res.lastID;
+                                }
+                                if (res && typeof res.changes === 'number') {
+                                    totalChanges += res.changes;
+                                }
+                            } catch (stmtErr) {
+                                stmtErr.fromPacketTransactionUnit = true;
+                                stmtErr.failedStatementIndex = stepIdx;
+                                stmtErr.failedStatementSql = stmt.sql;
+                                stmtErr.packetUnitId = item.id;
+                                stmtErr.transactionLabel = item.sql;
+                                throw stmtErr;
+                            }
+                        }
+                        executionResults.set(item.id, {
+                            id: item.id,
+                            status: 'COMMITTED',
+                            isTransactionUnit: true,
+                            statementCount: item.statements.length,
+                            lastID,
+                            changes: totalChanges,
+                            statementResults
+                        });
+                    } else {
+                        try {
+                            const res = await tx.execute(item.sql, item.params);
+                            executionResults.set(item.id, {
+                                id: item.id,
+                                status: 'COMMITTED',
+                                isTransactionUnit: false,
+                                statementCount: 1,
+                                lastID: res ? res.lastID : undefined,
+                                changes: res ? res.changes : undefined
+                            });
+                        } catch (singleErr) {
+                            singleErr.failedStatementIndex = 0;
+                            singleErr.failedStatementSql = item.sql;
+                            singleErr.transactionLabel = item.sql;
+                            throw singleErr;
+                        }
+                    }
+                }
+            });
+
+            // 成功提交：Exactly-once Accounting (P1-02)
+            // 僅在底層 COMMIT 成功後，才轉換狀態並觸發回呼
+            for (const item of batch) {
+                this._transitionItem(item, ITEM_STATUS.COMMITTED);
+                const itemRes = executionResults.get(item.id) || { id: item.id, status: 'COMMITTED' };
+                this._invokeCallback(item, null, itemRes);
+            }
+        } catch (err) {
+            const errType = classifyError(err);
+            if (err && typeof err === 'object') {
+                err.errorType = errType;
+            }
+
+            // P1 修正：只有明確判定為 ERROR_TYPES.DATA_CONSTRAINT 的資料約束錯誤，才可進入 Binary Isolation。
+            // ERROR_TYPES.UNKNOWN（如 SQL 語法錯誤、欄位/資料表不存在、未知資料庫錯誤）必須直接向上拋出並進入 Fatal Error 熔斷流程！
+            if (errType === ERROR_TYPES.DATA_CONSTRAINT) {
+                await this._binaryIsolateBatch(batch, capability, deadlineAt, err);
+                return;
+            }
+
+            // 非資料約束錯誤（DISK_FULL, UNKNOWN, FATAL_CORRUPT, BUSY, DEADLINE 等）直接向上拋出，由 _executeTopLevelBatch 統一處理！
+            throw err;
+        }
+    }
+
+    /**
+     * 遞迴二分拆分：子層不自行退回，保持 Left 優先，且永遠以單一 Item（或單一封包交易單位）為最小邊界，絕不拆開封包內部語句 (P0-1, P0-2, 4.0.2)
+     */
+    async _binaryIsolateBatch(batch, capability = null, deadlineAt = null, lastErr = null) {
+        if (batch.length === 1) {
+            // 單一壞資料或單一失敗封包交易單位：明確隔離並標記 QUARANTINED (P0-4 & 4.0.2)
+            const badItem = batch[0];
+            const detailSuffix = lastErr && lastErr.message ? ` (${lastErr.message})` : '';
+            const constraintErr = new Error(`[QUARANTINED_CONSTRAINT_ERROR] 資料約束違反: ${badItem.sql}${detailSuffix}`);
+            constraintErr.errorType = ERROR_TYPES.DATA_CONSTRAINT;
+            constraintErr.transactionLabel = badItem.sql;
+            if (lastErr) {
+                constraintErr.cause = lastErr;
+                if (typeof lastErr.failedStatementIndex === 'number') {
+                    constraintErr.failedStatementIndex = lastErr.failedStatementIndex;
+                    constraintErr.failedStatementSql = lastErr.failedStatementSql;
+                }
+                if (lastErr.packetUnitId) {
+                    constraintErr.packetUnitId = lastErr.packetUnitId;
+                }
+            }
+            this._transitionItem(badItem, ITEM_STATUS.QUARANTINED, constraintErr);
+            this._invokeCallback(badItem, constraintErr);
+            return;
+        }
+
+        // P0-2: 遞迴前再次檢查 Deadline，防止子批次超時啟動新交易
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限已到達，禁止遞迴拆分執行子批次`);
+        }
+
+        const mid = Math.floor(batch.length / 2);
+        const left = batch.slice(0, mid);
+        const right = batch.slice(mid);
+
+        // 先執行 Left，若 Left 拋出非約束錯誤，直接往上拋給 _executeTopLevelBatch 統一原子排回
+        await this._commitOrIsolate(left, capability, deadlineAt);
+
+        // P0-2: Left 成功後再檢查 Deadline，若超時則拋出 DEADLINE_EXPIRED，由頂層統一退回 Right
+        if (deadlineAt && Date.now() >= deadlineAt) {
+            throw new Error(`[DEADLINE_EXPIRED] 停機期限已到達，禁止執行右側子批次`);
+        }
+
+        // Left 成功且在期限內，再執行 Right
+        await this._commitOrIsolate(right, capability, deadlineAt);
+    }
+
+    resumeDiskFull() {
+        if (this.state === QUEUE_STATES.PAUSED_DISK_FULL) {
+            this.state = QUEUE_STATES.NORMAL;
+            this._checkTriggerFlush();
+        }
+    }
+
+    /**
+     * 🌟 安全排空 (Drain - P0-3: 具備獨立 Deadline Observer 與 Promise.race)
+     */
+    async drain(capability, deadlineMs = 5000) {
+        this.state = QUEUE_STATES.CLOSING;
+        this._shutdownGateClosed = true;
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+
+        const deadlineAt = Date.now() + deadlineMs;
+
+        // 獨立 Deadline Observer Promise
+        let deadlineTimeoutId = null;
+        const deadlinePromise = new Promise((resolve) => {
+            deadlineTimeoutId = setTimeout(() => {
+                const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
+                resolve({
+                    isClean: false,
+                    isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
+                    hasUncommittedErrors: this.uncommittedErrors.length > 0,
+                    isDiskFull: this.state === QUEUE_STATES.PAUSED_DISK_FULL,
+                    deadlineExpired: true,
+                    uncommitted: totalUncommitted,
+                    adapterStatus: this.#adapter.getActiveStatus()
+                });
+            }, deadlineMs);
+        });
+
+        // 實際排空工作 Worker Promise
+        const drainWorkerPromise = (async () => {
+            this.isDraining = true;
+            try {
+                while (this.queue.length > 0 || this.retryPendingItems.size > 0 || this.#inFlightItems.size > 0) {
+                    if (Date.now() >= deadlineAt) {
+                        break;
+                    }
+                    // P0-3: 磁碟滿額或嚴重錯誤時立即中止 Drain，避免無限重試
+                    if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                        break;
+                    }
+
+                    // 🌟 P0-1: 嚴格遵守 Retry Backoff，僅提升已經到達重試時間的項目
+                    if (this.retryPendingItems.size > 0) {
+                        const now = Date.now();
+                        const readyToRequeue = [];
+                        const expiredBudgetItems = [];
+
+                        for (const item of this.retryPendingItems) {
+                            const rAt = item.retryAt || 0;
+                            if (rAt <= now) {
+                                readyToRequeue.push(item);
+                            } else if (rAt > deadlineAt) {
+                                expiredBudgetItems.push(item);
+                            }
+                        }
+
+                        if (expiredBudgetItems.length > 0) {
+                            for (const item of expiredBudgetItems) {
+                                this._transitionItem(item, ITEM_STATUS.UNCOMMITTED_ERROR, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                                this._invokeCallback(item, new Error('[RETRY_BUDGET_EXCEEDED] 剩餘排空時限不足以容納重試'));
+                            }
+                        }
+
+                        if (readyToRequeue.length > 0) {
+                            this._requeueRemainingBatchAtHead(readyToRequeue);
+                        }
+                    }
+
+                    if (this.queue.length > 0) {
+                        const batch = this.queue.splice(0, this.#config.batchSize);
+                        for (const item of batch) {
+                            this._transitionItem(item, ITEM_STATUS.IN_FLIGHT);
+                        }
+                        try {
+                            await this._executeTopLevelBatch(batch, capability, deadlineAt);
+                        } catch (batchErr) {
+                            // 若遇到磁碟滿額或嚴重錯誤，立即中斷排空迴圈 (P0-3)
+                            if (this.state === QUEUE_STATES.PAUSED_DISK_FULL || this.state === QUEUE_STATES.PAUSED_ERROR) {
+                                break;
+                            }
+                        }
+                    } else if (this.retryPendingItems.size > 0) {
+                        // 佇列目前為空，但有尚未到達重試時間的 retryPendingItems
+                        // 有界等待至下一次重試到達或 deadline，嚴格禁止 busy-spin 或提前重試
+                        const now = Date.now();
+                        let nextRetryAt = deadlineAt;
+                        for (const item of this.retryPendingItems) {
+                            if (item.retryAt && item.retryAt < nextRetryAt) {
+                                nextRetryAt = item.retryAt;
+                            }
+                        }
+                        const waitMs = Math.min(Math.max(1, nextRetryAt - now), Math.max(0, deadlineAt - now));
+                        if (waitMs > 0) {
+                            await new Promise(r => setTimeout(r, Math.min(waitMs, 50)));
+                        }
+                    } else if (this.#inFlightItems.size > 0) {
+                        await new Promise(r => setTimeout(r, 20));
+                    }
+                }
+
+                const totalUncommitted = this.queue.length + this.retryPendingItems.size + this.#inFlightItems.size + this.uncommittedErrors.length;
+                const hasErrors = this.uncommittedErrors.length > 0;
+                const isDiskFull = this.state === QUEUE_STATES.PAUSED_DISK_FULL;
+                const clean = (totalUncommitted === 0 && !isDiskFull);
+
+                return {
+                    isClean: clean,
+                    isQuiescent: typeof this.#adapter.isQuiescent === 'function' ? this.#adapter.isQuiescent() : true,
+                    hasUncommittedErrors: hasErrors,
+                    isDiskFull,
+                    deadlineExpired: (Date.now() >= deadlineAt),
+                    uncommitted: totalUncommitted,
+                    adapterStatus: this.#adapter.getActiveStatus()
+                };
+            } finally {
+                this.isDraining = false;
+            }
+        })();
+
+        try {
+            const result = await Promise.race([drainWorkerPromise, deadlinePromise]);
+            if (deadlineTimeoutId) clearTimeout(deadlineTimeoutId);
+            this._clearAllRetryTimers();
+            return result;
+        } catch (err) {
+            if (deadlineTimeoutId) clearTimeout(deadlineTimeoutId);
+            this._clearAllRetryTimers();
+            throw err;
+        }
+    }
+
+    close() {
+        this.state = QUEUE_STATES.CLOSED;
+        this._shutdownGateClosed = true;
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        this._clearAllRetryTimers();
+    }
+}
+
+module.exports = {
+    WriteQueue,
+    QUEUE_STATES,
+    ITEM_STATUS
+};

@@ -10,6 +10,10 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:3002',
         changeOrigin: true
+      },
+      '/socket.io': {
+        target: 'http://localhost:3002',
+        ws: true
       }
     }
   },
@@ -18,10 +22,15 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
-            if (id.includes('socket.io-client')) {
+            if (id.includes('socket.io-client') || id.includes('engine.io-client')) {
               return 'vendor-socket';
             }
-            return 'vendor';
+            if (id.includes('react-dom') || id.includes('/react/') || id.includes('scheduler')) {
+              return 'vendor-react';
+            }
+            if (id.includes('leaflet') || id.includes('react-leaflet')) {
+              return 'vendor-leaflet';
+            }
           }
         }
       }

@@ -6,7 +6,8 @@
   "scripts": {
     "install-all": "npm install && cd frontend && npm install",
     "build": "npm install && cd frontend && npm install && npm run build",
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:database": "node --test tests/database/*.test.js"
   },
   "dependencies": {
     "@libsql/client": "^0.14.0",

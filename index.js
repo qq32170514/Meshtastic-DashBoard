@@ -33,7 +33,9 @@ if (missingEnv.length > 0) {
 // ==========================================
 // 📝 系統事件記錄簿 (Local Event Log Book)
 // ==========================================
-const EVENT_LOG_PATH = path.join(__dirname, 'system_events.json');
+const EVENT_LOG_PATH = process.env.EVENT_LOG_PATH
+    ? path.resolve(process.env.EVENT_LOG_PATH)
+    : path.join(__dirname, 'system_events.json');
 
 function logSystemEvent(eventType, details = {}) {
     const event = {
@@ -194,6 +196,19 @@ app.use((req, res, next) => {
     next();
 });
 
+// 📊 4.0.3 API 診斷計時中介軟體 (僅記錄路徑、方法、耗時與快取命中狀態，絕不記錄節點 ID / GPS / Token 等敏感資訊)
+app.use('/api/', (req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    res.on('finish', () => {
+        const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+        if (elapsedMs >= 50 || process.env.API_PERF_LOG === '1') {
+            const cacheHeader = res.getHeader('X-Cache') || 'NONE';
+            console.log(`⏱️ [API_PERF] ${req.method} ${req.path} status=${res.statusCode} durationMs=${elapsedMs.toFixed(1)} cache=${cacheHeader}`);
+        }
+    });
+    next();
+});
+
 // ==========================================
 // 🛡️ 封包去重快取引擎 (Bounded TTL Deduplication Cache)
 // 具備 5 分鐘物理傳播生命週期 (TTL) 與 10,000 筆上限，防止記憶體無上限增長
@@ -314,64 +329,12 @@ function batchEmit(type, data) {
 
 // ==========================================
 // 🚀 有界 LRU API 快取層 (Bounded LRU Cache with Route-Specific TTL)
-// 包含最大容量 (MAX_CACHE_ENTRIES)、過期自動清理與 Query Key 規範化
+// 包含最大容量 (MAX_CACHE_ENTRIES)、過期自動清理與 Query Key 規範化 (4.0.3.1: 完整保留所有 Query Params)
 // ==========================================
-class BoundedLRUCache {
-    constructor(maxEntries = 300) {
-        this.maxEntries = maxEntries;
-        this.cache = new Map(); // key -> { data, expiredAt }
-    }
-
-    get(key) {
-        const item = this.cache.get(key);
-        if (!item) return null;
-        if (Date.now() > item.expiredAt) {
-            this.cache.delete(key);
-            return null;
-        }
-        // LRU 移至最新
-        this.cache.delete(key);
-        this.cache.set(key, item);
-        return item.data;
-    }
-
-    set(key, data, ttlMs) {
-        if (this.cache.has(key)) {
-            this.cache.delete(key);
-        } else if (this.cache.size >= this.maxEntries) {
-            const oldestKey = this.cache.keys().next().value;
-            this.cache.delete(oldestKey);
-        }
-        this.cache.set(key, { data, expiredAt: Date.now() + ttlMs });
-    }
-
-    delete(key) {
-        return this.cache.delete(key);
-    }
-
-    clearPrefix(prefix) {
-        for (const key of this.cache.keys()) {
-            if (key.startsWith(prefix)) {
-                this.cache.delete(key);
-            }
-        }
-    }
-
-    pruneExpired() {
-        const now = Date.now();
-        for (const [key, item] of this.cache.entries()) {
-            if (now > item.expiredAt) {
-                this.cache.delete(key);
-            }
-        }
-    }
-
-    get size() {
-        return this.cache.size;
-    }
-}
+const { BoundedLRUCache, normalizeCacheKey, createWithCache } = require('./src/utils/api-cache');
 
 const apiCache = new BoundedLRUCache(300);
+const withCache = createWithCache(apiCache);
 
 // 🚀 定期每 60 秒清理過期的 API 快取與重複封包快取
 setInterval(() => {
@@ -428,45 +391,6 @@ setInterval(() => {
     console.log(`📊 [PERF_METRICS] MEM: ${rssMb}MB (Heap: ${heapMb}MB) | MQTT: ${mqttPktPerSec} pkt/s | DB_Q: ${dbQueue.length} (committed: ${dbQueueMetrics.totalCommitted}) | Clients: ${socketClients} | LoopLag: ${lagMs}ms`);
 }, 30 * 1000);
 
-/**
- * 規範化 Cache Key：保留標準合法 query keys 並排序，防止 Cache Explosion 攻擊
- */
-function normalizeCacheKey(req) {
-    const url = new URL(req.originalUrl || req.url, 'http://localhost');
-    const allowed = ['limit', 'page', 'range', 'days', 'node_id', 'portnum', 'gateway_id', 'exclude_tunnel', 'cursor'];
-    const searchParams = new URLSearchParams();
-    for (const key of allowed) {
-        const val = url.searchParams.get(key);
-        if (val !== null && val !== '') searchParams.set(key, val);
-    }
-    const qs = searchParams.toString();
-    return qs ? `${url.pathname}?${qs}` : url.pathname;
-}
-
-/**
- * Express 中間件：自動快取 GET 回應
- * 快取命中時直接回傳，不碰 DB
- */
-function withCache(ttlMs = 10 * 1000) {
-    return (req, res, next) => {
-        const key = normalizeCacheKey(req);
-        const cachedData = apiCache.get(key);
-        if (cachedData !== null && cachedData !== undefined) {
-            res.setHeader('X-Cache', 'HIT');
-            return res.json(cachedData);
-        }
-        const origJson = res.json.bind(res);
-        res.json = (data) => {
-            if (res.statusCode >= 200 && res.statusCode < 300 && data) {
-                apiCache.set(key, data, ttlMs);
-            }
-            res.setHeader('X-Cache', 'MISS');
-            origJson(data);
-        };
-        next();
-    };
-}
-
 function invalidatePacketCache() {
     apiCache.clearPrefix('/api/packets');
     apiCache.clearPrefix('/api/node/');
@@ -478,8 +402,6 @@ function invalidatePacketCache() {
 // 具備背壓 (Backpressure)、自適應批次 (Chunking) 與可觀測性指標
 // ==========================================
 const dbQueue = [];
-let dbQueueTimer = null;
-let isFlushingDbQueue = false;
 
 const MAX_QUEUE_CAPACITY = 5000;
 const BATCH_CHUNK_SIZE = 100;
@@ -494,96 +416,41 @@ const dbQueueMetrics = {
     maxQueueLengthSeen: 0
 };
 
+const {
+    buildMqttPacketTransactionPlan,
+    buildRfTunnelPacketTransactionPlan,
+    executePacketTransactionPlan,
+    createTursoDbWrapper,
+    createSequentialFallbackQueueController
+} = require('./src/database/packet-transaction');
+const {
+    registerAppBackupSchedule
+} = require('./src/database/backup-manager');
+
+// 🛡️ 4.0.2 Packet Transaction Boundary & Turso Sequential Fallback Queue Orchestrator
+// - 本地 SQLite 分支：直接委派 db.queuePacketTransaction / db.queueDbOp / db.flushDbQueue
+// - Turso fallback 分支：透過共用調度器執行 queuePacketTransaction() -> dbQueue -> flushDbQueue() -> executeSequentialFallbackItem()
+//   （誠實限制：Turso fallback 為多語句依序執行，不宣稱具備 Local SQLite Adapter 的單連線原子交易回滾保證）
+const fallbackQueueController = createSequentialFallbackQueueController({
+    getDb: () => db,
+    dbQueue,
+    dbQueueMetrics,
+    maxQueueCapacity: MAX_QUEUE_CAPACITY,
+    batchChunkSize: BATCH_CHUNK_SIZE,
+    flushIntervalMs: FLUSH_INTERVAL_MS,
+    logger: console
+});
+
 function queueDbOp(sql, params, callback) {
-    // 🛡️ 背壓防護 (Backpressure): 超過上限時記錄警示，避免記憶體溢位 (OOM)
-    if (dbQueue.length >= MAX_QUEUE_CAPACITY) {
-        console.warn(`⚠️ [DB_QUEUE] 隊列超過最大容量 (${MAX_QUEUE_CAPACITY})，啟動背壓控制！`);
-        if (callback) callback(new Error('DB queue backpressure limit reached'));
-        return;
-    }
+    return fallbackQueueController.queueDbOp(sql, params, callback);
+}
 
-    dbQueue.push({ sql, params, callback, queuedAt: Date.now() });
-    dbQueueMetrics.totalQueued++;
-    if (dbQueue.length > dbQueueMetrics.maxQueueLengthSeen) {
-        dbQueueMetrics.maxQueueLengthSeen = dbQueue.length;
-    }
-
-    // 🚀 自適應觸發：若積累達 BATCH_CHUNK_SIZE 立即執行，否則等待防抖計時
-    if (dbQueue.length >= BATCH_CHUNK_SIZE && !isFlushingDbQueue) {
-        if (dbQueueTimer) {
-            clearTimeout(dbQueueTimer);
-            dbQueueTimer = null;
-        }
-        flushDbQueue();
-    } else if (!dbQueueTimer) {
-        dbQueueTimer = setTimeout(flushDbQueue, FLUSH_INTERVAL_MS);
-    }
+function queuePacketTransaction(statements, callback = null, options = {}) {
+    return fallbackQueueController.queuePacketTransaction(statements, callback, options);
 }
 
 function flushDbQueue() {
-    if (dbQueueTimer) {
-        clearTimeout(dbQueueTimer);
-        dbQueueTimer = null;
-    }
-    if (dbQueue.length === 0 || isFlushingDbQueue) return;
-
-    // 🚀 分批切片 (Chunking)，每次最多處理 BATCH_CHUNK_SIZE 筆，避免單一交易鎖定過久
-    const batch = dbQueue.splice(0, BATCH_CHUNK_SIZE);
-    isFlushingDbQueue = true;
-
-    const startTime = Date.now();
-    db.serialize(() => {
-        // 使用 IMMEDIATE 交易預先鎖定寫入，避免死鎖
-        db.run('BEGIN IMMEDIATE TRANSACTION', (beginErr) => {
-            if (beginErr) {
-                console.error('❌ [DB_QUEUE] BEGIN IMMEDIATE 失敗:', beginErr.message);
-                dbQueueMetrics.totalErrors += batch.length;
-                isFlushingDbQueue = false;
-                batch.forEach(item => item.callback && item.callback(beginErr));
-                if (dbQueue.length > 0) setTimeout(flushDbQueue, 50);
-                return;
-            }
-
-            let completed = 0;
-            let batchHasError = false;
-
-            batch.forEach((item) => {
-                db.run(item.sql, item.params, function (err) {
-                    if (err) {
-                        batchHasError = true;
-                        dbQueueMetrics.totalErrors++;
-                    }
-                    if (item.callback) {
-                        try { item.callback.call(this, err); } catch (_) { }
-                    }
-                    completed++;
-
-                    if (completed === batch.length) {
-                        const txEndSql = batchHasError ? 'ROLLBACK' : 'COMMIT';
-                        db.run(txEndSql, (commitErr) => {
-                            const duration = Date.now() - startTime;
-                            dbQueueMetrics.lastBatchSize = batch.length;
-                            dbQueueMetrics.lastDurationMs = duration;
-
-                            if (commitErr || batchHasError) {
-                                console.error(`⚠️ [DB_QUEUE] 交易結束 (${txEndSql}) 異常:`, commitErr?.message || '單項操作失敗');
-                            } else {
-                                dbQueueMetrics.totalCommitted += batch.length;
-                            }
-
-                            isFlushingDbQueue = false;
-                            // 🚀 採用路由級別 5 秒 TTL 自然過期，避免每 200ms 全面清空快取造成並行查詢穿透至 DB
-
-                            // 若隊列中仍有剩餘待處理資料，立即處理下一批
-                            if (dbQueue.length > 0) {
-                                setImmediate(flushDbQueue);
-                            }
-                        });
-                    }
-                });
-            });
-        });
-    });
+    return fallbackQueueController.flushDbQueue();
 }
 
 // ==========================================
@@ -665,224 +532,156 @@ if (process.env.TURSO_URL) {
         url: process.env.TURSO_URL,
         authToken: process.env.TURSO_TOKEN,
     });
-    // 建立一個相容 sqlite3 語法的包裝器
-    db = {
-        run: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb && cb.call({ lastID: Number(r.lastInsertRowid) }, null)).catch(cb),
-        all: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows)).catch(cb),
-        get: (sql, params, cb) => client.execute({ sql, args: params || [] }).then(r => cb(null, r.rows[0])).catch(cb),
-        serialize: (fn) => fn()
-    };
+    // 建立一個相容 sqlite3 語法的包裝器（支援 (sql, cb) 與 (sql, params, cb) 兩種呼叫形式）
+    db = createTursoDbWrapper(client);
     console.log(`☁️ 已連線至 Turso 雲端資料庫`);
+    db.serialize(() => {
+        db.run(`
+            CREATE TABLE IF NOT EXISTS telemetry_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                battery_level REAL,
+                voltage REAL,
+                temperature REAL,
+                humidity REAL,
+                channel_utilization REAL,
+                air_util_tx REAL,
+                snr REAL,
+                rssi REAL,
+                current REAL,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                adc_voltage REAL
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS nodes (
+                node_id TEXT PRIMARY KEY,
+                long_name TEXT,
+                short_name TEXT,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                latitude REAL,
+                longitude REAL,
+                is_favorite INTEGER DEFAULT 0,
+                last_topic TEXT,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                role TEXT,
+                channel TEXT,
+                hw_model TEXT,
+                battery_level REAL,
+                voltage REAL,
+                current REAL,
+                temperature REAL,
+                humidity REAL,
+                firmware_version TEXT,
+                firmware_build_num TEXT,
+                last_gateway TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS packet_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                portnum TEXT,
+                topic TEXT,
+                gateway_id TEXT,
+                snr REAL,
+                rssi REAL,
+                hop_limit INTEGER,
+                hop_start INTEGER,
+                payload_json TEXT,
+                raw_hex TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS neighbors (
+                node_id TEXT,
+                neighbor_id TEXT,
+                snr REAL,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(node_id, neighbor_id)
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message TEXT,
+                channel_name TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS packets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT,
+                lat REAL,
+                lon REAL,
+                snr REAL,
+                source TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS daily_analytics_summary (
+                date TEXT PRIMARY KEY,
+                active_count INTEGER DEFAULT 0,
+                ghost_count INTEGER DEFAULT 0,
+                snr_sum REAL DEFAULT 0,
+                snr_count INTEGER DEFAULT 0,
+                rssi_sum REAL DEFAULT 0,
+                rssi_count INTEGER DEFAULT 0,
+                temp_sum REAL DEFAULT 0,
+                temp_count INTEGER DEFAULT 0,
+                hum_sum REAL DEFAULT 0,
+                hum_count INTEGER DEFAULT 0,
+                position_count INTEGER DEFAULT 0,
+                telemetry_count INTEGER DEFAULT 0,
+                text_count INTEGER DEFAULT 0,
+                routing_count INTEGER DEFAULT 0,
+                other_count INTEGER DEFAULT 0,
+                hop0_count INTEGER DEFAULT 0,
+                hop1_count INTEGER DEFAULT 0,
+                hop2_count INTEGER DEFAULT 0,
+                hop3_count INTEGER DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS cwa_weather_stations (
+                station_id TEXT PRIMARY KEY,
+                station_name TEXT,
+                county TEXT,
+                town TEXT,
+                latitude REAL,
+                longitude REAL,
+                temperature REAL,
+                humidity REAL,
+                weather TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)`);
+    });
 } else {
-    const sqlite3 = require('sqlite3').verbose();
-    const dbPath = path.join(__dirname, 'meshtastic.db');
-    db = new sqlite3.Database(dbPath, (err) => {
-        if (err) console.error('❌ 本地資料庫連線失敗:', err.message);
-        else console.log(`🗄️ 本地資料庫連線成功: ${dbPath}`);
+    const { initDatabaseSubsystemSync } = require('./src/database');
+    const dbPath = process.env.DB_PATH
+        ? path.resolve(process.env.DB_PATH)
+        : path.join(__dirname, 'meshtastic.db');
+    const configuredBackupDir = process.env.BACKUP_PATH || path.join(__dirname, 'backups');
+    // 🛡️ 4.0.1 P0: 啟用 bootstrapSchema: true，將 Table DDL、Column Migration、Index 建立與 Schema Verification 全數納入 db.readyPromise 屏障
+    db = initDatabaseSubsystemSync({
+        dbPath,
+        backupDir: configuredBackupDir,
+        bootstrapSchema: true
     });
+    console.log(`🗄️ 本地資料庫子系統已掛載，正在執行初始化與 Schema Initialization Barrier (4.0.1): ${dbPath}`);
 }
-
-db.serialize(() => {
-    // 🚀 效能優先：所有 DDL 前先設定最佳 PRAGMA
-    db.run(`PRAGMA journal_mode = WAL`);
-    db.run(`PRAGMA synchronous = NORMAL`);   // WAL 模式下 NORMAL 具備完整崩潰一致性防護，且免除每次交易強制磁碟 sync
-    db.run(`PRAGMA cache_size = -64000`);    // 64MB 頁面快取（負值代表 KB），大幅減少 4GB 資料庫的冷讀取 I/O
-    db.run(`PRAGMA temp_store = MEMORY`);    // 暫存運算全放記憶體
-    db.run(`PRAGMA mmap_size = 268435456`);  // 256MB mmap 加速讀取
-    db.run(`PRAGMA busy_timeout = 30000`);   // 30秒等待鎖，避免高併發寫入時出現 SQLITE_BUSY 錯誤
-    db.run(`PRAGMA wal_autocheckpoint = 1000`); // 每累積 1000 頁自動 checkpoint
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS telemetry_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            battery_level REAL,
-            voltage REAL,
-            temperature REAL,
-            humidity REAL,
-            channel_utilization REAL,
-            air_util_tx REAL,
-            snr REAL,
-            rssi REAL,
-            current REAL,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            adc_voltage REAL
-        )
-    `);
-    // 新增 nodes 資料表，用於追蹤所有出現過的節點及其最後在線時間
-    db.run(`
-        CREATE TABLE IF NOT EXISTS nodes (
-            node_id TEXT PRIMARY KEY,
-            long_name TEXT,
-            short_name TEXT,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            latitude REAL,
-            longitude REAL,
-            is_favorite INTEGER DEFAULT 0,
-            last_topic TEXT,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            role TEXT,
-            channel TEXT,
-            hw_model TEXT,
-            battery_level REAL,
-            voltage REAL,
-            current REAL,
-            temperature REAL,
-            humidity REAL,
-            firmware_version TEXT,
-            firmware_build_num TEXT,
-            last_gateway TEXT
-        )
-    `);
-    // 新增 packet_logs 資料表，紀錄所有原始封包軌跡
-    db.run(`
-        CREATE TABLE IF NOT EXISTS packet_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            portnum TEXT,
-            topic TEXT,
-            gateway_id TEXT,
-            snr REAL,
-            rssi REAL,
-            hop_limit INTEGER,
-            hop_start INTEGER,
-            payload_json TEXT,
-            raw_hex TEXT
-        )
-    `);
-    // 新增 neighbors 資料表，紀錄節點間的鄰居關係 (拓撲核心)
-    db.run(`
-        CREATE TABLE IF NOT EXISTS neighbors (
-            node_id TEXT,
-            neighbor_id TEXT,
-            snr REAL,
-            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(node_id, neighbor_id)
-        )
-    `);
-    // 新增 chat_messages 資料表，專門儲存解密後的文字訊息
-    db.run(`
-        CREATE TABLE IF NOT EXISTS chat_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            message TEXT,
-            channel_name TEXT
-        )
-    `);
-    // 🚀 核心升級：實體 RF 攔截專用表 (支援多來源標記)
-    db.run(`
-        CREATE TABLE IF NOT EXISTS packets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT,
-            lat REAL,
-            lon REAL,
-            snr REAL,
-            source TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS daily_analytics_summary (
-            date TEXT PRIMARY KEY,
-            active_count INTEGER DEFAULT 0,
-            ghost_count INTEGER DEFAULT 0,
-            snr_sum REAL DEFAULT 0,
-            snr_count INTEGER DEFAULT 0,
-            rssi_sum REAL DEFAULT 0,
-            rssi_count INTEGER DEFAULT 0,
-            temp_sum REAL DEFAULT 0,
-            temp_count INTEGER DEFAULT 0,
-            hum_sum REAL DEFAULT 0,
-            hum_count INTEGER DEFAULT 0,
-            position_count INTEGER DEFAULT 0,
-            telemetry_count INTEGER DEFAULT 0,
-            text_count INTEGER DEFAULT 0,
-            routing_count INTEGER DEFAULT 0,
-            other_count INTEGER DEFAULT 0,
-            hop0_count INTEGER DEFAULT 0,
-            hop1_count INTEGER DEFAULT 0,
-            hop2_count INTEGER DEFAULT 0,
-            hop3_count INTEGER DEFAULT 0,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packets_timestamp ON packets(timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_nodes_last_seen ON nodes(last_seen DESC)`);
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS cwa_weather_stations (
-            station_id TEXT PRIMARY KEY,
-            station_name TEXT,
-            county TEXT,
-            town TEXT,
-            latitude REAL,
-            longitude REAL,
-            temperature REAL,
-            humidity REAL,
-            weather TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_cwa_lat_lng ON cwa_weather_stations(latitude, longitude)`);
-
-    const cols = [
-        { t: 'nodes', c: 'is_favorite', d: 'INTEGER DEFAULT 0' },
-        { t: 'nodes', c: 'last_topic', d: 'TEXT' },
-        { t: 'packet_logs', c: 'gateway_id', d: 'TEXT' },
-        { t: 'telemetry_data', c: 'current', d: 'REAL' },
-        { t: 'packet_logs', c: 'hop_limit', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'hop_start', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'payload_json', d: 'TEXT' },
-        { t: 'packet_logs', c: 'raw_hex', d: 'TEXT' },
-        { t: 'nodes', c: 'hop_limit', d: 'INTEGER' },
-        { t: 'nodes', c: 'hop_start', d: 'INTEGER' },
-        { t: 'nodes', c: 'role', d: 'TEXT' },
-        { t: 'nodes', c: 'channel', d: 'TEXT' },
-        { t: 'nodes', c: 'hw_model', d: 'TEXT' },
-        { t: 'nodes', c: 'battery_level', d: 'REAL' },
-        { t: 'nodes', c: 'voltage', d: 'REAL' },
-        { t: 'nodes', c: 'current', d: 'REAL' },
-        { t: 'nodes', c: 'temperature', d: 'REAL' },
-        { t: 'nodes', c: 'humidity', d: 'REAL' },
-        { t: 'nodes', c: 'firmware_version', d: 'TEXT' },
-        { t: 'nodes', c: 'firmware_build_num', d: 'TEXT' },
-        { t: 'nodes', c: 'last_gateway', d: 'TEXT' },
-        { t: 'packet_logs', c: 'latitude', d: 'REAL' },
-        { t: 'packet_logs', c: 'longitude', d: 'REAL' },
-        { t: 'packet_logs', c: 'hops_away', d: 'INTEGER' },
-        { t: 'packet_logs', c: 'source', d: 'TEXT' }, // 🚀 新增：標記封包來源 (MQTT 或 RF 隧道)
-        { t: 'telemetry_data', c: 'adc_voltage', d: 'REAL' } // 🚀 新增：保留 ADC 電壓
-    ];
-    cols.forEach(col => {
-        db.run(`ALTER TABLE ${col.t} ADD COLUMN ${col.c} ${col.d}`, (err) => { });
-    });
-    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_telemetry_node_timestamp ON telemetry_data (node_id, timestamp DESC)`);
-
-    // 🛡️ 效能優化 (Phase 1)：安全卸載無用、重複或引發 TEMP B-TREE 排序的大型索引
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_rawhex_ts`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_port_ts`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_node_id`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_gateway`);
-    db.run(`DROP INDEX IF EXISTS idx_packet_logs_source_timestamp`);
-
-    // 🚀 保留核心索引 (覆蓋最左前綴原則，無重複冗餘)
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_timestamp ON packet_logs (timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_node_timestamp ON packet_logs (node_id, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_portnum_timestamp ON packet_logs (portnum, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_gw_ts ON packet_logs (gateway_id, timestamp DESC)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_packet_logs_ts_hops ON packet_logs (timestamp DESC, hops_away)`);
-
-    // 聊天紀錄效能優化
-    db.run(`CREATE INDEX IF NOT EXISTS idx_chat_channel_timestamp ON chat_messages (channel_name, timestamp DESC)`);
-});
 
 // 🛸 輔助映射：將前端名稱對應回 Protobuf ID，確保 API 查詢正確
 const PORT_NAME_TO_ID = {
@@ -906,33 +705,44 @@ const PORT_NAME_TO_ID = {
 const DATA_RETENTION_DAYS = 90; // 🚀 保留 90 天 (3 個月)
 
 function cleanupOldData() {
+    if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+        return;
+    }
     const sql = `DELETE FROM telemetry_data WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     const sqlPackets = `DELETE FROM packet_logs WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
     // 聊天紀錄保留 90 天
     const sqlChat = `DELETE FROM chat_messages WHERE timestamp < datetime('now', '-${DATA_RETENTION_DAYS} days')`;
 
     db.run(sql, function (err) {
-        if (err) console.error('❌ 清理舊資料失敗:', err.message);
+        if (err) console.error('❌ 清理舊資料失敗 (telemetry_data):', err.message);
         else if (this.changes > 0) {
             console.log(`🧹 自動清理完成，已刪除 ${this.changes} 筆超過 90 天的舊資料`);
         }
     });
-    db.run(sqlPackets);
-    db.run(sqlChat);
+    db.run(sqlPackets, function (err) {
+        if (err) console.error('❌ 清理舊資料失敗 (packet_logs):', err.message);
+    });
+    db.run(sqlChat, function (err) {
+        if (err) console.error('❌ 清理舊資料失敗 (chat_messages):', err.message);
+    });
 }
 
-// 每小時執行一次清理
-setInterval(cleanupOldData, 60 * 60 * 1000);
-cleanupOldData(); // 啟動時先執行一次
+function startDatabaseMaintenanceWorkers() {
+    cleanupOldData();
+    setInterval(cleanupOldData, 60 * 60 * 1000);
 
-// 🚀 效能維護：每 15 分鐘執行一次被動 WAL Checkpoint，防止 WAL 檔案無限制膨脹至數百 MB
-setInterval(() => {
-    if (db && typeof db.run === 'function') {
-        db.run('PRAGMA wal_checkpoint(PASSIVE)', (err) => {
-            if (err) console.error('⚠️ [WAL] Passive checkpoint warning:', err.message);
-        });
-    }
-}, 15 * 60 * 1000);
+    // 🚀 效能維護：每 15 分鐘執行一次被動 WAL Checkpoint，防止 WAL 檔案無限制膨脹至數百 MB
+    setInterval(() => {
+        if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+            return;
+        }
+        if (db && typeof db.run === 'function') {
+            db.run('PRAGMA wal_checkpoint(PASSIVE)', (err) => {
+                if (err) console.error('⚠️ [WAL] Passive checkpoint warning:', err.message);
+            });
+        }
+    }, 15 * 60 * 1000);
+}
 
 // ==========================================
 // 1.5 API 路由設定 (提供給前端)
@@ -1524,33 +1334,141 @@ app.get('/api/traceroute/paths', withCache(30 * 1000), (req, res) => {
     });
 });
 
-// 📡 靜態服務：全島 ITM 電波覆蓋烘焙圖資
-app.use('/coverage', express.static(path.join(__dirname, 'public/coverage')));
+// 📡 靜態服務：全島 ITM 電波覆蓋烘焙圖資 (4.0.3.2: 透過 current.json Manifest 統一解析目前有效 Generation，確保 PNG/JSON 整組一致)
+const COVERAGE_BASE_DIR = path.join(__dirname, 'public/coverage');
+const { resolveCurrentCoverage } = require('./src/utils/coverage-storage');
+
+app.get('/coverage/taiwan_coverage.png', (req, res, next) => {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) return next();
+    if (resolved.generationId) res.setHeader('X-Coverage-Generation', resolved.generationId);
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.sendFile(resolved.pngPath);
+});
+
+app.get('/coverage/taiwan_coverage.json', (req, res, next) => {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) return next();
+    if (resolved.generationId) res.setHeader('X-Coverage-Generation', resolved.generationId);
+    res.setHeader('Cache-Control', 'no-cache');
+    return res.json(resolved.metadata);
+});
+
+app.use('/coverage', express.static(COVERAGE_BASE_DIR));
 
 // 📡 API: 取得全台 3D 地形電波覆蓋圖 (ITM) 資訊
 app.get('/api/coverage/itm-info', (req, res) => {
-    const metaPath = path.join(__dirname, 'public/coverage/taiwan_coverage.json');
-    if (!fs.existsSync(metaPath)) {
+    const resolved = resolveCurrentCoverage(COVERAGE_BASE_DIR);
+    if (!resolved.available) {
         return res.json({ available: false });
     }
-    try {
-        const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-        res.json({ available: true, ...data });
-    } catch (e) {
-        res.status(500).json({ error: 'Failed to read coverage metadata' });
-    }
+    return res.json({ available: true, ...resolved.metadata });
 });
 
-// 📡 API: 手動或背景排程觸發重新烘焙全台覆蓋圖
-app.post('/api/coverage/rebuild', (req, res) => {
-    const { exec } = require('child_process');
-    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
-    exec(`node "${bakeScript}" 500`, (err, stdout, stderr) => {
-        if (err) console.error('❌ 全台覆蓋烘焙失敗:', err.message);
-        else console.log('✅ 全台覆蓋烘焙排程完成！');
-    });
-    res.json({ success: true, message: '全台電波覆蓋烘焙排程已在背景啟動' });
+const { createRequireCoverageAdmin, CoverageJobController } = require('./src/utils/coverage-controller');
+const requireCoverageAdmin = createRequireCoverageAdmin();
+const coverageJobController = new CoverageJobController({
+    bakeScriptPath: path.join(__dirname, 'rf-engine/bake.mjs'),
+    lockDirPath: path.join(COVERAGE_BASE_DIR, '.coverage_bake.lockdir')
 });
+
+// 📡 API: 取得全台覆蓋烘焙任務公開狀態 (4.0.3.2: 不公開 stdout/stderr/內部路徑)
+app.get('/api/coverage/status', (req, res) => {
+    res.json(coverageJobController.getStatus());
+});
+
+// 📡 API: 管理員專屬診斷資訊 (需 Admin Authorization，且遮蔽敏感路徑)
+app.get('/api/coverage/diagnostics', requireCoverageAdmin, (req, res) => {
+    res.json(coverageJobController.getAdminDiagnostics());
+});
+
+// 📡 API: 手動觸發重新烘焙全台覆蓋圖 (需管理員授權 + 單一執行鎖保護)
+app.post('/api/coverage/rebuild', requireCoverageAdmin, (req, res) => {
+    const requestedLimit = req.body && req.body.limit !== undefined ? req.body.limit : req.query.limit;
+    const launch = coverageJobController.startBake({
+        trigger: 'manual',
+        limit: requestedLimit
+    });
+
+    if (!launch.started) {
+        if (launch.reason === 'invalid_limit') {
+            return res.status(400).json({ success: false, error: launch.error });
+        }
+        return res.status(409).json({
+            success: false,
+            error: '全台電波覆蓋烘焙任務正在執行中，請勿重複觸發',
+            status: coverageJobController.getStatus()
+        });
+    }
+
+    launch.completion.then((result) => {
+        if (result.status === 'completed') {
+            console.log(`✅ 全台覆蓋烘焙排程完成 (jobId=${result.jobId}, duration=${result.durationMs}ms)`);
+            apiCache.clearPrefix('/api/coverage');
+        } else {
+            console.error(`❌ 全台覆蓋烘焙失敗 (jobId=${result.jobId}, status=${result.status}):`, result.error);
+        }
+    });
+
+    res.status(202).json({
+        success: true,
+        message: '全台電波覆蓋烘焙排程已在背景啟動',
+        job: launch.job
+    });
+});
+
+// 📢 動態公告與即時橫幅 (支援 announcement.json 存檔免重開熱更新)
+const ANNOUNCEMENT_FILE = path.join(__dirname, 'announcement.json');
+const ANNOUNCEMENT_EXAMPLE = path.join(__dirname, 'announcement.example.json');
+
+function getAnnouncementData() {
+    let target = ANNOUNCEMENT_FILE;
+    if (!fs.existsSync(target)) {
+        if (fs.existsSync(ANNOUNCEMENT_EXAMPLE)) {
+            try {
+                fs.copyFileSync(ANNOUNCEMENT_EXAMPLE, ANNOUNCEMENT_FILE);
+            } catch (_) {}
+            target = ANNOUNCEMENT_EXAMPLE;
+        } else {
+            return {
+                banner: { enabled: false, text: '', type: 'info', link: '', linkText: '' },
+                modal: { enabled: false, version: '3.1.0', title: '', content: '' }
+            };
+        }
+    }
+    try {
+        return JSON.parse(fs.readFileSync(target, 'utf8'));
+    } catch (err) {
+        console.error('❌ 讀取 announcement.json 失敗:', err.message);
+        return {
+            banner: { enabled: false, text: '', type: 'info', link: '', linkText: '' },
+            modal: { enabled: false, version: '3.1.0', title: '', content: '' }
+        };
+    }
+}
+
+// 📢 API: 取得當前公告與橫幅設定
+app.get('/api/announcement', (req, res) => {
+    res.json(getAnnouncementData());
+});
+
+// 📢 即時熱重載：監聽 announcement.json 變更並即時 WebSocket 廣播
+let announcementDebounceTimer = null;
+try {
+    const watchDir = __dirname;
+    fs.watch(watchDir, (eventType, filename) => {
+        if (filename && filename.includes('announcement.json')) {
+            clearTimeout(announcementDebounceTimer);
+            announcementDebounceTimer = setTimeout(() => {
+                const updatedData = getAnnouncementData();
+                console.log('📢 [即時熱更新] 偵測到 announcement.json 存檔更新，已自動推播至所有線上用戶！');
+                io.emit('announcement:update', updatedData);
+            }, 300);
+        }
+    });
+} catch (err) {
+    console.warn('⚠️ announcement.json 檔案監聽器啟動異常:', err.message);
+}
 
 // 🚀 核心升級：網格化覆蓋率聚合 API
 // 🚀 效能優化：用 CTE 取代相關子查詢，消滅 N+1 問題
@@ -2802,6 +2720,7 @@ function fetchCwaSolarData() {
 
 // 每 15 分鐘自動刷新中央氣象署氣象與日射資料
 cron.schedule('*/15 * * * *', () => {
+    if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) return;
     fetchAndSaveCWAData();
     fetchCwaSolarData();
 });
@@ -2809,11 +2728,18 @@ cron.schedule('*/15 * * * *', () => {
 // ⏰ 每日凌晨 04:00 自動重新烘焙全台 3D 地形電波覆蓋圖 (Longley-Rice ITM)
 cron.schedule('0 4 * * *', () => {
     console.log('⏰ [排程觸發] 開始每日全台電波覆蓋 (ITM) 自動烘焙...');
-    const { exec } = require('child_process');
-    const bakeScript = path.join(__dirname, 'rf-engine/bake.mjs');
-    exec(`node "${bakeScript}" 500`, (err, stdout) => {
-        if (err) console.error('❌ 排程烘焙失敗:', err.message);
-        else console.log('✅ 每日排程烘焙成功完成！');
+    const launch = coverageJobController.startBake({ trigger: 'cron', limit: 500 });
+    if (!launch.started) {
+        console.warn(`⚠️ [排程略過] 覆蓋烘焙任務已在執行中 (${launch.reason})，略過本次排程`);
+        return;
+    }
+    launch.completion.then((result) => {
+        if (result.status === 'completed') {
+            console.log(`✅ 每日排程烘焙成功完成 (jobId=${result.jobId}, duration=${result.durationMs}ms)`);
+            apiCache.clearPrefix('/api/coverage');
+        } else {
+            console.error(`❌ 排程烘焙失敗 (jobId=${result.jobId}, status=${result.status}):`, result.error);
+        }
     });
 });
 
@@ -2922,65 +2848,16 @@ app.get('/api/analytics/cwa-comparison', withCache(60 * 1000), (req, res) => {
 });
 
 // ==========================================
-// 📊 API 2.1: 跳數傳播深度分佈 (Hop Count Distribution & 診斷)
+// 📊 API 2.1: 跳數傳播深度分佈診斷 (Hop Analysis & 診斷)
 // ==========================================
-app.get('/api/analytics/hop-distribution', withCache(60 * 1000), (req, res) => {
-    const sqlActual = `
-        SELECT 
-            COALESCE(hops_away, (hop_start - hop_limit)) as hop,
-            COUNT(*) as count
-        FROM packet_logs
-        WHERE timestamp >= datetime('now', '-24 hours')
-          AND (hops_away IS NOT NULL OR (hop_start IS NOT NULL AND hop_limit IS NOT NULL))
-          AND COALESCE(hops_away, (hop_start - hop_limit)) >= 0
-        GROUP BY hop
-        ORDER BY hop ASC
-    `;
+const { computeHopAnalysis } = require('./src/utils/hop-analysis');
 
-    const sqlConfigured = `
-        SELECT 
-            hop_limit as hop,
-            COUNT(*) as count
-        FROM nodes
-        WHERE hop_limit IS NOT NULL AND hop_limit > 0
-          AND last_seen >= datetime('now', '-7 days')
-        GROUP BY hop_limit
-        ORDER BY hop_limit ASC
-    `;
-
-    db.all(sqlActual, [], (err, actualRows) => {
-        db.all(sqlConfigured, [], (cErr, configuredRows) => {
-            let actualTotal = 0, actualSum = 0;
-            (actualRows || []).forEach(r => {
-                actualTotal += r.count;
-                actualSum += r.hop * r.count;
-            });
-            const avgActualHops = actualTotal > 0 ? Math.round((actualSum / actualTotal) * 10) / 10 : 0;
-
-            let confTotal = 0, confSum = 0;
-            (configuredRows || []).forEach(r => {
-                confTotal += r.count;
-                confSum += r.hop * r.count;
-            });
-            const avgConfiguredHops = confTotal > 0 ? Math.round((confSum / confTotal) * 10) / 10 : 0;
-
-            const diff = Math.round((avgConfiguredHops - avgActualHops) * 10) / 10;
-            let recommendation = null;
-            if (avgConfiguredHops > 0 && avgActualHops > 0 && diff >= 1.2) {
-                recommendation = `💡 網路診斷提醒：全網封包實際傳播深度平均僅 ${avgActualHops} 跳，但節點預設的 Hop Limit 限額平均高達 ${avgConfiguredHops} 跳（相差 ${diff} 跳）。建議引導用戶將 Hop Limit 降低至 2~3，以大幅減少無謂重複廣播與頻道碰撞，有效節省 Mesh 頻寬！`;
-            } else {
-                recommendation = `✅ 網路診斷良好：封包實際跳轉數 (${avgActualHops} 跳) 與節點 Hop 限額設定 (${avgConfiguredHops} 跳) 匹配良好，頻寬利用順暢。`;
-            }
-
-            res.json({
-                actualHops: actualRows || [],
-                configuredHops: configuredRows || [],
-                avgActualHops,
-                avgConfiguredHops,
-                diff,
-                recommendation
-            });
-        });
+app.get('/api/analytics/hop-analysis', withCache(60 * 1000), (req, res) => {
+    computeHopAnalysis(db, (err, payload) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        return res.json(payload);
     });
 });
 
@@ -3802,119 +3679,96 @@ app.get('/api/analytics/county-weather-trends', withCache(300 * 1000), (req, res
     });
 });
 // ==========================================
-// 🚀 API Bundle: 一鍵打包全網宏觀戰情中心所有數據 (極速快取 10分鐘 + 背景預熱)
+// 🚀 API Bundle: 一鍵打包全網宏觀戰情中心所有數據 (4.0.3.1: 有界併發 + 部分失敗保護 + 短 TTL 降級)
 // ==========================================
+const { buildAnalyticsBundle } = require('./src/utils/analytics-bundle');
 const bundleCacheMap = {};
 
 app.get('/api/analytics/bundle', async (req, res) => {
-    const range = req.query.range || '7d';
-    const now = Date.now();
-
-    // 🚀 快取延長至 10 分鐘，結合背景 setInterval 自動更新，用戶點擊 NOC 達成 0ms 載入
-    if (bundleCacheMap[range] && (now - bundleCacheMap[range].timestamp < 10 * 60 * 1000)) {
-        return res.json(bundleCacheMap[range].data);
-    }
-
+    const rawRange = String(req.query.range || '7d');
+    const range = ['24h', '7d', '30d'].includes(rawRange) ? rawRange : '7d';
     const currentPort = server.address()?.port || PORT;
     const baseUrl = `http://127.0.0.1:${currentPort}`;
 
     try {
-        const endpoints = [
-            `/api/analytics/kpi?range=${range}`,
-            `/api/analytics/trends?range=${range}`,
-            '/api/analytics/roles',
-            `/api/analytics/traffic?range=${range}`,
-            `/api/analytics/signal-health?range=${range}`,
-            `/api/analytics/hop-distribution?range=${range}`,
-            '/api/analytics/hop-distribution',
-            `/api/analytics/hourly-activity?range=${range}`,
-            '/api/analytics/hourly-peak-stacked',
-            '/api/analytics/cu-distribution',
-            '/api/analytics/hardware-models',
-            '/api/analytics/firmware-versions',
-            `/api/analytics/environment-trends?range=${range}`,
-            '/api/analytics/cwa-comparison',
-            '/api/analytics/cwa-node-comparison',
-            '/api/analytics/air-util-distribution',
-            `/api/analytics/top-gateways?range=${range}`,
-            '/api/analytics/duplicate-stats',
-            '/api/analytics/power-health',
-            '/api/analytics/mesh-interconnectivity',
-            '/api/analytics/weak-signal-alerts',
-            '/api/analytics/solar-charging-health',
-            '/api/analytics/county-weather-trends'
-        ];
+        const result = await buildAnalyticsBundle({
+            baseUrl,
+            range,
+            concurrency: 4,
+            cacheMap: bundleCacheMap,
+            ttlMs: 10 * 60 * 1000,
+            partialTtlMs: 15 * 1000,
+            maxStaleAgeMs: 30 * 60 * 1000
+        });
 
-        const results = [];
-        for (const ep of endpoints) {
-            try {
-                const r = await fetch(`${baseUrl}${ep}`);
-                results.push(r.ok ? await r.json() : null);
-            } catch (e) {
-                results.push(null);
-            }
+        if (result.status !== 200) {
+            return res.status(result.status).json({
+                error: result.error,
+                staleExpired: Boolean(result.staleExpired),
+                staleAgeMs: result.staleAgeMs ?? null,
+                failedEndpoints: result.failedEndpoints
+            });
         }
 
-        const payload = {
-            kpi: results[0],
-            trends: results[1],
-            roles: results[2],
-            traffic: results[3],
-            signalHealth: results[4],
-            hopDist: results[5],
-            hopAnalysis: results[6],
-            hourlyActivity: results[7],
-            hourlyStacked: results[8],
-            cuDist: results[9],
-            hwModels: results[10],
-            firmwareVersions: results[11],
-            envTrends: results[12],
-            cwaComparison: results[13],
-            cwaNodeComparison: results[14],
-            airUtilDist: results[15],
-            topGateways: results[16],
-            duplicateStats: results[17],
-            powerHealth: results[18],
-            meshInterconnectivity: results[19],
-            weakSignalAlerts: results[20],
-            solarChargingHealth: results[21],
-            countyWeatherTrends: results[22]
-        };
-
-        bundleCacheMap[range] = { data: payload, timestamp: now };
-        res.json(payload);
+        if (result.partialFailure) {
+            res.setHeader('X-Bundle-Partial', '1');
+        }
+        if (result.staleFallback) {
+            res.setHeader('X-Bundle-Stale', '1');
+            res.setHeader('X-Bundle-Stale-Age-Ms', String(result.staleAgeMs ?? 0));
+        }
+        return res.json(result.data);
     } catch (err) {
         if (bundleCacheMap[range]) return res.json(bundleCacheMap[range].data);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 啟動 Express 伺服器
-server.listen(PORT, () => {
-    console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
-    console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
-    bootstrapAnalyticsSummary();
-    fetchAndSaveCWAData();
-    fetchCwaSolarData();
-    // 啟動 RF 監聽
-    setupRFListener(io, db);
+// 啟動 Express 伺服器 (P1-4 & 4.0.1 P0: 確保資料庫初始化、PRAGMA 驗證與 Schema Initialization Barrier 全數完成才開啟通訊埠與背景工作者)
+async function startServer() {
+    try {
+        if (db && db.readyPromise) {
+            await db.readyPromise;
+            if (typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+                throw db.bootstrapError || new Error('[BOOTSTRAP_BARRIER_FAILED] Schema Initialization Barrier 未通過');
+            }
+            console.log('✅ [BOOTSTRAP] 資料庫子系統初始化、PRAGMA 驗證與 Schema Initialization Barrier 全數完成，準備開啟服務埠');
+        }
 
-    // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取
-    const warmCache = () => {
-        const portToUse = server.address()?.port || PORT;
-        ['7d', '24h', '30d'].forEach(r => {
-            fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=${r}`).catch(() => { });
+        server.listen(PORT, () => {
+            console.log(`🚀 API 伺服器已啟動: http://localhost:${PORT}`);
+            console.log(`📊 嘗試存取資料: http://localhost:${PORT}/api/telemetry`);
+            startDatabaseMaintenanceWorkers();
+            bootstrapAnalyticsSummary();
+            fetchAndSaveCWAData();
+            fetchCwaSolarData();
+            // 啟動 RF 監聽
+            setupRFListener(io, db);
+
+            // ⚡ 背景自動預熱與定時刷新 NOC 全網戰情 Bundle 快取 (4.0.3: 優先預熱最常用的 7d 範圍，避免開機同時併發查詢 24h/7d/30d 增加 SQLite 壓力)
+            const warmCache = () => {
+                const portToUse = server.address()?.port || PORT;
+                fetch(`http://127.0.0.1:${portToUse}/api/analytics/bundle?range=7d`).catch(() => { });
+            };
+            setTimeout(warmCache, 2000);
+            setInterval(warmCache, 3 * 60 * 1000);
         });
-    };
-    setTimeout(warmCache, 2000);
-    setInterval(warmCache, 3 * 60 * 1000);
-});
+    } catch (bootErr) {
+        console.error('❌ [FATAL_BOOTSTRAP_ERROR] 資料庫或 Schema 初始化失敗，拒絕啟動伺服器與相關模組:', bootErr.message);
+        process.exit(1);
+    }
+}
+
+startServer();
 
 
 // ==========================================
 // 🛰️ 實體 RF 隧道攔截模組 (HiveMQ 雲端分流對接)
 // ==========================================
 async function setupRFListener(io, db) {
+    if (process.env.DISABLE_RF_TUNNEL === 'true') {
+        return;
+    }
     const relayConfigs = [
         { name: 'hualien', label: '花蓮站', port: 4404 },
         { name: 'taoyuan', label: '台北站', port: 4405 },
@@ -3980,15 +3834,24 @@ async function setupRFListener(io, db) {
                                     hops_away: hopsAway
                                 };
 
-                                db.serialize(() => {
-                                    db.run('BEGIN');
-                                    db.run(`INSERT INTO packet_logs (node_id, portnum, gateway_id, snr, rssi, latitude, longitude, hops_away, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                                        [fromId, 'POSITION', packetData.gateway_id, packet.rxSnr, packet.rxRssi, lat, lng, hopsAway, config.name]);
-                                    db.run(`UPDATE nodes SET last_seen = CURRENT_TIMESTAMP, last_gateway = ? WHERE node_id = ?`,
-                                        [`隧道:${config.label}`, fromId]);
-                                    db.run('COMMIT');
+                                // 🛡️ 4.0.2 Packet Transaction Boundary: 透過封包原子交易管線寫入，僅在 COMMIT 成功後才執行推播
+                                const rfPlan = buildRfTunnelPacketTransactionPlan({
+                                    fromId,
+                                    gatewayId: packetData.gateway_id,
+                                    snr: packet.rxSnr,
+                                    rssi: packet.rxRssi,
+                                    lat,
+                                    lng,
+                                    hopsAway,
+                                    sourceName: config.name,
+                                    sourceLabel: config.label,
+                                    packetData
                                 });
-                                batchEmit('raw_packet', packetData);
+                                executePacketTransactionPlan(rfPlan, {
+                                    enqueuePacketTransaction: queuePacketTransaction,
+                                    batchEmit,
+                                    recordLivePacketAnalytics
+                                });
                             }
                         }
                     } catch (e) { /* 忽略碎片或錯誤封包 */ }
@@ -4049,9 +3912,18 @@ root.load([
     Routing = root.lookupType("meshtastic.Routing");
     RouteDiscovery = root.lookupType("meshtastic.RouteDiscovery");
     NeighborInfo = root.lookupType("meshtastic.NeighborInfo");
-    MeshPacket = root.lookupType("meshtastic.MeshPacket"); // 🚀 Load MeshPacket type
-    console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
-    startMqttClient(); // 修正為 startMqttClient
+    (async () => {
+        try {
+            if (db && db.readyPromise) await db.readyPromise;
+            if (db && typeof db.isBootstrapReady === 'function' && !db.isBootstrapReady()) {
+                throw db.bootstrapError || new Error('[BOOTSTRAP_BARRIER_FAILED] Schema Initialization Barrier 未通過');
+            }
+            console.log('📚 Protobuf 字典載入完成！準備啟動雷達...');
+            startMqttClient();
+        } catch (dbErr) {
+            console.error('❌ [MQTT_BOOT_ABORT] 資料庫或 Schema 尚未就緒，取消 MQTT 啟動:', dbErr.message);
+        }
+    })();
 });
 
 // ==========================================
@@ -4066,12 +3938,15 @@ function startMqttClient() {
         throw new Error('❌ Missing required MQTT environment variables (MQTT_BROKER, MQTT_USER, MQTT_PASSWORD)');
     }
 
-    const client = mqtt.connect(broker, {
+    const connectOpts = {
         username: username,
         password: password,
         clientId: 'mesh_dash_' + Math.random().toString(16).substring(2, 10),
         connectTimeout: 5000
-    });
+    };
+    const client = process.env.MQTT_PIPE_PATH
+        ? new mqtt.MqttClient(() => net.connect(process.env.MQTT_PIPE_PATH), connectOpts)
+        : mqtt.connect(broker, connectOpts);
     mqttClient = client; // 🚀 Expose client instance
 
     client.on('connect', () => {
@@ -4181,41 +4056,41 @@ function startMqttClient() {
                 } catch (e) { console.error('❌ 解密引擎結構錯誤', e); }
             }
 
-            // 1. 更新節點最後在線狀態 (Discovery)
-            const nodeUpdateSql = `
-                INSERT INTO nodes (node_id, last_seen, last_topic, channel, hop_limit, hop_start, last_gateway) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET last_seen=excluded.last_seen, last_topic=excluded.last_topic, channel=COALESCE(excluded.channel, nodes.channel), hop_limit=excluded.hop_limit, hop_start=excluded.hop_start, last_gateway=excluded.last_gateway
-            `;
-            // 🚀 批次寫入：改用佇列避免高流量時的鎖等待
-            queueDbOp(nodeUpdateSql, [fromId, topic, resolvedChannel, packet.hop_limit || 0, packet.hop_start || 0, gatewayId]);
-            batchEmit('node_seen', { node_id: fromId, last_seen: new Date().toISOString(), last_topic: topic, channel: resolvedChannel });
-
-            // 2. 如果最終仍無法解碼，則標記為 ENCRYPTED
+            // ==========================================
+            // 🛡️ 4.0.2 Packet Transaction Boundary
+            // 同一邏輯封包的所有關聯 SQLite 寫入合併為單一不可拆分的交易單位，
+            // 並嚴格確保僅在 SQLite COMMIT 完成後才執行 batchEmit 與戰情分析累加。
+            // ==========================================
             if (!decodedData) {
-                const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
-                queueDbOp(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [fromId, 'ENCRYPTED', topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, null, rawHex, hopsAway]);
-                batchEmit('raw_packet', {
-                    from: fromId,
-                    portnum: 'ENCRYPTED',
-                    topic: topic,
-                    gateway_id: gatewayId,
-                    timestamp: new Date().toISOString(),
-                    time: new Date().toLocaleTimeString(),
-                    snr: packet.rx_snr,
-                    rssi: packet.rx_rssi
+                const encryptedPlan = buildMqttPacketTransactionPlan({
+                    fromId,
+                    topic,
+                    resolvedChannel,
+                    gatewayId,
+                    packet,
+                    rawHex,
+                    decodedData: null
+                });
+                executePacketTransactionPlan(encryptedPlan, {
+                    enqueuePacketTransaction: queuePacketTransaction,
+                    batchEmit,
+                    recordLivePacketAnalytics
                 });
                 return;
             }
 
             // ==========================================
-            // 💬 3. 業務邏輯解析 (文字、遙測等)
+            // 💬 3. 業務邏輯解析 (文字、遙測等 — 純記憶體解析，無直接 I/O 寫入)
             // ==========================================
             let payloadObj = null;
             const port = decodedData.portnum;
-            // 🛡️ 初始化為 null，確保 SQL 寫入正確
             let packetLat = undefined;
             let packetLng = undefined;
+            let neighborList = null;
+            let nodeInfoData = null;
+            let positionData = null;
+            let mapReportData = null;
+            let telemetryData = null;
 
             const payloadBuffer = Buffer.isBuffer(decodedData.payload) ? decodedData.payload : Buffer.from(decodedData.payload || []);
 
@@ -4224,17 +4099,10 @@ function startMqttClient() {
                     const textMessage = payloadBuffer.toString('utf8');
                     const channelName = decodedData.channel_name || 'MediumFast';
                     payloadObj = { text: textMessage, channel_name: channelName };
-
                     console.log(`💬 [頻道: ${channelName}] ${fromId} 說: ${textMessage}`);
-
-                    // 寫入聊天紀錄表
-                    queueDbOp(`INSERT INTO chat_messages (node_id, message, channel_name) VALUES (?, ?, ?)`, [fromId, textMessage, channelName]);
                 } else if (port === 3 || port === 'POSITION_APP' || port === '3') {
-                    // 確保我們正確解碼 Meshtastic 標準位置
                     const posMessage = Position.decode(payloadBuffer);
                     payloadObj = Position.toObject(posMessage, { enums: String, defaults: true });
-
-                    // 🛸 強化座標讀取，避免數值為 0 被誤判
                     packetLat = (payloadObj.latitude_i !== undefined) ? payloadObj.latitude_i / 1e7 : payloadObj.latitude;
                     packetLng = (payloadObj.longitude_i !== undefined) ? payloadObj.longitude_i / 1e7 : payloadObj.longitude;
                 } else if (port === 4 || port === 'NODEINFO_APP') {
@@ -4248,12 +4116,12 @@ function startMqttClient() {
                 } else if (port === 71 || port === 'NEIGHBORINFO_APP') {
                     const ni = NeighborInfo.decode(payloadBuffer);
                     payloadObj = NeighborInfo.toObject(ni, { enums: String, defaults: true });
-                    // 寫入拓撲關係
                     if (ni.neighbors && ni.neighbors.length > 0) {
-                        ni.neighbors.forEach(n => {
-                            const nId = `!${n.node_id.toString(16).padStart(8, '0')}`;
-                            queueDbOp(`INSERT INTO neighbors (node_id, neighbor_id, snr) VALUES (?, ?, ?) ON CONFLICT(node_id, neighbor_id) DO UPDATE SET snr=excluded.snr, last_seen=CURRENT_TIMESTAMP`, [fromId, nId, n.snr]);
-                        });
+                        neighborList = ni.neighbors.map(n => ({
+                            neighborId: `!${n.node_id.toString(16).padStart(8, '0')}`,
+                            node_id: n.node_id,
+                            snr: n.snr
+                        }));
                     }
                 } else if (port === 73 || port === 'MAP_REPORT_APP') {
                     const report = MapReport.decode(payloadBuffer);
@@ -4267,124 +4135,51 @@ function startMqttClient() {
                 payloadObj.channel_name = decodedData.channel_name;
             }
 
-            // 3. 寫入封包日誌並推播
-            const payloadJson = payloadObj ? JSON.stringify(payloadObj) : null;
-            const hopsAway = Math.max(0, (packet.hop_start || 0) - (packet.hop_limit || 0));
-
-            // 🚀 同步更新 nodes 表中的座標，讓地圖 Marker 能即時移動
-            if (packetLat && packetLng) {
-                queueDbOp(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [packetLat, packetLng, fromId]);
-            }
-
-            queueDbOp(`INSERT INTO packet_logs (node_id, portnum, topic, gateway_id, snr, rssi, hop_limit, hop_start, payload_json, raw_hex, latitude, longitude, hops_away) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [fromId, port, topic, gatewayId, packet.rx_snr || null, packet.rx_rssi || null, packet.hop_limit || 0, packet.hop_start || 0, payloadJson, rawHex, packetLat, packetLng, hopsAway]);
-
-            // ⚡ 戰情中心即時流式增量累加
-            recordLivePacketAnalytics(port, packet.rx_snr, packet.rx_rssi);
-
-            batchEmit('raw_packet', {
-                from: fromId,
-                portnum: port,
-                topic: topic,
-                gateway_id: gatewayId,
-                timestamp: new Date().toISOString(),
-                time: new Date().toLocaleTimeString(),
-                snr: packet.rx_snr,
-                rssi: packet.rx_rssi,
-                latitude: packetLat,
-                longitude: packetLng,
-                hops_away: hopsAway,
-                payload_json: payloadObj
-            });
-
-            // 解析節點資訊 (名稱) - NODEINFO 外層更新
+            // 解析節點資訊 (名稱) - NODEINFO
             if (port === 4 || port === 'NODEINFO_APP') {
                 try {
                     const user = User.toObject(User.decode(payloadBuffer), { enums: String });
-                    const finalRole = user.role || 'CLIENT';
-                    const hwModel = user.hw_model || user.hwModel || null;
-                    const firmwareVersion = user.firmware_version || user.firmwareVersion || null;
-                    const firmwareBuildNum = user.firmware_build_num || user.firmwareBuildNum || null;
-                    queueDbOp(`UPDATE nodes SET long_name = ?, short_name = ?, role = ?, hw_model = ?, firmware_version = ?, firmware_build_num = ? WHERE node_id = ?`,
-                        [user.long_name, user.short_name, finalRole, hwModel, firmwareVersion, firmwareBuildNum, fromId], function (err) {
-                            if (!err) {
-                                console.log(`👤 [節點資訊] 更新: ${user.short_name} 角色: ${finalRole}`);
-                                batchEmit('node_seen', {
-                                    node_id: fromId,
-                                    long_name: user.long_name,
-                                    short_name: user.short_name,
-                                    role: finalRole,
-                                    hw_model: hwModel,
-                                    firmware_version: firmwareVersion,
-                                    firmware_build_num: firmwareBuildNum,
-                                    last_seen: new Date().toISOString(),
-                                    last_topic: topic
-                                });
-                            }
-                        });
+                    nodeInfoData = {
+                        long_name: user.long_name,
+                        short_name: user.short_name,
+                        role: user.role || 'CLIENT',
+                        hw_model: user.hw_model || user.hwModel || null,
+                        firmware_version: user.firmware_version || user.firmwareVersion || null,
+                        firmware_build_num: user.firmware_build_num || user.firmwareBuildNum || null
+                    };
                 } catch (e) { console.error('❌ 解析 NodeInfo 失敗', e); }
             }
 
-            // 解析位置資訊 - POSITION 外層更新
+            // 解析位置資訊 - POSITION
             if (port === 3 || port === 'POSITION_APP') {
                 try {
                     const pos = Position.decode(decodedData.payload);
                     if (pos.latitude_i && pos.longitude_i) {
-                        const lat = pos.latitude_i / 1e7;
-                        const lng = pos.longitude_i / 1e7;
-                        queueDbOp(`UPDATE nodes SET latitude = ?, longitude = ? WHERE node_id = ?`, [lat, lng, fromId], function (err) {
-                            if (!err) {
-                                batchEmit('node_seen', {
-                                    node_id: fromId,
-                                    latitude: lat,
-                                    longitude: lng,
-                                    last_seen: new Date().toISOString(),
-                                    last_topic: topic
-                                });
-                            }
-                        });
+                        positionData = {
+                            lat: pos.latitude_i / 1e7,
+                            lng: pos.longitude_i / 1e7
+                        };
                     }
                 } catch (e) { console.error('❌ 解析 Position 失敗', e); }
             }
 
+            // 解析地圖報告 - MAP_REPORT
             if (port === 73 || port === 'MAP_REPORT_APP') {
                 try {
                     const report = MapReport.decode(decodedData.payload);
-                    const lat = report.latitude_i / 1e7;
-                    const lng = report.longitude_i / 1e7;
-                    const fwVer = report.firmware_version || report.firmwareVersion || null;
-                    const hwModel = report.hw_model || report.hwModel || null;
-                    const role = report.role || null;
-                    queueDbOp(`
-                        UPDATE nodes SET 
-                            long_name = COALESCE(?, nodes.long_name), 
-                            short_name = COALESCE(?, nodes.short_name), 
-                            latitude = ?, 
-                            longitude = ?,
-                            hw_model = COALESCE(?, nodes.hw_model),
-                            role = COALESCE(?, nodes.role),
-                            firmware_version = COALESCE(?, nodes.firmware_version)
-                        WHERE node_id = ?
-                    `, [report.long_name, report.short_name, lat, lng, hwModel, role, fwVer, fromId], function (err) {
-                        if (!err) {
-                            console.log(`🗺️ [地圖報告] 節點: ${report.short_name} -> ${lat}, ${lng} FW: ${fwVer || '--'}`);
-                            batchEmit('node_seen', {
-                                node_id: fromId,
-                                long_name: report.long_name,
-                                short_name: report.short_name,
-                                latitude: lat,
-                                longitude: lng,
-                                hw_model: hwModel,
-                                role: role,
-                                firmware_version: fwVer,
-                                last_seen: new Date().toISOString(),
-                                last_topic: topic
-                            });
-                        }
-                    });
+                    mapReportData = {
+                        long_name: report.long_name,
+                        short_name: report.short_name,
+                        lat: report.latitude_i / 1e7,
+                        lng: report.longitude_i / 1e7,
+                        fwVer: report.firmware_version || report.firmwareVersion || null,
+                        hwModel: report.hw_model || report.hwModel || null,
+                        role: report.role || null
+                    };
                 } catch (e) { console.error('❌ 解析 MapReport 失敗', e); }
             }
 
+            // 解析遙測資訊 - TELEMETRY
             if (port === 67 || port === 'TELEMETRY_APP') {
                 const telemetry = Telemetry.decode(decodedData.payload);
                 const cleanJSON = Telemetry.toObject(telemetry, { enums: String, defaults: true });
@@ -4395,69 +4190,46 @@ function startMqttClient() {
                 const air = cleanJSON.air_util_tx ?? device.air_util_tx ?? device.airUtilTx ?? null;
                 const cu = device.channel_utilization ?? device.channelUtilization ?? null;
 
-                // 修改：只顯示 I2C 設備讀到的電壓 (Power Metrics)，忽略板載 ADC 設備電壓 (device.voltage)
+                // 只顯示 I2C 設備讀到的電壓 (Power Metrics)，忽略板載 ADC 設備電壓 (device.voltage)
                 const finalVoltage = power.ch1_voltage ?? power.ch1Voltage ?? null;
                 const finalCurrent = power.ch1_current ?? power.ch1Current ?? null;
-
                 const adcVoltage = device.voltage ?? null;
 
-                const sql = `
-                    INSERT INTO telemetry_data 
-                    (node_id, battery_level, voltage, temperature, humidity, channel_utilization, air_util_tx, snr, rssi, current, hop_limit, hop_start, adc_voltage) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `;
-                const params = [
-                    fromId,
-                    device.battery_level ?? device.batteryLevel ?? null,
+                telemetryData = {
+                    batteryLevel: device.battery_level ?? device.batteryLevel ?? null,
                     finalVoltage,
-                    env.temperature ?? null,
-                    env.relative_humidity ?? env.relativeHumidity ?? null,
-                    cu,
-                    air,
-                    packet.rx_snr ?? null,
-                    packet.rx_rssi ?? null,
                     finalCurrent,
-                    packet.hop_limit || 0,
-                    packet.hop_start || 0,
+                    temperature: env.temperature ?? null,
+                    humidity: env.relative_humidity ?? env.relativeHumidity ?? null,
+                    channelUtilization: cu,
+                    airUtilTx: air,
                     adcVoltage
-                ];
-
-                // 同步更新 nodes 表，確保 Dashboard 數據能正確載入 (使用 COALESCE 避免不同 telemetry 互相覆寫)
-                queueDbOp(`
-                        UPDATE nodes SET 
-                            battery_level = COALESCE(?, nodes.battery_level), 
-                            voltage = COALESCE(?, nodes.voltage), 
-                            current = COALESCE(?, nodes.current), 
-                            temperature = COALESCE(?, nodes.temperature), 
-                            humidity = COALESCE(?, nodes.humidity) 
-                        WHERE node_id = ?
-                    `, [params[1], finalVoltage, finalCurrent, params[3], params[4], fromId]);
-
-                queueDbOp(sql, params, function (err) {
-                    if (err) return console.error('❌ 寫入資料庫失敗:', err.message);
-
-                    recordLivePacketAnalytics(port, packet.rx_snr, packet.rx_rssi, env.temperature, env.relative_humidity);
-
-                    console.log(`💾 [寫入DB成功] 節點: ${fromId} | 紀錄 ID: ${this.lastID}`);
-                    // 🚀 透過批次推播即時將新資料推播到前端
-                    batchEmit('telemetry_update', {
-                        node_id: fromId,
-                        battery_level: params[1],
-                        voltage: finalVoltage,
-                        current: finalCurrent,
-                        temperature: params[3],
-                        humidity: params[4],
-                        channel_utilization: cu,
-                        air_util_tx: air,
-                        timestamp: new Date().toISOString(),
-                        snr: params[7],
-                        rssi: params[8],
-                        hop_limit: params[10],
-                        hop_start: params[11],
-                        adc_voltage: adcVoltage
-                    });
-                });
+                };
             }
+
+            const packetPlan = buildMqttPacketTransactionPlan({
+                fromId,
+                topic,
+                resolvedChannel,
+                gatewayId,
+                packet,
+                rawHex,
+                decodedData,
+                payloadObj,
+                packetLat,
+                packetLng,
+                neighborList,
+                nodeInfoData,
+                positionData,
+                mapReportData,
+                telemetryData
+            });
+
+            executePacketTransactionPlan(packetPlan, {
+                enqueuePacketTransaction: queuePacketTransaction,
+                batchEmit,
+                recordLivePacketAnalytics
+            });
         } catch (err) {
             // 忽略無法解碼的雜訊封包
         }
@@ -4465,61 +4237,12 @@ function startMqttClient() {
 }
 
 // ==========================================
-// 💾 4. 每 12 小時自動備份資料庫至雲端
+// 💾 4. 自動備份資料庫至雲端 (4.0.1 P1: 正式整合 BackupManager WAL 一致性備份)
+//    註：保留既有實際 Cron 表達式 '0 0 * * 0' (每週日 00:00)；舊版註解「每 12 小時」與 sqlite.config.js 之 '0 4 * * *' 差異列為待確認事項
 // ==========================================
-cron.schedule('0 0 * * 0', () => {
-    // 原始資料庫路徑
-    const sourceDbPath = path.join(__dirname, 'meshtastic.db');
-
-    // 雲端環境適應：從環境變數讀取備份路徑，若無則不執行備份
-    const googleDrivePath = process.env.BACKUP_PATH;
-
-    if (!googleDrivePath) return;
-
-    // 如果資料夾不存在，就自動建立
-    if (!fs.existsSync(googleDrivePath)) {
-        fs.mkdirSync(googleDrivePath, { recursive: true });
-    }
-
-    // 取得今天的日期作為檔名後綴
-    const dateStr = new Date().toISOString().slice(0, 10);
-    const backupFileName = `meshtastic_backup_${dateStr}.db`;
-    const targetBackupPath = path.join(googleDrivePath, backupFileName);
-
-    try {
-        // 執行檔案複製 (靜態副本)
-        fs.copyFileSync(sourceDbPath, targetBackupPath);
-        console.log(`\n📦 [雲端備份成功] ${new Date().toLocaleString()} - 資料庫已安全複製至: ${backupFileName}`);
-
-        // 🧹 清理 30 天以前的舊備份
-        try {
-            const files = fs.readdirSync(googleDrivePath);
-            const now = new Date();
-            const maxAgeMs = 30 * 24 * 60 * 60 * 1000; // 30 天的毫秒數
-
-            files.forEach(file => {
-                const match = file.match(/^meshtastic_backup_(\d{4}-\d{2}-\d{2})\.db$/);
-                if (match) {
-                    const fileDateStr = match[1];
-                    const fileDate = new Date(fileDateStr);
-                    if (!isNaN(fileDate.getTime())) {
-                        const ageMs = now - fileDate;
-                        if (ageMs > maxAgeMs) {
-                            const oldFilePath = path.join(googleDrivePath, file);
-                            fs.unlinkSync(oldFilePath);
-                            console.log(`🧹 [備份清理] 已刪除 30 天前舊備份: ${file}`);
-                        }
-                    }
-                }
-            });
-        } catch (cleanErr) {
-            console.error('❌ [備份清理失敗] 發生錯誤:', cleanErr);
-        }
-
-    } catch (err) {
-        console.error('\n❌ [雲端備份失敗] 發生錯誤:', err);
-    }
-});
+if (db && db.backupManager) {
+    registerAppBackupSchedule(db, cron, process.env);
+}
 
 // ==========================================
 // 🔌 系統關閉訊號監聽
@@ -4537,15 +4260,77 @@ function handleShutdown(signal) {
     } catch (err) {
         console.error('Failed to log shutdown event:', err);
     }
-    setTimeout(() => {
-        process.exit(0);
-    }, 500);
+    if (db && db.backupManager) {
+        db.backupManager.stopSchedule();
+    }
+    if (db && db.shutdownHandler) {
+        db.shutdownHandler.handle(signal, { exitProcess: true });
+    } else {
+        setTimeout(() => {
+            process.exit(0);
+        }, 500);
+    }
+}
+
+// ==========================================
+// 🧪 測試專用 IPC Hooks 開關 (4.0.2 最終驗收前修正 P2)
+// 預設關閉；僅當環境變數 MESHTASTIC_ENABLE_TEST_HOOKS === '1' 時，才允許處理 TEST_* IPC 控制訊息。
+// 此開關絕不可寫入一般 .env 或 Production 設定；僅供整合測試子程序於 spawn 時明確注入。
+// ==========================================
+const TEST_HOOKS_ENABLED = process.env.MESHTASTIC_ENABLE_TEST_HOOKS === '1';
+const TEST_HOOK_MESSAGE_TYPES = new Set(['TEST_FLUSH_DB_QUEUE', 'TEST_INJECT_MQTT_PACKET']);
+
+async function handleTestHookMessage(msg) {
+    if (msg.type === 'TEST_FLUSH_DB_QUEUE') {
+        try {
+            await flushDbQueue();
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_DB_QUEUE_FLUSHED', requestId: msg.requestId || null, ok: true });
+            }
+        } catch (err) {
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_DB_QUEUE_FLUSHED', requestId: msg.requestId || null, ok: false, error: err.message });
+            }
+        }
+    } else if (msg.type === 'TEST_INJECT_MQTT_PACKET' && mqttClient) {
+        try {
+            mqttClient.emit('message', msg.topic, Buffer.from(msg.payloadHex, 'hex'));
+            if (db && typeof db.flushDbQueue === 'function') {
+                await db.flushDbQueue();
+            }
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_MQTT_PACKET_FLUSHED', requestId: msg.requestId || null, ok: true });
+            }
+        } catch (err) {
+            if (typeof process.send === 'function') {
+                process.send({ type: 'TEST_MQTT_PACKET_FLUSHED', requestId: msg.requestId || null, ok: false, error: err.message });
+            }
+        }
+    }
 }
 
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
-process.on('message', (msg) => {
+process.on('message', async (msg) => {
     if (msg === 'shutdown') {
         handleShutdown('PM2_SHUTDOWN');
+        return;
+    }
+    if (msg && typeof msg === 'object' && TEST_HOOK_MESSAGE_TYPES.has(msg.type)) {
+        if (!TEST_HOOKS_ENABLED) {
+            // 安全拒絕：未啟用測試模式時一律忽略測試控制訊息，不執行、不回覆
+            console.warn(`🚫 [TEST_HOOKS_DISABLED] 已忽略測試控制訊息 ${msg.type} (未設定 MESHTASTIC_ENABLE_TEST_HOOKS=1)`);
+            return;
+        }
+        await handleTestHookMessage(msg);
+    }
+});
+
+process.on('uncaughtException', (err, origin) => {
+    console.error('💥 [FATAL_CRASH] 未捕獲之異常:', err);
+    if (db && db.shutdownHandler) {
+        db.shutdownHandler.handleEmergencyCrash(err, origin, { exitProcess: true });
+    } else {
+        process.exit(1);
     }
 });

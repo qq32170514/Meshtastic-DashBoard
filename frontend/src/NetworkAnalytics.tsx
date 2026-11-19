@@ -34,7 +34,10 @@ import {
   CloudRain,
   Info,
 } from 'lucide-react';
-import CwaNodeMap, { NodeComparison } from './CwaNodeMap';
+import type { NodeComparison } from './CwaNodeMap';
+import MapErrorBoundary from './maps/MapErrorBoundary';
+
+const CwaNodeMap = React.lazy(() => import('./CwaNodeMap'));
 import {
   ResponsiveContainer,
   LineChart,
@@ -420,7 +423,7 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
         fetch(`/api/analytics/traffic?range=${range}`),
         fetch(`/api/analytics/signal-health?range=${range}`),
         fetch(`/api/analytics/hop-distribution?range=${range}`),
-        fetch('/api/analytics/hop-distribution'),
+        fetch('/api/analytics/hop-analysis'),
         fetch(`/api/analytics/hourly-activity?range=${range}`),
         fetch('/api/analytics/hourly-peak-stacked'),
         fetch('/api/analytics/cu-distribution'),
@@ -1545,14 +1548,18 @@ export default function NetworkAnalytics({ darkMode }: NetworkAnalyticsProps) {
             </div>
           )}
 
-          {/* 🗺️ CWA 配對地圖 - 用獨立 Component 避免 Leaflet 構造函數衝突 */}
+          {/* 🗺️ CWA 配對地圖 - 延遲載入與獨立 Error Boundary 保護 */}
           {cwaNodeComparison && cwaViewMode === 'map' && (
-            <CwaNodeMap
-              key="cwa-node-map"
-              nodes={cwaNodeComparison.nodeComparisons}
-              regionSummary={cwaNodeComparison.regionSummary}
-              darkMode={darkMode}
-            />
+            <MapErrorBoundary title="CWA 配對地圖載入失敗">
+              <React.Suspense fallback={<div className="p-8 text-center text-slate-400 font-mono">正在載入 CWA 配對地圖...</div>}>
+                <CwaNodeMap
+                  key="cwa-node-map"
+                  nodes={cwaNodeComparison.nodeComparisons}
+                  regionSummary={cwaNodeComparison.regionSummary}
+                  darkMode={darkMode}
+                />
+              </React.Suspense>
+            </MapErrorBoundary>
           )}
 
 

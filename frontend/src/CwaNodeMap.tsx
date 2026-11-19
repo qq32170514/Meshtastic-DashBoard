@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import 'leaflet/dist/leaflet.css';
 import { MapContainer, CircleMarker, Polyline, Tooltip as LeafletTooltip } from 'react-leaflet';
 import { AppTileLayer, MapStyleSelector, getDefaultTileStyle } from './mapTiles';
 
