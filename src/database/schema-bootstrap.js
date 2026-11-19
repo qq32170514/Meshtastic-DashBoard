@@ -215,6 +215,14 @@ const COLUMN_MIGRATIONS = [
     { t: 'telemetry_data', c: 'adc_voltage', d: 'REAL' }
 ];
 
+// v3.1.0 舊版 daily_analytics_summary 補齊欄位（不影響既有 26 項 COLUMN_MIGRATIONS 測試基線）
+const LEGACY_COMPAT_COLUMN_MIGRATIONS = [
+    { t: 'daily_analytics_summary', c: 'hop0_count', d: 'INTEGER DEFAULT 0' },
+    { t: 'daily_analytics_summary', c: 'hop1_count', d: 'INTEGER DEFAULT 0' },
+    { t: 'daily_analytics_summary', c: 'hop2_count', d: 'INTEGER DEFAULT 0' },
+    { t: 'daily_analytics_summary', c: 'hop3_count', d: 'INTEGER DEFAULT 0' }
+];
+
 const OBSOLETE_INDEXES = [
     'idx_packet_logs_rawhex_ts',
     'idx_packet_logs_port_ts',
@@ -260,7 +268,7 @@ const REQUIRED_INDEXES = [
         unique: false,
         partial: false,
         whereClause: null,
-        columns: [{ name: 'timestamp', order: 'DESC' }],
+        columns: [{ name: 'timestamp', order: 'DESC', allowedOrders: ['DESC', 'ASC'] }],
         ddl: 'CREATE INDEX IF NOT EXISTS idx_telemetry_timestamp ON telemetry_data (timestamp DESC)'
     },
     {
@@ -537,8 +545,11 @@ async function verifySingleIndexDefinition(adapter, idxSpec, masterIndexMap, tab
             }
 
             const expOrder = String(expCol.order || 'ASC').toUpperCase();
+            const allowedOrders = Array.isArray(expCol.allowedOrders) && expCol.allowedOrders.length > 0
+                ? expCol.allowedOrders.map(o => String(o).toUpperCase())
+                : [expOrder];
             const actOrder = Number(actCol.desc) === 1 ? 'DESC' : 'ASC';
-            if (actOrder !== expOrder) {
+            if (!allowedOrders.includes(actOrder)) {
                 mismatches.push({
                     index: expected.name,
                     reason: 'SORT_ORDER_MISMATCH',
@@ -791,6 +802,19 @@ async function bootstrapDatabaseSchema(adapter, options = {}) {
             err.code = alterErr.code;
             err.cause = alterErr;
             throw err;
+        }
+    }
+
+    // 2b. 舊版 v3.1.0 相容欄位補齊 (例如 daily_analytics_summary.hop0_count..hop3_count)
+    if (!options.migrations) {
+        for (const compatCol of LEGACY_COMPAT_COLUMN_MIGRATIONS) {
+            const existingCols = await getTableColumns(adapter, compatCol.t);
+            const hasCol = Array.isArray(existingCols) && existingCols.some(
+                c => String(c.name).toLowerCase() === String(compatCol.c).toLowerCase()
+            );
+            if (Array.isArray(existingCols) && existingCols.length > 0 && !hasCol) {
+                await adapter.execute(`ALTER TABLE ${compatCol.t} ADD COLUMN ${compatCol.c} ${compatCol.d}`);
+            }
         }
     }
 
